@@ -1,0 +1,8 @@
+{
+    "Name":"pluginPdf",
+    "Version":"0.0.1",
+    "Author" : "lujiajing",
+    "Date":"2023-07-12",
+	"Dependency":"Qt5Pdfium.dll",
+    "Description":"基于QPdfium实现，用来显示pdf内容。Qt5Pdfium.dll从源码编译得到，参照loadFile函数实现了loadFromMem函数，实现了从内存中加载pdf文件。"
+}

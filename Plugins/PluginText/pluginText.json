@@ -1,0 +1,7 @@
+{
+    "Name":"pluginText",
+    "Version":"0.0.1",
+    "Author" : "lujiajing",
+    "Date":"2023-07-09",
+    "Description":"used by filewrapper, handling text"
+}
