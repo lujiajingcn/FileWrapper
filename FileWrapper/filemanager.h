@@ -4,12 +4,6 @@
 #include <QMap>
 #include <QFile>
 #include <QObject>
-#include <string>
-#include <iostream>
-#include <io.h>
-#include <fcntl.h>
-#include <stdio.h>
-using namespace std;
 
 typedef struct FILEINFO
 {
@@ -33,7 +27,6 @@ public:
     void unLoadMergedFile();
     void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
     QVector<FILEINFO> getFileInfos();
-    QString getMergedFilePath();
 
     void outputFile(QString sFilePath, QString sOutputDir);
 
@@ -46,9 +39,7 @@ private:
 
 private:
     QVector<FILEINFO>        m_vtFileInfos;
-    QString                 m_sMergedFilePath;
     QMap<QString,FILEINFO>  m_mapFileInfos;
-    FILE                    *m_pFile;
     QFile                   m_qFile;
 };
 

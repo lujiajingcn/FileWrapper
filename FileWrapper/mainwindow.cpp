@@ -92,6 +92,11 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     char *szBuf = nullptr;
     qint64 nFileLen = 0;
     m_fileManager->QGetFileContent(sFilePath, &szBuf, nFileLen);
+    if(szBuf == nullptr)
+    {
+        qDebug()<<"获取文件内容失败:"<<sFilePath;
+        return;
+    }
 
     PluginManager::getInstance()->loadAllPlugins();
     PluginInterface* pInterface = nullptr;
@@ -100,6 +105,7 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     if(sPluginPath.isEmpty())
     {
         QMessageBox().information(nullptr, "", "没有插件来处理该类型文件，请手动映射插件");
+        delete[] szBuf;
         return;
     }
     pInterface = PluginManager::getInstance()->getInterface(sPluginPath);
@@ -113,8 +119,9 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     }
     ui->tabWidget->addTab(wPlugin, "");
 
+    // 插件在 sendFileData 返回前会同步复制/使用数据，因此返回后可安全释放
     pInterface->sendFileData(szBuf, nFileLen);
-
+    delete[] szBuf;
 }
 
 void MainWindow::on_actionLoadFile_triggered()

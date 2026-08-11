@@ -3,6 +3,9 @@
 
 #include <QMainWindow>
 #include <QStandardItemModel>
+#include <vector>
+#include <string>
+using namespace std;
 #include "filemanager.h"
 #include <QTreeView>
 #include <QStackedWidget>
