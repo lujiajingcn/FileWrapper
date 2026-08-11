@@ -24,14 +24,28 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     // 在文件头记录合并文件的个数
     int nCount = vtInputFiles.size();
     QFile fOutputFile(sOutputFile);
-    fOutputFile.open(QIODevice::WriteOnly);
-    fOutputFile.seek(0);
+    if(!fOutputFile.open(QIODevice::WriteOnly))
+    {
+        qWarning()<<"打开输出文件失败:"<<sOutputFile;
+        return;
+    }
+    if(!fOutputFile.seek(0))
+    {
+        qWarning()<<"定位输出文件失败:"<<sOutputFile;
+        fOutputFile.close();
+        return;
+    }
     {
         char szBuf[FILECOUNTMAX];
         memset(szBuf, 0x0, FILECOUNTMAX);
         QString sCount = QString::number(nCount);
         strncpy(szBuf, sCount.toStdString().c_str(), FILECOUNTMAX - 1);
-        fOutputFile.write(szBuf, FILECOUNTMAX);
+        if(fOutputFile.write(szBuf, FILECOUNTMAX) != FILECOUNTMAX)
+        {
+            qWarning()<<"写入文件个数失败:"<<sOutputFile;
+            fOutputFile.close();
+            return;
+        }
     }
 
     // 文件头部分的大小
@@ -45,28 +59,48 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     {
         QString strFilePath = *cIt;
         QFile fInputFile(strFilePath);
-        fInputFile.open(QIODevice::ReadOnly);
+        if(!fInputFile.open(QIODevice::ReadOnly))
+        {
+            qWarning()<<"打开输入文件失败:"<<strFilePath;
+            fOutputFile.close();
+            return;
+        }
         qint64 nFileLen = fInputFile.size();
         fInputFile.close();
         {
             char szPath[FILEPATHSIZE];
             memset(szPath, 0x0, FILEPATHSIZE);
             strncpy(szPath, strFilePath.toStdString().c_str(), FILEPATHSIZE - 1);
-            fOutputFile.write(szPath, FILEPATHSIZE);
+            if(fOutputFile.write(szPath, FILEPATHSIZE) != FILEPATHSIZE)
+            {
+                qWarning()<<"写入文件路径失败:"<<strFilePath;
+                fOutputFile.close();
+                return;
+            }
         }
         {
             char szLen[FILELENMAX];
             memset(szLen, 0x0, FILELENMAX);
             QString sLen = QString::number(nFileLen);
             strncpy(szLen, sLen.toStdString().c_str(), FILELENMAX - 1);
-            fOutputFile.write(szLen, FILELENMAX);
+            if(fOutputFile.write(szLen, FILELENMAX) != FILELENMAX)
+            {
+                qWarning()<<"写入文件大小失败:"<<strFilePath;
+                fOutputFile.close();
+                return;
+            }
         }
         {
             char szPos[FILELENMAX];
             memset(szPos, 0x0, FILELENMAX);
             QString sPos = QString::number(nFileContentPosition);
             strncpy(szPos, sPos.toStdString().c_str(), FILELENMAX - 1);
-            fOutputFile.write(szPos, FILELENMAX);
+            if(fOutputFile.write(szPos, FILELENMAX) != FILELENMAX)
+            {
+                qWarning()<<"写入文件位置失败:"<<strFilePath;
+                fOutputFile.close();
+                return;
+            }
         }
         nFileContentPosition += nFileLen;
     }
@@ -78,15 +112,37 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     {
         QString strFilePath = *cIt;
         QFile fInputFile(strFilePath);
-        fInputFile.open(QIODevice::ReadOnly);
+        if(!fInputFile.open(QIODevice::ReadOnly))
+        {
+            qWarning()<<"打开输入文件失败:"<<strFilePath;
+            fOutputFile.close();
+            delete[] szBuf;
+            return;
+        }
         qint64 nFileLen = fInputFile.size();
 
-        fOutputFile.seek(nFileContentPosition);
+        if(!fOutputFile.seek(nFileContentPosition))
+        {
+            qWarning()<<"定位输出文件位置失败:"<<strFilePath;
+            fInputFile.close();
+            fOutputFile.close();
+            delete[] szBuf;
+            return;
+        }
         qint64 nBufferSize = 0;
         while(nBufferSize < nFileLen)
         {
-            qint64 nBufferRealSize = fInputFile.read(szBuf, MAXBUFFERSIZE);
-            fOutputFile.write(szBuf, nBufferRealSize);
+            qint64 nBufferRealSize = fInputFile.read(szBuf, (qint64)MAXBUFFERSIZE);
+            if(nBufferRealSize <= 0)
+            {
+                qWarning()<<"读取输入文件内容失败:"<<strFilePath;
+                break;
+            }
+            if(fOutputFile.write(szBuf, nBufferRealSize) != nBufferRealSize)
+            {
+                qWarning()<<"写入输出文件内容失败:"<<sOutputFile;
+                break;
+            }
             nBufferSize += nBufferRealSize;
             qDebug()<<"strFilePath:"<<strFilePath<<"nBufferSize:"<<nBufferSize<<"nBufferRealSize:"<<nBufferRealSize;
         }
@@ -106,13 +162,27 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir)
 {
     QFile fInputFile(sInputFile);
-    fInputFile.open(QIODevice::ReadOnly);
-    fInputFile.seek(0);
+    if(!fInputFile.open(QIODevice::ReadOnly))
+    {
+        qWarning()<<"打开合并文件失败:"<<sInputFile;
+        return;
+    }
+    if(!fInputFile.seek(0))
+    {
+        qWarning()<<"定位合并文件失败:"<<sInputFile;
+        fInputFile.close();
+        return;
+    }
 
     // 获取文件数量
     char szFileCount[FILECOUNTMAX];
     memset(szFileCount, 0x0, FILECOUNTMAX);
-    fInputFile.read(szFileCount, FILECOUNTMAX);
+    if(fInputFile.read(szFileCount, FILECOUNTMAX) != FILECOUNTMAX)
+    {
+        qWarning()<<"读取文件数量失败:"<<sInputFile;
+        fInputFile.close();
+        return;
+    }
     int nFileCount = QString(szFileCount).toInt();
 
     char *szBuf = new char[MAXBUFFERSIZE];
@@ -121,7 +191,11 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
     {
         char szFilePath[FILEPATHSIZE];
         memset(szFilePath, 0x0, FILEPATHSIZE);
-        fInputFile.read(szFilePath, FILEPATHSIZE);
+        if(fInputFile.read(szFilePath, FILEPATHSIZE) != FILEPATHSIZE)
+        {
+            qWarning()<<"读取文件路径失败:"<<sInputFile;
+            break;
+        }
 
         QString sOutputPath;
         if(bIsSaveAsOldPath)
@@ -138,22 +212,45 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         qint64 nFileLen = 0;
         char szFileLen[FILELENMAX];
         memset(szFileLen, 0x0, FILELENMAX);
-        fInputFile.read(szFileLen, FILELENMAX);
+        if(fInputFile.read(szFileLen, FILELENMAX) != FILELENMAX)
+        {
+            qWarning()<<"读取文件长度失败:"<<sInputFile;
+            break;
+        }
         nFileLen = QString(szFileLen).toLongLong();
 
         // 读取文件内容的存放位置
         qint64 nFilePosition = 0;
         char szFilePosition[FILELENMAX];
         memset(szFilePosition, 0x0, FILELENMAX);
-        fInputFile.read(szFilePosition, FILELENMAX);
+        if(fInputFile.read(szFilePosition, FILELENMAX) != FILELENMAX)
+        {
+            qWarning()<<"读取文件位置失败:"<<sInputFile;
+            break;
+        }
         nFilePosition = QString(szFilePosition).toLongLong();
 
         // 跳转到文件内容的存放位置
-        fInputFile.seek(nFilePosition);
+        if(!fInputFile.seek(nFilePosition))
+        {
+            qWarning()<<"定位文件内容失败:"<<sInputFile;
+            break;
+        }
 
         // 新建一个文件
         QFile fOutputFile(sOutputPath);
-        fOutputFile.open(QIODevice::WriteOnly);
+        if(!fOutputFile.open(QIODevice::WriteOnly))
+        {
+            qWarning()<<"打开输出文件失败:"<<sOutputPath;
+            // 跳转到下一个文件的头信息部分
+            nPosition += QHEADERITEMSIZE;
+            if(!fInputFile.seek(nPosition))
+            {
+                qWarning()<<"定位下一个文件头失败:"<<sInputFile;
+                break;
+            }
+            continue;
+        }
 
         qint64 nBufferSize = 0;
         while(nBufferSize < nFileLen)
@@ -165,9 +262,18 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
             }
             else
             {
-                nBufferRealSize = fInputFile.read(szBuf, MAXBUFFERSIZE);
+                nBufferRealSize = fInputFile.read(szBuf, (qint64)MAXBUFFERSIZE);
             }
-            fOutputFile.write(szBuf, nBufferRealSize);
+            if(nBufferRealSize <= 0)
+            {
+                qWarning()<<"读取文件内容失败:"<<sInputFile;
+                break;
+            }
+            if(fOutputFile.write(szBuf, nBufferRealSize) != nBufferRealSize)
+            {
+                qWarning()<<"写入输出文件失败:"<<sOutputPath;
+                break;
+            }
             nBufferSize += nBufferRealSize;
             qDebug()<<"sOutputPath:"<<sOutputPath<<"nBufferSize:"<<nBufferSize<<"nBufferRealSize:"<<nBufferRealSize;
         }
@@ -176,7 +282,11 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 
         // 跳转到下一个文件的头信息部分
         nPosition += QHEADERITEMSIZE;
-        fInputFile.seek(nPosition);
+        if(!fInputFile.seek(nPosition))
+        {
+            qWarning()<<"定位下一个文件头失败:"<<sInputFile;
+            break;
+        }
     }
     delete []szBuf;
     fInputFile.close();
@@ -195,13 +305,23 @@ void FileManager::QLoadMergedFile(QString sFilePath)
     m_qFile.setFileName(sFilePath);
     if(!m_qFile.open(QIODevice::ReadOnly))
     {
-        qDebug()<<"打开合并文件失败:"<<sFilePath;
+        qWarning()<<"打开合并文件失败:"<<sFilePath;
         return;
     }
-    m_qFile.seek(0);
+    if(!m_qFile.seek(0))
+    {
+        qWarning()<<"定位合并文件失败:"<<sFilePath;
+        m_qFile.close();
+        return;
+    }
     char szFileCount[FILECOUNTMAX];
     memset(szFileCount, 0x0, FILECOUNTMAX);
-    m_qFile.read(szFileCount, FILECOUNTMAX);
+    if(m_qFile.read(szFileCount, FILECOUNTMAX) != FILECOUNTMAX)
+    {
+        qWarning()<<"读取文件数量失败:"<<sFilePath;
+        m_qFile.close();
+        return;
+    }
     int nFileCount = QString(szFileCount).toInt();
 
     int nPosition = FILECOUNTMAX;
@@ -211,7 +331,14 @@ void FileManager::QLoadMergedFile(QString sFilePath)
 
         char szFilePath[FILEPATHSIZE];
         memset(szFilePath, 0x0, FILEPATHSIZE);
-        m_qFile.read(szFilePath, FILEPATHSIZE);
+        if(m_qFile.read(szFilePath, FILEPATHSIZE) != FILEPATHSIZE)
+        {
+            qWarning()<<"读取文件路径失败:"<<sFilePath;
+            m_vtFileInfos.clear();
+            m_mapFileInfos.clear();
+            m_qFile.close();
+            return;
+        }
 
         fileInfo.sFilePath = szFilePath;
 
@@ -219,7 +346,14 @@ void FileManager::QLoadMergedFile(QString sFilePath)
         qint64 nFileLen = 0;
         char szFileLen[FILELENMAX];
         memset(szFileLen, 0x0, FILELENMAX);
-        m_qFile.read(szFileLen, FILELENMAX);
+        if(m_qFile.read(szFileLen, FILELENMAX) != FILELENMAX)
+        {
+            qWarning()<<"读取文件长度失败:"<<sFilePath;
+            m_vtFileInfos.clear();
+            m_mapFileInfos.clear();
+            m_qFile.close();
+            return;
+        }
         nFileLen = QString(szFileLen).toLongLong();
         fileInfo.nFileLen = nFileLen;
 
@@ -227,7 +361,14 @@ void FileManager::QLoadMergedFile(QString sFilePath)
         qint64 nFilePosition = 0;
         char szFilePosition[FILELENMAX];
         memset(szFilePosition, 0x0, FILELENMAX);
-        m_qFile.read(szFilePosition, FILELENMAX);
+        if(m_qFile.read(szFilePosition, FILELENMAX) != FILELENMAX)
+        {
+            qWarning()<<"读取文件位置失败:"<<sFilePath;
+            m_vtFileInfos.clear();
+            m_mapFileInfos.clear();
+            m_qFile.close();
+            return;
+        }
         nFilePosition = QString(szFilePosition).toLongLong();
         fileInfo.nContentPositon = nFilePosition;
 
@@ -239,7 +380,14 @@ void FileManager::QLoadMergedFile(QString sFilePath)
 
         // 跳转到下一个文件的头信息部分
         nPosition += QHEADERITEMSIZE;
-        m_qFile.seek(nPosition);
+        if(!m_qFile.seek(nPosition))
+        {
+            qWarning()<<"定位下一个文件头失败:"<<sFilePath;
+            m_vtFileInfos.clear();
+            m_mapFileInfos.clear();
+            m_qFile.close();
+            return;
+        }
     }
 }
 
@@ -269,11 +417,24 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
         return;
 
     // 跳转到文件内容的存放位置
-    m_qFile.seek(cIt.value().nContentPositon);
+    if(!m_qFile.seek(cIt.value().nContentPositon))
+    {
+        qWarning()<<"定位文件内容失败:"<<sFilePath;
+        nFileLen = 0;
+        return;
+    }
 
     *szBuf = new char[nFileLen];
     // 读取文件内容
-    m_qFile.read(*szBuf, nFileLen);
+    qint64 nRead = m_qFile.read(*szBuf, nFileLen);
+    if(nRead != nFileLen)
+    {
+        qWarning()<<"读取文件内容不完整:"<<sFilePath<<"期望"<<nFileLen<<"实际"<<nRead;
+        delete[] *szBuf;
+        *szBuf = nullptr;
+        nFileLen = 0;
+        return;
+    }
 }
 
 QVector<FILEINFO> FileManager::getFileInfos()
@@ -301,8 +462,16 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
     }
 
     QFile fTemp(sOutputFilePath);
-    fTemp.open(QIODevice::WriteOnly);
-    fTemp.write(szBuf, nFileLen);
+    if(!fTemp.open(QIODevice::WriteOnly))
+    {
+        qWarning()<<"打开输出文件失败:"<<sOutputFilePath;
+        delete[] szBuf;
+        return;
+    }
+    if(fTemp.write(szBuf, nFileLen) != nFileLen)
+    {
+        qWarning()<<"写入输出文件失败:"<<sOutputFilePath;
+    }
     fTemp.close();
 
     // 释放 QGetFileContent 分配的内容
