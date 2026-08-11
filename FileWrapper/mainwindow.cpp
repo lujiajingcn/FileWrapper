@@ -276,10 +276,8 @@ void MainWindow::on_actionSplitFile_triggered()
         {
             sSplitFileDir = dlgSplitFile.getSplitFileDir();
         }
-        else
-        {
-            emit QSplitFiles(sMergedFilePath, true, "");
-        }
+
+        emit QSplitFiles(sMergedFilePath, bIsSaveAsOldPath, sSplitFileDir);
     }
 }
 

@@ -97,10 +97,9 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 
     // 获取文件数量
     char szFileCount[FILECOUNTMAX];
+    memset(szFileCount, 0x0, FILECOUNTMAX);
     fInputFile.read(szFileCount, FILECOUNTMAX);
     int nFileCount = QString(szFileCount).toInt();
-
-    qint64 nHeaderSize = FILECOUNTMAX + (FILEPATHSIZE + FILELENMAX + FILELENMAX) * nFileCount;
 
     char *szBuf = new char[MAXBUFFERSIZE];
     int nPosition = FILECOUNTMAX;
@@ -110,14 +109,15 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         memset(szFilePath, 0x0, FILEPATHSIZE);
         fInputFile.read(szFilePath, FILEPATHSIZE);
 
-        QString sName;
+        QString sOutputPath;
         if(bIsSaveAsOldPath)
         {
-            sName = szFilePath;
+            sOutputPath = szFilePath;
         }
         else
         {
-            //todo
+            QString sFileName = getFileName(szFilePath);
+            sOutputPath = sSplitFileDir + "/" + sFileName;
         }
 
         // 读取文件长度
@@ -138,7 +138,7 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         fInputFile.seek(nFilePosition);
 
         // 新建一个文件
-        QFile fOutputFile(sName);
+        QFile fOutputFile(sOutputPath);
         fOutputFile.open(QIODevice::WriteOnly);
 
         qint64 nBufferSize = 0;
@@ -156,7 +156,7 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
             }
             fOutputFile.write(szBuf, nBufferRealSize);
             nBufferSize += nBufferRealSize;
-            qDebug()<<"sName:"<<sName<<"nBufferSize:"<<nBufferSize<<"nBufferRealSize:"<<nBufferRealSize;
+            qDebug()<<"sOutputPath:"<<sOutputPath<<"nBufferSize:"<<nBufferSize<<"nBufferRealSize:"<<nBufferRealSize;
         }
 
         fOutputFile.close();
