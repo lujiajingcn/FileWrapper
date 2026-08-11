@@ -12,10 +12,10 @@ class PluginMedia : public QObject,public PluginInterface
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginMedia" FILE "pluginMedia.json")
 public:
     explicit PluginMedia(QObject *parent = nullptr);
-    void sendFileData(char *szFileData, int nFileLen);
+    void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
 signals:
-    void showVideo(char *szFileData, int nFileLen);
+    void showVideo(char *szFileData, qint64 nFileLen);
 private:
     MainWindow*         m_wMainWindow;
 };

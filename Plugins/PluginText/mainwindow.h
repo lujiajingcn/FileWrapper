@@ -15,7 +15,7 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
-    void showText(char *szBuf, int nFileLen);
+    void showText(char *szBuf, qint64 nFileLen);
 
 private:
     Ui::MainWindow *ui;

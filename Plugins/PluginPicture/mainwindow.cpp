@@ -13,7 +13,7 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::showPicture(char *szBuf, int nFileLen)
+void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
     QPixmap pix;
     pix.loadFromData(reinterpret_cast<uchar*>(szBuf), nFileLen);

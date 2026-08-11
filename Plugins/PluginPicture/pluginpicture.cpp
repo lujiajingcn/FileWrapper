@@ -6,7 +6,7 @@ PluginPicture::PluginPicture(QObject *parent) : QObject(parent)
     m_wMainWindow = new MainWindow;
 }
 
-void PluginPicture::sendFileData(char *szFileData, int nFileLen)
+void PluginPicture::sendFileData(char *szFileData, qint64 nFileLen)
 {
     m_wMainWindow->showPicture(szFileData, nFileLen);
 }

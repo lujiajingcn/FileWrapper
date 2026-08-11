@@ -90,7 +90,7 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     QString sExt = fileInfo.suffix();
 
     char *szBuf = nullptr;
-    int nFileLen = 0;
+    qint64 nFileLen = 0;
     m_fileManager->QGetFileContent(sFilePath, &szBuf, nFileLen);
 
     PluginManager::getInstance()->loadAllPlugins();

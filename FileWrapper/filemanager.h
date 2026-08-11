@@ -15,8 +15,8 @@ typedef struct FILEINFO
 {
     QString sFilePath;          // 文件路径
     QString sFileName;          // 文件名称（包括后缀）
-    int     nFileLen;           // 文件大小
-    int     nContentPositon;    // 文件内容在合并后的文件中的位置
+    qint64  nFileLen;           // 文件大小
+    qint64  nContentPositon;    // 文件内容在合并后的文件中的位置
     int     nState;             // 是否已经删除
 } FILEINFO;
 
@@ -31,7 +31,7 @@ public:
 
     void QLoadMergedFile(QString sFilePath);
     void unLoadMergedFile();
-    void QGetFileContent(QString sFilePath, char **szBuf, int &nFileLen);
+    void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
     QVector<FILEINFO> getFileInfos();
     QString getMergedFilePath();
 

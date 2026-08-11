@@ -5,7 +5,7 @@ PluginText::PluginText(QObject *parent) : QObject(parent)
     m_wMainWindow = new MainWindow;
 }
 
-void PluginText::sendFileData(char *szFileData, int nFileLen)
+void PluginText::sendFileData(char *szFileData, qint64 nFileLen)
 {
     m_wMainWindow->showText(szFileData, nFileLen);
 }

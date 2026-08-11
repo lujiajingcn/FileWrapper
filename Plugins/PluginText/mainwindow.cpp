@@ -13,7 +13,7 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::showText(char *szBuf, int nFileLen)
+void MainWindow::showText(char *szBuf, qint64 nFileLen)
 {
     QByteArray array;
     array.resize(strlen(szBuf));//重置数据大小

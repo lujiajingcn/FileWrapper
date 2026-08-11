@@ -177,9 +177,10 @@ void FileManager::QLoadMergedFile(QString sFilePath)
     m_qFile.setFileName(sFilePath);
     m_qFile.open(QIODevice::ReadOnly);
     m_qFile.seek(0);
-    char *data;
-    m_qFile.read(data, FILECOUNTMAX); // todo 该语句会导致sFilePath变为空
-    int nFileCount = QString(data).toInt();
+    char szFileCount[FILECOUNTMAX];
+    memset(szFileCount, 0x0, FILECOUNTMAX);
+    m_qFile.read(szFileCount, FILECOUNTMAX);
+    int nFileCount = QString(szFileCount).toInt();
 
     int nPosition = FILECOUNTMAX;
     for(int i = 0; i < nFileCount; i++)
@@ -193,19 +194,19 @@ void FileManager::QLoadMergedFile(QString sFilePath)
         fileInfo.sFilePath = szFilePath;
 
         // 读取文件长度
-        int nFileLen = 0;
+        qint64 nFileLen = 0;
         char szFileLen[FILELENMAX];
         memset(szFileLen, 0x0, FILELENMAX);
         m_qFile.read(szFileLen, FILELENMAX);
-        nFileLen = QString(szFileLen).toInt();
+        nFileLen = QString(szFileLen).toLongLong();
         fileInfo.nFileLen = nFileLen;
 
         // 读取文件内容的存放位置
-        int nFilePosition = 0;
+        qint64 nFilePosition = 0;
         char szFilePosition[FILELENMAX];
         memset(szFilePosition, 0x0, FILELENMAX);
         m_qFile.read(szFilePosition, FILELENMAX);
-        nFilePosition = QString(szFilePosition).toInt();
+        nFilePosition = QString(szFilePosition).toLongLong();
         fileInfo.nContentPositon = nFilePosition;
 
         // 分析文件名
@@ -226,7 +227,7 @@ void FileManager::unLoadMergedFile()
         fclose(m_pFile);
 }
 
-void FileManager::QGetFileContent(QString sFilePath, char **szBuf, int &nFileLen)
+void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen)
 {
     QMap<QString,FILEINFO>::const_iterator cIt = m_mapFileInfos.find(sFilePath);
     if(cIt == m_mapFileInfos.end())
@@ -262,7 +263,7 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
     }
 
     char *szBuf = nullptr;
-    int nFileLen = 0;
+    qint64 nFileLen = 0;
 
     QGetFileContent(sFilePath, &szBuf, nFileLen);
 

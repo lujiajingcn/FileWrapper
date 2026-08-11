@@ -7,7 +7,7 @@ class PluginInterface
 {
 public:
     virtual ~PluginInterface(){}
-    virtual void sendFileData(char *szFileData, int nFileLen) = 0;
+    virtual void sendFileData(char *szFileData, qint64 nFileLen) = 0;
     virtual QWidget* getPluginWidget() = 0;
 };
 

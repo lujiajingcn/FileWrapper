@@ -43,7 +43,7 @@ public slots:
    void resizeEvent(QResizeEvent* );
 
 public slots:
-   int showVideo(char *szFileData, int nFileLen);
+   int showVideo(char *szFileData, qint64 nFileLen);
 
 private:
     Ui::MainWindow *ui;

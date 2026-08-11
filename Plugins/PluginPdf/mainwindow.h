@@ -18,7 +18,7 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
-    void showPdf(char *szBuf, int nFileLen);
+    void showPdf(char *szBuf, qint64 nFileLen);
 
 private slots:
     void on_actionFirstPage_triggered();

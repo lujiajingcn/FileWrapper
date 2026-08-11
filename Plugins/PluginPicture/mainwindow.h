@@ -15,7 +15,7 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
-    void showPicture(char *szBuf, int nFileLen);
+    void showPicture(char *szBuf, qint64 nFileLen);
 
 private:
     Ui::MainWindow *ui;

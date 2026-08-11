@@ -12,7 +12,7 @@ class PluginPicture : public QObject,public PluginInterface
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginPicture" FILE "pluginPicture.json")
 public:
     explicit PluginPicture(QObject *parent = nullptr);
-    void sendFileData(char *szFileData, int nFileLen);
+    void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
 
 private:

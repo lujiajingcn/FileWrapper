@@ -6,7 +6,7 @@ PluginMedia::PluginMedia(QObject *parent) : QObject(parent)
     connect(this, &PluginMedia::showVideo, m_wMainWindow, &MainWindow::showVideo);
 }
 
-void PluginMedia::sendFileData(char *szFileData, int nFileLen)
+void PluginMedia::sendFileData(char *szFileData, qint64 nFileLen)
 {
     emit showVideo(szFileData, nFileLen);
 }

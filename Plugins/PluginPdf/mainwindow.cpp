@@ -26,7 +26,7 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::showPdf(char *szBuf, int nFileLen)
+void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
 {
     m_pdfium.loadFromMem(szBuf, nFileLen);
     m_nPageCount = m_pdfium.pageCount();

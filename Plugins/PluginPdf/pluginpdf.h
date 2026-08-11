@@ -12,7 +12,7 @@ class PluginPdf : public QObject,public PluginInterface
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginPdf" FILE "pluginPdf.json")
 public:
     explicit PluginPdf(QObject *parent = nullptr);
-    void sendFileData(char *szFileData, int nFileLen);
+    void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
 
 private:

@@ -44,7 +44,7 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-int MainWindow::showVideo(char *szFileData, int nFileLen)
+int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 {
     videoW = ui->widget->size().width();
     videoH = ui->widget->size().height();
