@@ -133,10 +133,21 @@ void MainWindow::on_actionLoadFile_triggered()
 
     m_fileManager->QLoadMergedFile(sFileName);
 
+    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
+    if(vtFileInfos.isEmpty())
+    {
+        m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
+        m_tvFilePath->header()->setVisible(false);
+        m_acShowFileName->setEnabled(true);
+        m_acShowFilePath->setEnabled(false);
+        QMessageBox().critical(nullptr, "加载失败", "不是有效的归档文件或文件已损坏。\n"
+                                "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
+        return;
+    }
+
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, sFileName);
     m_tvFilePath->header()->setVisible(true);
 
-    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
     int nRow = 0;
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     for(QVector<FILEINFO>::const_iterator cIt = vtFileInfos.begin(); cIt != vtFileInfos.end(); cIt++, nRow++)
@@ -277,6 +288,13 @@ void MainWindow::on_actionSplitFile_triggered()
     if(dlgSplitFile.exec() == QDialog::Accepted)
     {
         QString sMergedFilePath = dlgSplitFile.getMergedFilePath();
+
+        if(!m_fileManager->validateMergedFile(sMergedFilePath))
+        {
+            QMessageBox().critical(nullptr, "分割失败", "不是有效的归档文件或文件已损坏。\n"
+                                    "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
+            return;
+        }
         bool bIsSaveAsOldPath = dlgSplitFile.getIsSaveAsOldPath();
         QString sSplitFileDir = "";
         if(!bIsSaveAsOldPath)

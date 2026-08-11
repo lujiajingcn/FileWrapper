@@ -29,6 +29,7 @@ public:
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
+    bool validateMergedFile(QString sFilePath);
 
 public slots:
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
