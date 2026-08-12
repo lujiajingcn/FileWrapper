@@ -12,6 +12,7 @@ class PluginManager : public QObject
 
 public:
     explicit PluginManager(QObject *parent = nullptr);
+    ~PluginManager();
 
     static PluginManager *getInstance();
 
@@ -28,6 +29,7 @@ private:
     static PluginManager            *m_pInstance;
     PluginInterface                 *m_pInterface = nullptr;
     QMap<QString, PluginInterface*> m_mapPluginInterface;
+    QMap<QString, QPluginLoader*>   m_mapPluginLoaders;
 };
 
 #endif // PLUGINMANAGER_H

@@ -9,6 +9,11 @@ PluginManager::PluginManager(QObject *parent) : QObject (parent)
 {
 }
 
+PluginManager::~PluginManager()
+{
+    qDeleteAll(m_mapPluginLoaders);
+}
+
 PluginManager *PluginManager::getInstance()
 {
     if(m_pInstance == nullptr)
@@ -37,25 +42,34 @@ bool PluginManager::loadPlugin()
 
 void PluginManager::loadAllPlugins()
 {
+    // 已加载过则跳过，避免重复 reload
+    if (!m_mapPluginLoaders.isEmpty())
+        return;
+
     QDir pluginsDir(qApp->applicationDirPath());
     pluginsDir.cd("plugins");
     foreach (QString fileName, pluginsDir.entryList(QDir::Files))
     {
         QString sFilePath = pluginsDir.absoluteFilePath(fileName);
-        QPluginLoader pluginLoader(sFilePath);
-        QObject *plugin = pluginLoader.instance();
+        QPluginLoader *loader = new QPluginLoader(sFilePath, this);
+        QObject *plugin = loader->instance();
         if (plugin)
         {
-            scanMetaData(pluginsDir.absoluteFilePath(fileName));
-            m_pInterface = qobject_cast<PluginInterface *>(plugin);
-            if (m_pInterface)
+            scanMetaData(sFilePath);
+            PluginInterface *iface = qobject_cast<PluginInterface *>(plugin);
+            if (iface)
             {
-                m_mapPluginInterface[sFilePath] = m_pInterface;
+                m_mapPluginInterface[sFilePath] = iface;
+                m_mapPluginLoaders[sFilePath] = loader;
+            }
+            else
+            {
+                delete loader;
             }
         }
         else
         {
-            continue;
+            delete loader;
         }
     }
 }

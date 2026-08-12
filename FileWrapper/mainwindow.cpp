@@ -23,6 +23,9 @@ MainWindow::MainWindow(QWidget *parent) :
 
     m_fileManager = new FileManager;
 
+    // 启动时一次性加载所有插件（避免每次双击重复 reload）
+    PluginManager::getInstance()->loadAllPlugins();
+
 //    connect(this, &MainWindow::mergeFiles, m_fileManager, &FileManager::mergeFiles);
 //    connect(this, &MainWindow::splitFiles, m_fileManager, &FileManager::splitFiles);
 
@@ -98,7 +101,6 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
         return;
     }
 
-    PluginManager::getInstance()->loadAllPlugins();
     PluginInterface* pInterface = nullptr;
 
     QString sPluginPath = choosePlugin(sExt);
@@ -110,12 +112,30 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     }
     pInterface = PluginManager::getInstance()->getInterface(sPluginPath);
 
+    // Fix: getInterface 可能返回 nullptr（插件加载失败但元数据已注册时）
+    if (!pInterface)
+    {
+        qDebug() << "获取插件接口失败:" << sPluginPath;
+        delete[] szBuf;
+        return;
+    }
+
     QWidget *wPlugin = pInterface->getPluginWidget();
 
     int nCurIndex = ui->tabWidget->currentIndex();
-    if(nCurIndex != -1)
+
+    // Fix: 已是目标 widget 则直接复用，避免无意义的 remove/add
+    if (nCurIndex != -1 && ui->tabWidget->widget(nCurIndex) == wPlugin)
+    {
+        pInterface->sendFileData(szBuf, nFileLen);
+        delete[] szBuf;
+        return;
+    }
+
+    if (nCurIndex != -1)
     {
         ui->tabWidget->removeTab(nCurIndex);
+        // 注意：旧 page widget 不删除，它由其 Plugin 实例持有生命周期
     }
     ui->tabWidget->addTab(wPlugin, "");
 
