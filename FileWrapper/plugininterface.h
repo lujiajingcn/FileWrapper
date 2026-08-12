@@ -2,6 +2,7 @@
 #define PLUGININTERFACE_H
 
 #include <QObject>
+#include <QWidget>
 
 class PluginInterface
 {

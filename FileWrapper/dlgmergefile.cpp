@@ -95,13 +95,13 @@ void DlgMergeFile::on_btnOk_clicked()
 {
     if(m_hModelFilePath->rowCount() == 0)
     {
-        QMessageBox().information(nullptr, "", "未选择待合并的文件");
+        QMessageBox::information(this, "提示", "未选择待合并的文件");
         return;
     }
 
     if(ui->leMergedFilePath->text().isEmpty())
     {
-        QMessageBox().information(nullptr, "提示", "合并后的文件路径为空");
+        QMessageBox::information(this, "提示", "合并后的文件路径为空");
         return;
     }
     accept();

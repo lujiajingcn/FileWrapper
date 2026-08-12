@@ -5,11 +5,12 @@
 #include <QStandardItemModel>
 #include <vector>
 #include <string>
-using namespace std;
 #include "filemanager.h"
 #include <QTreeView>
 #include <QStackedWidget>
 #include <QHeaderView>
+#include <QToolBar>
+#include <QAction>
 
 namespace Ui {
 class MainWindow;
@@ -28,8 +29,8 @@ protected:
     void initWidgetFileContent();
 
 signals:
-    void mergeFiles(vector<string> inputFiles, string sMergedFilePath);
-    void splitFiles(string sFilePath, bool bIsSaveAsOldPath, string sSplitFileDir);
+    void mergeFiles(std::vector<std::string> inputFiles, std::string sMergedFilePath);
+    void splitFiles(std::string sFilePath, bool bIsSaveAsOldPath, std::string sSplitFileDir);
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
     void QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir);
 

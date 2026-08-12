@@ -35,6 +35,8 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
+    delete m_fileManager;
+    delete m_hModelFilePath;
     delete ui;
 }
 
@@ -84,7 +86,7 @@ void MainWindow::initWidgetFileContent()
 {
 //    m_swShowArea = ui->stackedWidget;
 }
-#include <QThread>
+
 void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
 {
     FILEINFO fInfo = m_hModelFilePath->itemFromIndex(index)->data().value<FILEINFO>();
@@ -106,7 +108,7 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     QString sPluginPath = choosePlugin(sExt);
     if(sPluginPath.isEmpty())
     {
-        QMessageBox().information(nullptr, "", "没有插件来处理该类型文件，请手动映射插件");
+        QMessageBox::information(this, "", "没有插件来处理该类型文件，请手动映射插件");
         delete[] szBuf;
         return;
     }
@@ -158,9 +160,9 @@ void MainWindow::on_actionLoadFile_triggered()
     {
         m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
         m_tvFilePath->header()->setVisible(false);
-        m_acShowFileName->setEnabled(true);
+        m_acShowFileName->setEnabled(false);
         m_acShowFilePath->setEnabled(false);
-        QMessageBox().critical(nullptr, "加载失败", "不是有效的归档文件或文件已损坏。\n"
+        QMessageBox::critical(this, "加载失败", "不是有效的归档文件或文件已损坏。\n"
                                 "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
         return;
     }
@@ -311,7 +313,7 @@ void MainWindow::on_actionSplitFile_triggered()
 
         if(!m_fileManager->validateMergedFile(sMergedFilePath))
         {
-            QMessageBox().critical(nullptr, "分割失败", "不是有效的归档文件或文件已损坏。\n"
+            QMessageBox::critical(this, "分割失败", "不是有效的归档文件或文件已损坏。\n"
                                     "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
             return;
         }

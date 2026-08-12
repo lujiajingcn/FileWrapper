@@ -2,6 +2,7 @@
 #include <QApplication>
 #include <QDebug>
 #include <QByteArray>
+#include <QDir>
 #include <cstring>
 #include <cstdio>
 
@@ -24,6 +25,9 @@
 //   [12..19] ContentPos  uint64
 //   [20..]   Path        uint8[PathLength] (UTF-8)
 // ============================================================
+//
+// 注意：条目固定部分为 20 字节（FWDAT_ENTRY_FIXED），
+// 此前的注释曾误写为 16。
 
 static const char FWDAT_MAGIC[4] = {'F', 'W', 'D', 'A'};
 static const quint32 FWDAT_VERSION = 1;
@@ -257,26 +261,38 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     QVector<FileInfo> fileVec;
     fileVec.reserve(nCount);
 
-    // 头部 = 全局(24) + 条目(nCount * (16 + pathLen))
+    // 头部 = 全局(24) + 条目(nCount * (20 + pathLen))
     qint64 contentStart = FWDAT_GLOBAL_HDR;
     for (int i = 0; i < nCount; i++)
     {
         QString fp = vtInputFiles.at(i);
-        QFile tmp(fp);
-        if (!tmp.open(QIODevice::ReadOnly))
+        QFile inputFile(fp);
+        if (!inputFile.open(QIODevice::ReadOnly))
         {
             qWarning() << "打开输入文件失败:" << fp;
             fOut.close();
+            QFile::remove(sOutputFile);  // 清理残留的半成品文件
             return;
         }
         FileInfo fi;
         fi.path = fp;
-        fi.size = tmp.size();
-        tmp.close();
+        fi.size = inputFile.size();
+        inputFile.close();
         contentStart += FWDAT_ENTRY_FIXED + fi.path.toUtf8().size();
         fileVec.append(fi);
     }
     qint64 totalHdrSize = contentStart;
+
+    // 头部不应超过 512 MB，否则 quint32 截断会导致 CRC 不匹配
+    if (totalHdrSize < FWDAT_GLOBAL_HDR || totalHdrSize > 512LL * 1024 * 1024
+        || quint64(totalHdrSize) > quint64(0xFFFFFFFFULL))
+    {
+        qWarning() << "合并文件头部过大:" << totalHdrSize;
+        fOut.close();
+        QFile::remove(sOutputFile);
+        return;
+    }
+
     qint64 contentPos = totalHdrSize;
     for (int i = 0; i < nCount; i++)
     {
@@ -332,24 +348,23 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     // —— 写文件内容 ——
     char *buf = new char[MAXBUFFERSIZE];
+    bool bFailed = false;
     for (int i = 0; i < nCount; i++)
     {
         QFile fIn(fileVec[i].path);
         if (!fIn.open(QIODevice::ReadOnly))
         {
             qWarning() << "打开输入文件失败:" << fileVec[i].path;
-            delete[] buf;
-            fOut.close();
-            return;
+            bFailed = true;
+            break;
         }
 
         if (!fOut.seek(fileVec[i].contentPos))
         {
             qWarning() << "定位输出文件失败";
             fIn.close();
-            delete[] buf;
-            fOut.close();
-            return;
+            bFailed = true;
+            break;
         }
 
         qint64 copied = 0;
@@ -362,20 +377,28 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             if (rd <= 0)
             {
                 qWarning() << "读取输入文件失败:" << fileVec[i].path;
+                bFailed = true;
                 break;
             }
             if (fOut.write(buf, rd) != rd)
             {
                 qWarning() << "写入输出文件失败";
+                bFailed = true;
                 break;
             }
             copied += rd;
             qDebug() << "merge" << fileVec[i].path << copied << "/" << fileVec[i].size;
         }
         fIn.close();
+        if (bFailed)
+            break;
     }
     delete[] buf;
     fOut.close();
+
+    // 任一文件写入失败 → 删除不完整的归档，避免生成"头部有效但内容缺失"的坏文件
+    if (bFailed)
+        QFile::remove(sOutputFile);
 }
 
 // ---- 分割文件 ----
@@ -468,6 +491,17 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         else
             sOutputPath = sSplitFileDir + "/" + getFileName(entries[i].origPath);
 
+        // 确保输出目录存在，否则打开输出文件会失败
+        QString sOutputDir = QFileInfo(sOutputPath).absolutePath();
+        if (!sOutputDir.isEmpty() && !QDir().exists(sOutputDir))
+        {
+            if (!QDir().mkpath(sOutputDir))
+            {
+                qWarning() << "创建输出目录失败:" << sOutputDir;
+                continue;
+            }
+        }
+
         // 跳至内容区
         if (!fIn.seek(entries[i].contentPos))
         {
@@ -524,9 +558,8 @@ void FileManager::QLoadMergedFile(QString sFilePath)
         return;
     }
 
-    quint32 fileCount, hdrSize;
-    quint32 tmp; // contentStart unused here, but needed for function
-    if (!readAndValidateHeader(m_qFile, fileCount, hdrSize, tmp))
+    quint32 fileCount, hdrSize, contentStart;
+    if (!readAndValidateHeader(m_qFile, fileCount, hdrSize, contentStart))
     {
         m_qFile.close();
         return;
@@ -662,7 +695,12 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
 {
     QString sOutputFilePath;
     if (!sOutputDir.isEmpty())
+    {
+        // 确保输出目录存在
+        if (!QDir().exists(sOutputDir) && !QDir().mkpath(sOutputDir))
+            qWarning() << "创建输出目录失败:" << sOutputDir;
         sOutputFilePath = sOutputDir + "/" + getFileName(sFilePath);
+    }
     else
         sOutputFilePath = sFilePath;
 
@@ -691,8 +729,8 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
 
 QString FileManager::getFileName(QString sFilePath)
 {
-    int pos = (sFilePath.lastIndexOf('\\') + 1) == 0
-        ? sFilePath.lastIndexOf('/') + 1
-        : sFilePath.lastIndexOf('\\') + 1;
-    return sFilePath.right(sFilePath.length() - pos);
+    // 取最后一个 '/' 或 '\' 之后的部分作为文件名；
+    // 正确同时处理 Unix(/)、Windows(\) 以及混合分隔符路径。
+    int nPos = qMax(sFilePath.lastIndexOf('/'), sFilePath.lastIndexOf('\\'));
+    return sFilePath.right(sFilePath.length() - (nPos + 1));
 }

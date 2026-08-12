@@ -2,6 +2,8 @@
 #include <QDir>
 #include <QDebug>
 #include <QApplication>
+#include <QLibrary>
+#include <QPluginLoader>
 
 PluginManager *PluginManager::m_pInstance = nullptr;
 
@@ -23,21 +25,10 @@ PluginManager *PluginManager::getInstance()
 
 bool PluginManager::loadPlugin()
 {
-    QDir pluginsDir(qApp->applicationDirPath());
-    pluginsDir.cd("plugins");
-    foreach (QString fileName, pluginsDir.entryList(QDir::Files))
-    {
-        QPluginLoader pluginLoader(pluginsDir.absoluteFilePath(fileName));
-        QObject *plugin = pluginLoader.instance();
-        if (plugin)
-        {
-            scanMetaData(pluginsDir.absoluteFilePath(fileName));
-            m_pInterface = qobject_cast<PluginInterface *>(plugin);
-            if (m_pInterface)
-                return true;
-        }
-    }
-    return false;
+    // 原始实现使用栈上的 QPluginLoader，函数返回时 DLL 被卸载，
+    // m_pInterface 变成悬空指针。已改为委托给 loadAllPlugins()。
+    loadAllPlugins();
+    return m_pInterface != nullptr;
 }
 
 void PluginManager::loadAllPlugins()

@@ -68,12 +68,12 @@ void DlgSplitFile::on_btnOk_clicked()
 {
     if(ui->leMergedFilePath->text().isEmpty())
     {
-        QMessageBox().information(nullptr, "", "未选择待分割的文件");
+        QMessageBox::information(this, "提示", "未选择待分割的文件");
         return;
     }
     if(ui->brSaveAsSelectedDir->isChecked() && ui->leSplittedFileDir->text().isEmpty())
     {
-        QMessageBox().information(nullptr, "", "按照选择的目录存放分割后的文件时 目录不能为空");
+        QMessageBox::information(this, "提示", "按照选择的目录存放分割后的文件时 目录不能为空");
         return;
     }
 
