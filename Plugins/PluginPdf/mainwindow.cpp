@@ -11,6 +11,7 @@ MainWindow::MainWindow(QWidget *parent) :
 
     m_lbContent = ui->label;
     m_nCurPage = 0;
+    m_nPageCount = 0;
     m_nScale = 100;
 
     //页码
@@ -28,7 +29,11 @@ MainWindow::~MainWindow()
 
 void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
 {
-    m_pdfium.loadFromMem(szBuf, nFileLen);
+    // 复制一份数据由本对象持有：PDFium 的 loadFromMem 只保存数据指针而不复制，
+    // 主程序会在 sendFileData 返回后释放原始缓冲区，
+    // 若不复制，翻页时访问已释放内存会导致 use-after-free 崩溃。
+    m_pdfData = QByteArray(szBuf, nFileLen);
+    m_pdfium.loadFromMem(m_pdfData.constData(), m_pdfData.size());
     m_nPageCount = m_pdfium.pageCount();
     gotoPage();
 }
@@ -50,15 +55,16 @@ void MainWindow::on_actionPrePage_triggered()
 
 void MainWindow::on_actionNextPage_triggered()
 {
-    if(m_nCurPage < m_nPageCount - 1)
-    {
-        m_nCurPage++;
-        gotoPage();
-    }
+    if(m_nPageCount <= 0 || m_nCurPage >= m_nPageCount - 1)
+        return;
+    m_nCurPage++;
+    gotoPage();
 }
 
 void MainWindow::on_actionLastPage_triggered()
 {
+    if(m_nPageCount <= 0)
+        return;
     m_nCurPage = m_nPageCount - 1;
     gotoPage();
 }
@@ -99,10 +105,15 @@ void MainWindow::gotoPage()
 
 void MainWindow::updatePage()
 {
+    if(!m_pdfium.isValid() || m_nPageCount <= 0 || m_nCurPage < 0 || m_nCurPage >= m_nPageCount)
+        return;
+
     QPdfiumPage pfPage = m_pdfium.page(m_nCurPage);
     int nPageWidth = pfPage.width();
     int nPageHeight = pfPage.height();
     QImage pdfImage = pfPage.image();
+    if(pdfImage.isNull())
+        return;
     QPixmap pixMap = QPixmap::fromImage(pdfImage);
     int nNewWidth = nPageWidth * m_nScale / 100;
     int nNewHeight = nPageHeight * m_nScale / 100;

@@ -2,6 +2,7 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QByteArray>
 #include "qpdfium.h"
 #include <QLabel>
 #include <QLineEdit>
@@ -49,6 +50,7 @@ private:
     int             m_nScale;
     QLabel          *m_lbContent;
     QLineEdit       *m_lePageNum;
+    QByteArray      m_pdfData;  // 持有 PDF 数据副本，防止主程序 delete[] 后 use-after-free
 
     Ui::MainWindow *ui;
 };
