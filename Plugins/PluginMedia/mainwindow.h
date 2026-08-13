@@ -16,11 +16,10 @@ extern "C"
     #include <libavformat/version.h>
     #include <libavutil/time.h>
     #include <libavutil/mathematics.h>
-    #include <libavfilter/buffersink.h>
-    #include <libavfilter/buffersrc.h>
     #include <libavutil/avutil.h>
     #include <libavutil/imgutils.h>
     #include <libavutil/pixfmt.h>
+    #include <libavutil/frame.h>
     #include <libswresample/swresample.h>
 }
 
@@ -46,25 +45,23 @@ public slots:
    int showVideo(char *szFileData, qint64 nFileLen);
 
 private:
-    Ui::MainWindow *ui;
-    QTimer *timer;      // 定时播放，根据帧率来
-    int videoW,videoH;  // 图像宽高
+    void clearFFmpegResources();
 
-    AVFormatContext	*pFormatCtx;
-    AVCodecContext  *pCodecCtx;
-    AVCodec         *pCodec;
-    AVFrame         *pFrame, *pFrameRGB;
-    int ret, got_picture,got_audio;  // 视频解码标志
-    int videoindex;        // 视频序号
-    // 音频
-    int audioindex;        // 音频序号
-    AVCodecParameters   *aCodecParameters;
-    AVCodec             *aCodec;
-    AVCodecContext      *aCodecCtx;
-    QByteArray          byteBuf;//音频缓冲
-    QAudioOutput        *audioOutput;
-    QIODevice           *streamOut;
+private:
+    Ui::MainWindow *ui;
+    QTimer *timer;
+    int videoW, videoH;
+
+    AVFormatContext *pFormatCtx = nullptr;
+    AVCodecContext  *pCodecCtx  = nullptr;
+    AVFrame         *pFrame     = nullptr, *pFrameRGB = nullptr;
+    int videoindex = -1;
+
+    int             audioindex = -1;
+    AVCodecContext  *aCodecCtx  = nullptr;
+    QByteArray      byteBuf;
+    QAudioOutput    *audioOutput;
+    QIODevice       *streamOut;
 };
 
 #endif // MAINWINDOW_H
-
