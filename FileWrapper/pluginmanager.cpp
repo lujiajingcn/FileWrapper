@@ -2,7 +2,6 @@
 #include <QDir>
 #include <QDebug>
 #include <QApplication>
-#include <QLibrary>
 #include <QPluginLoader>
 
 PluginManager *PluginManager::m_pInstance = nullptr;
@@ -14,6 +13,8 @@ PluginManager::PluginManager(QObject *parent) : QObject (parent)
 PluginManager::~PluginManager()
 {
     qDeleteAll(m_mapPluginLoaders);
+    m_mapPluginLoaders.clear();
+    m_mapPluginInterface.clear();
 }
 
 PluginManager *PluginManager::getInstance()
@@ -21,14 +22,6 @@ PluginManager *PluginManager::getInstance()
     if(m_pInstance == nullptr)
         m_pInstance = new PluginManager;
     return m_pInstance;
-}
-
-bool PluginManager::loadPlugin()
-{
-    // 原始实现使用栈上的 QPluginLoader，函数返回时 DLL 被卸载，
-    // m_pInterface 变成悬空指针。已改为委托给 loadAllPlugins()。
-    loadAllPlugins();
-    return m_pInterface != nullptr;
 }
 
 void PluginManager::loadAllPlugins()
@@ -46,46 +39,25 @@ void PluginManager::loadAllPlugins()
         QObject *plugin = loader->instance();
         if (plugin)
         {
-            scanMetaData(sFilePath);
             PluginInterface *iface = qobject_cast<PluginInterface *>(plugin);
             if (iface)
             {
                 m_mapPluginInterface[sFilePath] = iface;
                 m_mapPluginLoaders[sFilePath] = loader;
+                qDebug() << "[Plugin] Loaded:" << sFilePath;
             }
             else
             {
+                qWarning() << "[Plugin] Cast failed (not a PluginInterface):" << sFilePath;
                 delete loader;
             }
         }
         else
         {
+            qWarning() << "[Plugin] Load failed:" << sFilePath << "-" << loader->errorString();
             delete loader;
         }
     }
-}
-
-
-void PluginManager::scanMetaData(const QString &sPath)
-{
-    // 判断是否为库（后缀有效性）
-    if(!QLibrary::isLibrary(sPath))
-        return;
-
-    QPluginLoader* loader = new QPluginLoader(sPath);
-    QJsonObject jObj = loader->metaData().value("MetaData").toObject();
-    for(int i = 0; i < jObj.keys().size(); ++i)
-    {
-//        qDebug()<<jObj.keys().at(i)<< " : "<<jObj.value(jObj.keys().at(i)) << endl;
-    }
-
-    delete loader;
-    loader = nullptr;
-}
-
-PluginInterface* PluginManager::getInterface()
-{
-    return m_pInterface;
 }
 
 PluginInterface* PluginManager::getInterface(QString sPluginPath)

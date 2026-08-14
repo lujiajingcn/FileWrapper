@@ -16,18 +16,12 @@ public:
 
     static PluginManager *getInstance();
 
-    bool loadPlugin();
-
     void loadAllPlugins();
 
-    void scanMetaData(const QString &sPath);
-
-    PluginInterface* getInterface();
     PluginInterface* getInterface(QString sPluginPath);
 
 private:
     static PluginManager            *m_pInstance;
-    PluginInterface                 *m_pInterface = nullptr;
     QMap<QString, PluginInterface*> m_mapPluginInterface;
     QMap<QString, QPluginLoader*>   m_mapPluginLoaders;
 };

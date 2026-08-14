@@ -39,7 +39,9 @@ public:
 
 public slots:
    void timeCallback(void);
-   void resizeEvent(QResizeEvent* );
+
+protected:
+   void resizeEvent(QResizeEvent*) override;
 
 public slots:
    int showVideo(char *szFileData, qint64 nFileLen);
@@ -67,6 +69,8 @@ private:
     AVFormatContext *pFormatCtx = nullptr;
     AVCodecContext  *pCodecCtx  = nullptr;
     AVFrame         *pFrame     = nullptr, *pFrameRGB = nullptr;
+    unsigned char   *m_avioBuffer = nullptr;  // AVIO 内存缓冲（需手动释放）
+    AVIOContext     *m_avioCtx   = nullptr;   // 手动创建的 AVIO 上下文（需手动释放）
     int videoindex = -1;
 
     int             audioindex = -1;

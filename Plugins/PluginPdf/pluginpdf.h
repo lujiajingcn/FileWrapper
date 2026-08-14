@@ -1,5 +1,5 @@
-#ifndef PLUGINA_H
-#define PLUGINA_H
+#ifndef PLUGINPDF_H
+#define PLUGINPDF_H
 
 #include "mainwindow.h"
 
@@ -12,6 +12,7 @@ class PluginPdf : public QObject,public PluginInterface
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginPdf" FILE "pluginPdf.json")
 public:
     explicit PluginPdf(QObject *parent = nullptr);
+    ~PluginPdf();
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
 
@@ -19,4 +20,4 @@ private:
     MainWindow*         m_wMainWindow;
 };
 
-#endif // PLUGINA_H
+#endif // PLUGINPDF_H

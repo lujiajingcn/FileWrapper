@@ -54,12 +54,15 @@ void MainWindow::timeCallback(void)
     }
 
     // 3. 音频缓存播放
-    if (audioOutput && audioOutput->state() != QAudio::StoppedState
+    if (audioOutput && streamOut && audioOutput->state() != QAudio::StoppedState
      && audioOutput->state() != QAudio::SuspendedState)
     {
         int writeBytes = qMin(byteBuf.length(), audioOutput->bytesFree());
-        streamOut->write(byteBuf.data(), writeBytes);
-        byteBuf = byteBuf.right(byteBuf.length() - writeBytes);
+        if (writeBytes > 0)
+        {
+            streamOut->write(byteBuf.data(), writeBytes);
+            byteBuf = byteBuf.right(byteBuf.length() - writeBytes);
+        }
     }
 
     // 4. 最后更新 UI 显示（避免覆盖 seek 后的位置）
@@ -96,6 +99,9 @@ void MainWindow::clearFFmpegResources()
     if (pCodecCtx)  { avcodec_free_context(&pCodecCtx);  pCodecCtx = nullptr; }
     if (aCodecCtx)  { avcodec_free_context(&aCodecCtx);  aCodecCtx = nullptr; }
     if (pFormatCtx) { avformat_close_input(&pFormatCtx); pFormatCtx = nullptr; }
+    // 手动释放 AVIOContext 及底层缓冲区，防止每次 showVideo() 泄漏整份文件内存
+    if (m_avioCtx) { avio_context_free(&m_avioCtx); m_avioCtx = nullptr; }
+    if (m_avioBuffer) { av_freep(&m_avioBuffer); m_avioBuffer = nullptr; }
     videoindex = -1;
     audioindex = -1;
     m_bPlaying = false;
@@ -379,13 +385,19 @@ bool MainWindow::decodeOneFrame(AVPacket *packet)
 
     av_packet_unref(packet);
 
-    // 节奏控制
-    Delay_MSec(frameRate - 5);
+    // 节奏控制：等待至多 frameRate-5ms，避免累积延迟（-5 补偿解码耗时）
+    int delay = frameRate - 5;
+    if (delay < 0) delay = 0;
+    if (delay > 0)
+        Delay_MSec(delay);
     return true;
 }
 
 int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 {
+    if (szFileData == nullptr || nFileLen <= 0)
+        return -1;
+
     videoW = ui->videoLabel->size().width();
     videoH = ui->videoLabel->size().height();
 
@@ -411,10 +423,22 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     pFormatCtx = avformat_alloc_context();
 
     // 将传入的数据拷贝到 AVIOContext（FFmpeg 内部管理）
-    unsigned char *aviobuffer = (unsigned char *)av_malloc(nFileLen);
-    memcpy(aviobuffer, szFileData, nFileLen);
-    AVIOContext *avio = avio_alloc_context(aviobuffer, nFileLen, 0, nullptr, nullptr, nullptr, nullptr);
-    pFormatCtx->pb = avio;
+    m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
+    if (!m_avioBuffer)
+    {
+        qWarning() << "AVIO buffer allocation failed.";
+        return -1;
+    }
+    memcpy(m_avioBuffer, szFileData, nFileLen);
+    m_avioCtx = avio_alloc_context(m_avioBuffer, nFileLen, 0, nullptr, nullptr, nullptr, nullptr);
+    if (!m_avioCtx)
+    {
+        qWarning() << "AVIO context allocation failed.";
+        av_freep(&m_avioBuffer);
+        m_avioBuffer = nullptr;
+        return -1;
+    }
+    pFormatCtx->pb = m_avioCtx;
 
     if (avformat_open_input(&pFormatCtx, nullptr, nullptr, nullptr) != 0)
     {
@@ -465,12 +489,14 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     pCodecCtx = avcodec_alloc_context3(nullptr);
     avcodec_parameters_to_context(pCodecCtx, pFormatCtx->streams[videoindex]->codecpar);
 
-    // 获取帧率
+    // 获取帧率：直接使用 AVRational 精确计算，避免对真实高帧率内容的错误降频
     AVRational frame_rate = av_guess_frame_rate(pFormatCtx, pFormatCtx->streams[videoindex], nullptr);
-    float fps = av_q2d(frame_rate);
-    if (fps > 100) fps = fps / 1001;
-    if (fps <= 0) fps = 25;
-    frameRate = static_cast<int>(1000.0 / fps);
+    if (frame_rate.num > 0 && frame_rate.den > 0)
+        frameRate = static_cast<int>(1000.0 * frame_rate.den / frame_rate.num);
+    else
+        frameRate = 1000 / 25;  // 保底 25fps
+    float fps = 1000.0f / frameRate;
+    if (frameRate <= 0) frameRate = 1000 / 25;
     qDebug() << "帧/秒 = " << fps << " 播放间隔 = " << frameRate << "ms";
 
     // 打开视频解码器
@@ -511,10 +537,10 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     // 音频重采样设置
     const AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_S16;
-    out_sample_rate = aCodecCtx->sample_rate;
+    out_sample_rate = 44100;  // 必须与 QAudioOutput 的采样率一致
 
-    // 输出缓冲区
-    audio_out_buffer = (uint8_t *)av_malloc(MAX_AUDIO_FRAME_SIZE * 2);
+    // 输出缓冲区：MAX_AUDIO_FRAME_SIZE 是"每通道样本数"，实际字节 = samples × channels × bytes_per_sample
+    audio_out_buffer = (uint8_t *)av_malloc(MAX_AUDIO_FRAME_SIZE * 4);
 
     // 重采样上下文
     swr_ctx = nullptr;

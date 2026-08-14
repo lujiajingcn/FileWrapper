@@ -15,10 +15,11 @@ MainWindow::~MainWindow()
 
 void MainWindow::showText(char *szBuf, qint64 nFileLen)
 {
-    QByteArray array;
-    array.resize(strlen(szBuf));//重置数据大小
-    memcpy(array.data(), szBuf, strlen(szBuf));//copy数据
-    QString str;
-    str.prepend(array);
+    if (szBuf == nullptr || nFileLen <= 0)
+        return;
+
+    // 使用 nFileLen 作为长度（而非 strlen），避免读取越界或 NUL 截断
+    QByteArray array(szBuf, (int)nFileLen);
+    QString str(array);
     ui->textEdit->setText(str);
 }

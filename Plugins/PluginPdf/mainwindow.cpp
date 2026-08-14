@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 #include <QDebug>
 #include <QFile>
+#include <climits>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -24,17 +25,25 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
+    delete m_lePageNum;
     delete ui;
 }
 
 void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
 {
+    if (szBuf == nullptr || nFileLen <= 0)
+        return;
+
     // 复制一份数据由本对象持有：PDFium 的 loadFromMem 只保存数据指针而不复制，
     // 主程序会在 sendFileData 返回后释放原始缓冲区，
     // 若不复制，翻页时访问已释放内存会导致 use-after-free 崩溃。
-    m_pdfData = QByteArray(szBuf, nFileLen);
+    m_pdfData = QByteArray(szBuf, (int)nFileLen);
+    // loadFromMem 形参为 int；超过 int 范围的 PDF 已超出该库支持能力，做上限校验
+    if (m_pdfData.size() > INT_MAX)
+        m_pdfData = m_pdfData.left(INT_MAX);
     m_pdfium.loadFromMem(m_pdfData.constData(), m_pdfData.size());
     m_nPageCount = m_pdfium.pageCount();
+    if (m_nPageCount < 0) m_nPageCount = 0;
     gotoPage();
 }
 
@@ -117,8 +126,7 @@ void MainWindow::updatePage()
     QPixmap pixMap = QPixmap::fromImage(pdfImage);
     int nNewWidth = nPageWidth * m_nScale / 100;
     int nNewHeight = nPageHeight * m_nScale / 100;
-    pixMap = pixMap.scaledToWidth(nNewWidth);
-    pixMap = pixMap.scaledToHeight(nNewHeight);
+    pixMap = pixMap.scaled(nNewWidth, nNewHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation);
     m_lbContent->setPixmap(pixMap);
 }
 
@@ -131,6 +139,12 @@ void MainWindow::getLineEditPageNum()
     if(nIndex != -1)
         return;
     m_nCurPage = sPageNum.toInt() - 1;
+    // 限制页码到有效范围
+    if (m_nPageCount > 0)
+    {
+        if (m_nCurPage < 0) m_nCurPage = 0;
+        if (m_nCurPage >= m_nPageCount) m_nCurPage = m_nPageCount - 1;
+    }
 }
 
 void MainWindow::setLineEditPageNum()

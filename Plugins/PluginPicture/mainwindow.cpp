@@ -17,17 +17,30 @@ MainWindow::~MainWindow()
 
 void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
+    if (szBuf == nullptr || nFileLen <= 0)
+        return;
+
     QPixmap pix;
-    pix.loadFromData(reinterpret_cast<uchar*>(szBuf), nFileLen);
+    if (!pix.loadFromData(reinterpret_cast<uchar*>(szBuf), (int)nFileLen))
+    {
+        // 图片解码失败：给出提示，避免静默显示空白
+        ui->labelPicture->setText("无法加载图片：数据已损坏或格式不受支持。");
+        ui->labelPicture->setPixmap(QPixmap());
+        m_originalPix = QPixmap();
+        return;
+    }
     m_originalPix = pix;
 
-    // 初始缩放：适配窗口高度
+    // 初始缩放：适配窗口高度；窗口尚未显示时用原图尺寸保底，避免大图溢出
     m_scale = 1.0;
     if (!m_originalPix.isNull() && m_originalPix.height() > 0)
     {
         int availH = ui->scrollArea->viewport()->height();
         if (availH > 0)
             m_scale = (qreal)availH / m_originalPix.height();
+        else
+            m_scale = (qreal)qMin(this->height(), 600) / m_originalPix.height();
+        if (m_scale <= 0.0) m_scale = 1.0;
     }
     m_rotateDeg = 0;
     applyTransform();

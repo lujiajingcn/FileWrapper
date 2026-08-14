@@ -1,5 +1,5 @@
-#ifndef PLUGINA_H
-#define PLUGINA_H
+#ifndef PLUGINMEDIA_H
+#define PLUGINMEDIA_H
 
 #include "mainwindow.h"
 
@@ -12,6 +12,7 @@ class PluginMedia : public QObject,public PluginInterface
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginMedia" FILE "pluginMedia.json")
 public:
     explicit PluginMedia(QObject *parent = nullptr);
+    ~PluginMedia();
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
 signals:
@@ -20,4 +21,4 @@ private:
     MainWindow*         m_wMainWindow;
 };
 
-#endif // PLUGINA_H
+#endif // PLUGINMEDIA_H

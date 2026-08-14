@@ -26,9 +26,6 @@ MainWindow::MainWindow(QWidget *parent) :
     // 启动时一次性加载所有插件（避免每次双击重复 reload）
     PluginManager::getInstance()->loadAllPlugins();
 
-//    connect(this, &MainWindow::mergeFiles, m_fileManager, &FileManager::mergeFiles);
-//    connect(this, &MainWindow::splitFiles, m_fileManager, &FileManager::splitFiles);
-
     connect(this, &MainWindow::QMergeFiles, m_fileManager, &FileManager::QMergeFiles);
     connect(this, &MainWindow::QSplitFiles, m_fileManager, &FileManager::QSplitFiles);
 }
@@ -148,7 +145,6 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
 
 void MainWindow::on_actionLoadFile_triggered()
 {
-    QFileDialog fileDialog;
     QString sFileName = QFileDialog::getOpenFileName(this, tr("加载文件"), "", tr("Class Files (*.dat);;All Files (*.*)"));
     if(sFileName.isEmpty())
         return;
@@ -364,12 +360,12 @@ void MainWindow::onActionShowFileNameTriggered()
 
 void MainWindow::onActionAddFileTriggered()
 {
-
+    QMessageBox::information(this, tr("添加文件"), tr("功能开发中，敬请期待。"));
 }
 
 void MainWindow::onActionDelFileTriggered()
 {
-
+    QMessageBox::information(this, tr("删除文件"), tr("功能开发中，敬请期待。"));
 }
 
 void MainWindow::onActionOutputFileTriggered()
@@ -392,7 +388,7 @@ void MainWindow::onActionOutputFileTriggered()
 
 void MainWindow::onActionSaveFileTriggered()
 {
-
+    QMessageBox::information(this, tr("保存文件"), tr("功能开发中，敬请期待。"));
 }
 
 void MainWindow::on_actionAbout_triggered()
@@ -403,7 +399,7 @@ void MainWindow::on_actionAbout_triggered()
 
 void MainWindow::on_actionPluginMap_triggered()
 {
-
+    QMessageBox::information(this, tr("插件映射"), tr("功能开发中，敬请期待。"));
 }
 
 void MainWindow::on_actionUnloadFile_triggered()
