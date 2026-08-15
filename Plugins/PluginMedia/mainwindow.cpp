@@ -81,6 +81,12 @@ void VideoWorker::setPaused(bool paused)
     m_pauseCond.wakeAll();
 }
 
+void VideoWorker::updateGenId(int genId)
+{
+    QMutexLocker locker(&m_mutex);
+    m_genId = genId;
+}
+
 bool VideoWorker::waitForDecodingStopped(unsigned long timeoutMs)
 {
     QMutexLocker locker(&m_mutex);
@@ -188,7 +194,7 @@ void VideoWorker::doDecode()
                         if (ptsMs < 0) ptsMs = 0;
                     }
 
-                    emit frameDecoded(img, ptsMs);
+                    emit frameDecoded(img, ptsMs, m_genId);
 
                     if (ptsMs > 0)
                         m_lastPtsMs = ptsMs;
@@ -371,9 +377,13 @@ void MainWindow::timeCallback(void)
     updateProgressDisplay();
 }
 
-void MainWindow::onFrameDecoded(QImage img, qint64 ptsMs)
+void MainWindow::onFrameDecoded(QImage img, qint64 ptsMs, int genId)
 {
     if (!m_bPlaying || m_bPaused)
+        return;
+
+    // 过滤 seek 前的旧帧信号：只有当 genId 与当前 m_genCounter 一致时，才更新进度条和画面
+    if (genId != m_genCounter)
         return;
 
     QPixmap temp = QPixmap::fromImage(img);
@@ -675,6 +685,10 @@ void MainWindow::doSeek(qint64 ms)
     m_bPlaying = true;
 
     if (audioOutput) audioOutput->resume();
+
+    // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded 过滤掉（避免进度条回跳）
+    m_genCounter++;
+    QMetaObject::invokeMethod(m_videoWorker, "updateGenId", Qt::DirectConnection, Q_ARG(int, m_genCounter));
 
     // 清除 stop 标志，然后重新启动视频解码线程
     QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);

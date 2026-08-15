@@ -65,7 +65,7 @@ public:
     bool waitForDecodingStopped(unsigned long timeoutMs = 2000);
 
 signals:
-    void frameDecoded(QImage img, qint64 ptsMs);
+    void frameDecoded(QImage img, qint64 ptsMs, int genId);
     void decodingFinished(int genId);
 
 public slots:
@@ -74,6 +74,8 @@ public slots:
     void clearStopRequest();
     // 暂停/恢复解码线程的 PTS 帧调度（不退出循环，仅阻塞在条件变量上）
     void setPaused(bool paused);
+    // 更新当前播放世代（用于 seek 时过滤排队的旧帧信号）
+    void updateGenId(int genId);
 
     bool isDecodingActive() const { return m_running.load(std::memory_order_relaxed) != 0; }
 
@@ -136,7 +138,7 @@ private slots:
    void on_volumeSlider_valueChanged(int value);
 
    // VideoWorker 信号槽
-   void onFrameDecoded(QImage img, qint64 ptsMs);
+   void onFrameDecoded(QImage img, qint64 ptsMs, int genId);
    void onDecodingFinished(int genId);
 
 private:
