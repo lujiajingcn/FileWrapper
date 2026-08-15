@@ -32,7 +32,8 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
                               uint8_t *aOutBuf,
                               QMutex *aMutex,
                               QByteArray *aByteBuf,
-                              int outSampleRate, int genId)
+                              int outSampleRate, int genId,
+                              int audioOutBufCapacity)
 {
     QMutexLocker locker(&m_mutex);
     pFormatCtx = fmtCtx;
@@ -54,6 +55,7 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
     m_audioMutex = aMutex;
     m_audioByteBuf = aByteBuf;
     m_outSampleRate = outSampleRate;
+    m_audioOutBufCapacity = audioOutBufCapacity;
     m_genId = genId;
     // 新播放开始时清除 stop 与 pause 标志
     m_stopRequested.store(0, std::memory_order_relaxed);
@@ -256,7 +258,13 @@ void VideoWorker::doDecode()
 
                     if (swr_ctx)
                     {
-                        int len = swr_convert(swr_ctx, &audio_out_buffer, m_outSampleRate,
+                        // 使用 swr_get_out_samples 获取含内部延迟的上限输出样本数，
+                        // 并以实际缓冲区容量为上限，避免 swr_convert 写入超出缓冲区
+                        int out_count = swr_get_out_samples(swr_ctx, pAudioFrame->nb_samples);
+                        if (out_count <= 0 || out_count > m_audioOutBufCapacity)
+                            out_count = m_audioOutBufCapacity;
+
+                        int len = swr_convert(swr_ctx, &audio_out_buffer, out_count,
                                               (const uint8_t **)pAudioFrame->data, pAudioFrame->nb_samples);
                         if (len > 0)
                         {
@@ -919,21 +927,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     // 音频重采样设置
     out_sample_rate = AUDIO_OUT_SAMPLE_RATE;
-    // 计算重采样输出缓冲大小：以解码器帧大小（或采样率作为上界）推算最大输出样本数
-    int in_samples = aCodecCtx->frame_size;
-    if (in_samples <= 0) in_samples = aCodecCtx->sample_rate;
-    int audio_out_samples_max = (int)av_rescale_rnd(
-        in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
-    audio_out_buffer = (uint8_t *)av_malloc(
-        av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS, audio_out_samples_max, AUDIO_OUT_FORMAT, 1));
-    if (!audio_out_buffer)
-    {
-        qWarning() << "[ShowVideo] 音频输出缓冲分配失败.";
-        clearFFmpegResources();
-        return -1;
-    }
 
-    // 重采样上下文（参照 resample_audio.c）
+    // 1. 先创建并初始化重采样上下文（参照 resample_audio.c）
     swr_ctx = nullptr;
     int swr_ret = swr_alloc_set_opts2(&swr_ctx, &out_ch_layout, AUDIO_OUT_FORMAT, out_sample_rate,
                                       &aCodecCtx->ch_layout, aCodecCtx->sample_fmt,
@@ -950,6 +945,42 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     else if (swr_init(swr_ctx) < 0)
     {
         qWarning() << "[ShowVideo] 音频重采样初始化失败.";
+        swr_free(&swr_ctx);
+        swr_ctx = nullptr;
+    }
+
+    // 2. 计算重采样输出缓冲大小
+    //    使用 swr_get_out_samples() 获取含内部滤波器延迟的实际所需缓冲区大小，
+    //    避免 swr_convert 写入超出缓冲区（特别是采样率不同时的重采样场景）。
+    int in_samples = aCodecCtx->frame_size;
+    if (in_samples <= 0) in_samples = aCodecCtx->sample_rate;
+    int audio_out_samples_max;
+    if (swr_ctx)
+    {
+        audio_out_samples_max = swr_get_out_samples(swr_ctx, in_samples);
+        if (audio_out_samples_max <= 0)
+        {
+            // swr_get_out_samples 返回非正值时，回退到按比例估算
+            audio_out_samples_max = (int)av_rescale_rnd(
+                in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
+        }
+    }
+    else
+    {
+        // swr_ctx 不可用时，按比例估算
+        audio_out_samples_max = (int)av_rescale_rnd(
+            in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
+    }
+    // 额外预留 64 个样本空间以应对边界情况
+    audio_out_samples_max += 64;
+
+    audio_out_buffer = (uint8_t *)av_malloc(
+        av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS, audio_out_samples_max, AUDIO_OUT_FORMAT, 1));
+    if (!audio_out_buffer)
+    {
+        qWarning() << "[ShowVideo] 音频输出缓冲分配失败.";
+        clearFFmpegResources();
+        return -1;
     }
 
     // === 计算视频输出尺寸并创建 sws 上下文（保持宽高比） ===
@@ -1003,7 +1034,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
                                out_buffer,
                                swr_ctx, audio_out_buffer,
                                &m_audioMutex, &byteBuf, out_sample_rate,
-                               m_genCounter);
+                               m_genCounter,
+                               audio_out_samples_max);
 
     // 启动视频解码线程（异步）
     QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);

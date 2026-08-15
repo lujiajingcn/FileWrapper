@@ -33,9 +33,11 @@ static const int           AUDIO_OUT_CHANNELS    = 2;
 static const int           AUDIO_OUT_SAMPLE_RATE = 44100;
 static const AVSampleFormat AUDIO_OUT_FORMAT     = AV_SAMPLE_FMT_S16;
 
-// 音频缓冲上界：约 0.5 秒 PCM 数据（防止解码快于播放时无限增长 / 延迟累积）
-// 2 通道 * 2 字节(S16) * 44100 / 2
-static const int AUDIO_BUFFER_LIMIT_BYTES = AUDIO_OUT_CHANNELS * 2 * AUDIO_OUT_SAMPLE_RATE / 2;
+// 音频缓冲上界：约 2 秒 PCM 数据（防止解码快于播放时无限增长 / 延迟累积）
+// ASF/WMV 容器的音频包交错通常不如 MP4 均匀，需要更大的缓冲来吸收突发音频包，
+// 避免缓冲区满后丢弃音频块导致"跳帧"。
+// 2 通道 * 2 字节(S16) * 44100 * 2
+static const int AUDIO_BUFFER_LIMIT_BYTES = AUDIO_OUT_CHANNELS * 2 * AUDIO_OUT_SAMPLE_RATE * 8;
 
 namespace Ui {
 class MainWindow;
@@ -59,7 +61,8 @@ public:
                      uint8_t *outBuf,
                      SwrContext *swr, uint8_t *aOutBuf,
                      QMutex *aMutex, QByteArray *aByteBuf,
-                     int outSampleRate, int genId);
+                     int outSampleRate, int genId,
+                     int audioOutBufCapacity);
 
     // 阻塞等待 doDecode 退出（用于停止/seek/释放资源），超时返回 false
     bool waitForDecodingStopped(unsigned long timeoutMs = 2000);
@@ -99,6 +102,7 @@ private:
     QMutex          *m_audioMutex = nullptr;
     QByteArray      *m_audioByteBuf = nullptr;
     int m_outSampleRate = AUDIO_OUT_SAMPLE_RATE;
+    int m_audioOutBufCapacity = 0;  // 音频输出缓冲区实际容量（样本数），用作 swr_convert 的 out_count
 
     int m_genId = -1;
 
