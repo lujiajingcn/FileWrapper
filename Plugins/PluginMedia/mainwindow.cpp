@@ -125,6 +125,11 @@ void VideoWorker::doDecode()
     // 暂停期间累计的真实流逝时间（微秒），用于恢复播放后校正时钟，避免跳变
     qint64 pausedClockUs = 0;
     bool  wasPausedAtLoop = false;
+    // 纯音频 PTS 帧调度（无视频帧时，视频分支的时钟不起作用）
+    QElapsedTimer audioClock;
+    bool audioClockStarted = false;
+    qint64 audioFirstPtsMs = -1;
+    qint64 audioPausedClockUs = 0;
 
     while (true)
     {
@@ -136,6 +141,7 @@ void VideoWorker::doDecode()
         {
             QMutexLocker locker(&m_mutex);
             qint64 pauseBegin = playClock.isValid() ? playClock.nsecsElapsed() / 1000 : 0;
+            qint64 aPauseBegin = audioClock.isValid() ? audioClock.nsecsElapsed() / 1000 : 0;
             while (m_paused.load(std::memory_order_relaxed)
                    && !m_stopRequested.load(std::memory_order_relaxed))
             {
@@ -143,14 +149,16 @@ void VideoWorker::doDecode()
             }
             if (m_stopRequested.load(std::memory_order_relaxed))
                 goto stop_decode;
-            // 记下本次暂停持续的时间
-            qint64 pauseEnd = playClock.nsecsElapsed() / 1000;
+            // 记下本次暂停持续的时间（视频时钟 + 音频时钟分别累计）
+            qint64 pauseEnd = playClock.isValid() ? playClock.nsecsElapsed() / 1000 : 0;
             pausedClockUs += (pauseEnd - pauseBegin);
+            qint64 aPauseEnd = audioClock.isValid() ? audioClock.nsecsElapsed() / 1000 : 0;
+            audioPausedClockUs += (aPauseEnd - aPauseBegin);
             wasPausedAtLoop = true;
         }
         wasPausedAtLoop = false;
 
-        if (!pFormatCtx || videoindex < 0)
+        if (!pFormatCtx)
             break;
 
         int ret = av_read_frame(pFormatCtx, pkt);
@@ -289,6 +297,58 @@ void VideoWorker::doDecode()
                             }
                         }
                     }
+                    // 纯音频播放（无视频流）时，用音频 PTS 驱动进度显示与自动停止，
+                    // 否则 onFrameDecoded 因无视频帧永不触发，进度无法推进。
+                    if (videoindex < 0)
+                    {
+                        qint64 aptsMs = 0;
+                        if (pAudioFrame->pts != AV_NOPTS_VALUE)
+                        {
+                            double secs = pAudioFrame->pts * av_q2d(pFormatCtx->streams[audioindex]->time_base);
+                            aptsMs = (qint64)(secs * 1000);
+                            if (aptsMs < 0) aptsMs = 0;
+                        }
+
+                        // === 纯音频帧调度：模拟视频时钟节奏，按实时速率消费音频包 ===
+                        // 无视频帧时，视频分支的 playClock 不起作用，解码器会全速运行导致
+                        // 音频缓冲瞬间爆满 → 后续音频被丢弃 → 播放立即结束。
+                        // 此处引入独立的音频时钟，确保解码与播放同步。
+                        if (!audioClockStarted)
+                        {
+                            audioClock.start();
+                            audioFirstPtsMs = aptsMs;  // 记录首帧 PTS 作为基准
+                            audioClockStarted = true;
+                        }
+
+                        if (aptsMs > 0)
+                        {
+                            // 当前音频播放位置 = 真实流逝时间刨去暂停期间
+                            qint64 aclockUs = audioClock.nsecsElapsed() / 1000 - audioPausedClockUs;
+                            qint64 aclockMs = aclockUs / 1000;
+                            qint64 atargetMs = aptsMs - audioFirstPtsMs;
+
+                            if (atargetMs > aclockMs)
+                            {
+                                // 提前了：等待到目标时刻（分片等待以响应 stop/pause）
+                                qint64 awaitUs = (atargetMs - aclockMs) * 1000;
+                                while (awaitUs > 0)
+                                {
+                                    if (m_stopRequested.load(std::memory_order_relaxed))
+                                        goto stop_decode;
+                                    if (m_paused.load(std::memory_order_relaxed))
+                                        break;
+                                    qint64 chunk = qMin<qint64>(awaitUs, 2000);
+                                    QThread::usleep((unsigned long)chunk);
+                                    awaitUs -= chunk;
+                                }
+                            }
+                            // 若等待中检测到暂停，跳出内层循环回到外层暂停处理
+                            if (m_paused.load(std::memory_order_relaxed))
+                                break;
+                        }
+
+                        emit audioPtsUpdated(aptsMs, m_genId);
+                    }
                 }
             }
         }
@@ -348,6 +408,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     connect(m_videoWorker, &VideoWorker::frameDecoded,
             this, &MainWindow::onFrameDecoded, Qt::QueuedConnection);
+    connect(m_videoWorker, &VideoWorker::audioPtsUpdated,
+            this, &MainWindow::onAudioPtsUpdated, Qt::QueuedConnection);
     connect(m_videoWorker, &VideoWorker::decodingFinished,
             this, &MainWindow::onDecodingFinished, Qt::QueuedConnection);
 
@@ -424,6 +486,24 @@ void MainWindow::onDecodingFinished(int genId)
     }
 }
 
+void MainWindow::onAudioPtsUpdated(qint64 ptsMs, int genId)
+{
+    // 纯音频播放：通过音频 PTS 更新进度（替代 onFrameDecoded 的视频 PTS）
+    if (!m_bPlaying || m_bPaused)
+        return;
+
+    // 过滤 seek 前的旧信号
+    if (genId != m_genCounter)
+        return;
+
+    if (ptsMs > 0)
+    {
+        m_nCurrentMs = ptsMs;
+        if (m_nCurrentMs > m_nDurationMs)
+            m_nCurrentMs = m_nDurationMs;
+    }
+}
+
 void MainWindow::resizeEvent(QResizeEvent*)
 {
     // 仅记录目标区域；实际重建 sws 上下文在下一帧刷新时按新尺寸进行，
@@ -473,6 +553,7 @@ void MainWindow::clearFFmpegResources()
     audioindex = -1;
     m_bPlaying = false;
     m_bPaused = false;
+    m_bAudioOnly = false;  // 重置：下次播放时重新检测
 
     {
         QMutexLocker locker(&m_audioMutex);
@@ -651,11 +732,12 @@ void MainWindow::on_volumeSlider_valueChanged(int value)
 // ====== 执行 seek ======
 void MainWindow::doSeek(qint64 ms)
 {
-    if (!pFormatCtx || videoindex < 0)
+    if (!pFormatCtx)
     {
         m_bPlaying = false;
         return;
     }
+    // 纯音频文件：videoindex < 0，但 seek 仍然有效
     if (ms < 0) ms = 0;
     if (ms > m_nDurationMs) ms = m_nDurationMs;
 
@@ -694,7 +776,7 @@ void MainWindow::doSeek(qint64 ms)
 
     if (audioOutput) audioOutput->resume();
 
-    // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded 过滤掉（避免进度条回跳）
+    // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded / onAudioPtsUpdated 过滤掉
     m_genCounter++;
     QMetaObject::invokeMethod(m_videoWorker, "updateGenId", Qt::DirectConnection, Q_ARG(int, m_genCounter));
 
@@ -847,12 +929,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     if (audioindex >= 0)
         astream  = pFormatCtx->streams[audioindex];
 
-    if (videoindex < 0)
-    {
-        qWarning() << "[ShowVideo] 找不到视频流.";
-        clearFFmpegResources();
-        return -1;
-    }
+    // 支持纯音频文件：只要有音频流即可播放，视频流为可选
+    m_bAudioOnly = (videoindex < 0);
     if (audioindex < 0)
     {
         qWarning() << "[ShowVideo] 找不到音频流.";
@@ -860,33 +938,36 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
 
-    // ========== 视频解码 ==========
-    pCodecCtx = avcodec_alloc_context3(nullptr);
-    if (!pCodecCtx || avcodec_parameters_to_context(pCodecCtx, vstream->codecpar) < 0)
+    // ========== 视频解码（仅当存在视频流时）==========
+    if (videoindex >= 0)
     {
-        qWarning() << "[ShowVideo] 视频解码器上下文初始化失败.";
-        clearFFmpegResources();
-        return -1;
-    }
+        pCodecCtx = avcodec_alloc_context3(nullptr);
+        if (!pCodecCtx || avcodec_parameters_to_context(pCodecCtx, vstream->codecpar) < 0)
+        {
+            qWarning() << "[ShowVideo] 视频解码器上下文初始化失败.";
+            clearFFmpegResources();
+            return -1;
+        }
 
-    // 启用多线程解码（大文件/高分辨率下显著提升流畅度）
-    // threads=0 让 FFmpeg 根据 CPU 核心数自动选择线程数
-    // 同时允许帧级和分片级线程，由解码器自行选择其支持的模式
-    pCodecCtx->thread_count = 0;
-    pCodecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        // 启用多线程解码（大文件/高分辨率下显著提升流畅度）
+        // threads=0 让 FFmpeg 根据 CPU 核心数自动选择线程数
+        // 同时允许帧级和分片级线程，由解码器自行选择其支持的模式
+        pCodecCtx->thread_count = 0;
+        pCodecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
-    const AVCodec *videoCodec = avcodec_find_decoder(pCodecCtx->codec_id);
-    if (!videoCodec)
-    {
-        qWarning() << "[ShowVideo] 找不到视频解码器.";
-        clearFFmpegResources();
-        return -1;
-    }
-    if (avcodec_open2(pCodecCtx, videoCodec, nullptr) < 0)
-    {
-        qWarning() << "[ShowVideo] 打开视频解码器失败.";
-        clearFFmpegResources();
-        return -1;
+        const AVCodec *videoCodec = avcodec_find_decoder(pCodecCtx->codec_id);
+        if (!videoCodec)
+        {
+            qWarning() << "[ShowVideo] 找不到视频解码器.";
+            clearFFmpegResources();
+            return -1;
+        }
+        if (avcodec_open2(pCodecCtx, videoCodec, nullptr) < 0)
+        {
+            qWarning() << "[ShowVideo] 打开视频解码器失败.";
+            clearFFmpegResources();
+            return -1;
+        }
     }
 
     // ========== 音频解码 ==========
@@ -914,13 +995,22 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     byteBuf.clear();
 
-    // 创建帧
-    pFrame      = av_frame_alloc();
-    pFrameRGB   = av_frame_alloc();
-    pAudioFrame = av_frame_alloc();
-    if (!pFrame || !pFrameRGB || !pAudioFrame)
+    // 创建帧（视频帧仅在有视频流时分配）
+    if (videoindex >= 0)
     {
-        qWarning() << "[ShowVideo] 帧内存分配失败.";
+        pFrame    = av_frame_alloc();
+        pFrameRGB = av_frame_alloc();
+        if (!pFrame || !pFrameRGB)
+        {
+            qWarning() << "[ShowVideo] 视频帧内存分配失败.";
+            clearFFmpegResources();
+            return -1;
+        }
+    }
+    pAudioFrame = av_frame_alloc();
+    if (!pAudioFrame)
+    {
+        qWarning() << "[ShowVideo] 音频帧内存分配失败.";
         clearFFmpegResources();
         return -1;
     }
@@ -983,22 +1073,27 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
 
-    // === 计算视频输出尺寸并创建 sws 上下文（保持宽高比） ===
-    int dstW = ui->videoLabel->size().width();
-    int dstH = ui->videoLabel->size().height();
-    if (dstW <= 0) dstW = 640;
-    if (dstH <= 0) dstH = 480;
-    QSize outSize = computeAspectRatioSize(pCodecCtx->width, pCodecCtx->height, dstW, dstH);
-    int outW = outSize.width();
-    int outH = outSize.height();
-    rebuildSwsContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, outW, outH);
+    // === 计算视频输出尺寸并创建 sws 上下文（保持宽高比，仅视频文件） ===
+    int outW = 0, outH = 0;
+    if (videoindex >= 0)
+    {
+        int dstW = ui->videoLabel->size().width();
+        int dstH = ui->videoLabel->size().height();
+        if (dstW <= 0) dstW = 640;
+        if (dstH <= 0) dstH = 480;
+        QSize outSize = computeAspectRatioSize(pCodecCtx->width, pCodecCtx->height, dstW, dstH);
+        outW = outSize.width();
+        outH = outSize.height();
+        rebuildSwsContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, outW, outH);
+    }
 
-    // 总时长(毫秒)
+    // 总时长(毫秒)；纯音频时回退到音频流时长
     m_nDurationMs = 0;
     if (pFormatCtx->duration > 0)
         m_nDurationMs = pFormatCtx->duration / 1000;
-    if (m_nDurationMs <= 0 && vstream->duration > 0)
-        m_nDurationMs = (qint64)(vstream->duration * av_q2d(vstream->time_base) * 1000);
+    AVStream *durStream = (videoindex >= 0) ? vstream : astream;
+    if (m_nDurationMs <= 0 && durStream && durStream->duration > 0)
+        m_nDurationMs = (qint64)(durStream->duration * av_q2d(durStream->time_base) * 1000);
     if (m_nDurationMs <= 0) m_nDurationMs = 60000;
     qDebug() << "[ShowVideo] 总时长(ms) = " << m_nDurationMs;
 
@@ -1027,7 +1122,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     m_videoWorker->setContexts(pFormatCtx,
                                pCodecCtx, videoindex,
                                aCodecCtx, audioindex,
-                               pCodecCtx->width, pCodecCtx->height,
+                               (videoindex >= 0) ? pCodecCtx->width  : 0,
+                               (videoindex >= 0) ? pCodecCtx->height : 0,
                                outW, outH,
                                img_convert_ctx,
                                pFrame, pFrameRGB, pAudioFrame,

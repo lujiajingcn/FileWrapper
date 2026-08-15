@@ -284,7 +284,9 @@ QString MainWindow::choosePlugin(QString sFileExt)
         sPluginName = "PluginText";
     }
     else if(QString::compare(sFileExt, "mp4", Qt::CaseInsensitive) == 0 ||
-            QString::compare(sFileExt, "wmv", Qt::CaseInsensitive) == 0)
+            QString::compare(sFileExt, "wmv", Qt::CaseInsensitive) == 0 ||
+            QString::compare(sFileExt, "mp3", Qt::CaseInsensitive) == 0 ||
+            QString::compare(sFileExt, "wav", Qt::CaseInsensitive) == 0)
     {
         sPluginName = "PluginMedia";
     }

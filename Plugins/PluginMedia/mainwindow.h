@@ -69,6 +69,7 @@ public:
 
 signals:
     void frameDecoded(QImage img, qint64 ptsMs, int genId);
+    void audioPtsUpdated(qint64 ptsMs, int genId);  // 纯音频播放进度
     void decodingFinished(int genId);
 
 public slots:
@@ -124,6 +125,9 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
+    // 当前是否为纯音频播放（无视频流）
+    bool isAudioOnly() const { return m_bAudioOnly; }
+
 public slots:
    void timeCallback(void);
 
@@ -143,6 +147,7 @@ private slots:
 
    // VideoWorker 信号槽
    void onFrameDecoded(QImage img, qint64 ptsMs, int genId);
+   void onAudioPtsUpdated(qint64 ptsMs, int genId);  // 纯音频播放进度
    void onDecodingFinished(int genId);
 
 private:
@@ -193,6 +198,7 @@ private:
     bool   m_bPaused = false;
     bool   m_bUserDragging = false;
     bool   m_bSeekPending = false;
+    bool   m_bAudioOnly = false;   // 纯音频播放（无视频流）
     qint64 m_nTargetMs = 0;
     qint64 m_nDurationMs = 0;
     qint64 m_nCurrentMs = 0;
