@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 
 #include <QLabel>
+#include <QApplication>
 #include <QFileDialog>
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
@@ -143,8 +144,41 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     delete[] szBuf;
 }
 
+bool MainWindow::confirmDiscardOrSaveIfDirty()
+{
+    if (!m_fileManager->isDirty())
+        return true;
+
+    QMessageBox::StandardButton btn = QMessageBox::warning(this,
+        tr("未保存的改动"),
+        tr("当前归档存在未保存的改动，继续操作将丢失这些改动。\n是否先保存？"),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
+        QMessageBox::Save);
+
+    if (btn == QMessageBox::Cancel)
+        return false;
+
+    if (btn == QMessageBox::Save)
+    {
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        bool bOk = m_fileManager->save();
+        QApplication::restoreOverrideCursor();
+        if (!bOk)
+        {
+            QMessageBox::critical(this, tr("保存失败"),
+                                  tr("保存失败，归档文件可能已损坏或磁盘写入失败。操作已取消。"));
+            return false;
+        }
+    }
+    // Discard 或 保存成功：继续
+    return true;
+}
+
 void MainWindow::on_actionLoadFile_triggered()
 {
+    if (!confirmDiscardOrSaveIfDirty())
+        return;
+
     QString sFileName = QFileDialog::getOpenFileName(this, tr("加载文件"), "", tr("Class Files (*.dat);;All Files (*.*)"));
     if(sFileName.isEmpty())
         return;
@@ -166,16 +200,8 @@ void MainWindow::on_actionLoadFile_triggered()
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, sFileName);
     m_tvFilePath->header()->setVisible(true);
 
-    int nRow = 0;
-    m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
-    for(QVector<FILEINFO>::const_iterator cIt = vtFileInfos.begin(); cIt != vtFileInfos.end(); cIt++, nRow++)
-    {
-        QStandardItem* hItemName = new QStandardItem((*cIt).sFileName);
-        QVariant var;
-        var.setValue(*cIt);
-        hItemName->setData(var);
-        m_hModelFilePath->setItem(nRow, 0, hItemName);
-    }
+    populateFilePathView(false);
+    m_acSaveFile->setEnabled(false);
 }
 
 void MainWindow::on_actionMergeFile_triggered()
@@ -326,48 +352,103 @@ void MainWindow::on_actionSplitFile_triggered()
     }
 }
 
-void MainWindow::onActionShowFilePathTriggered()
+void MainWindow::populateFilePathView(bool bShowPath)
 {
     QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
     int nRow = 0;
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     for(QVector<FILEINFO>::const_iterator cIt = vtFileInfos.begin(); cIt != vtFileInfos.end(); cIt++, nRow++)
     {
-        QStandardItem* hItemName = new QStandardItem((*cIt).sFilePath);
+        QStandardItem* hItemName = new QStandardItem(bShowPath ? (*cIt).sFilePath : (*cIt).sFileName);
         QVariant var;
         var.setValue(*cIt);
         hItemName->setData(var);
         m_hModelFilePath->setItem(nRow, 0, hItemName);
     }
-    m_acShowFileName->setEnabled(true);
-    m_acShowFilePath->setEnabled(false);
+    m_bShowPath = bShowPath;
+    m_acShowFileName->setEnabled(bShowPath);
+    m_acShowFilePath->setEnabled(!bShowPath);
+}
+
+void MainWindow::refreshFilePathView()
+{
+    populateFilePathView(m_bShowPath);
+}
+
+void MainWindow::onActionShowFilePathTriggered()
+{
+    populateFilePathView(true);
 }
 
 void MainWindow::onActionShowFileNameTriggered()
 {
-    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
-    int nRow = 0;
-    m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
-    for(QVector<FILEINFO>::const_iterator cIt = vtFileInfos.begin(); cIt != vtFileInfos.end(); cIt++, nRow++)
-    {
-        QStandardItem* hItemName = new QStandardItem((*cIt).sFileName);
-        QVariant var;
-        var.setValue(*cIt);
-        hItemName->setData(var);
-        m_hModelFilePath->setItem(nRow, 0, hItemName);
-    }
-    m_acShowFileName->setEnabled(false);
-    m_acShowFilePath->setEnabled(true);
+    populateFilePathView(false);
 }
 
 void MainWindow::onActionAddFileTriggered()
 {
-    QMessageBox::information(this, tr("添加文件"), tr("功能开发中，敬请期待。"));
+    if(!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, tr("添加文件"),
+                                 tr("请先通过“加载文件”打开一个归档文件，再添加文件。"));
+        return;
+    }
+
+    QStringList qLFilePaths = QFileDialog::getOpenFileNames(this, tr("添加文件"),
+                                                           "", tr("All Files (*.*)"));
+    if(qLFilePaths.isEmpty())
+        return;
+
+    QVector<QString> vtAdd;
+    foreach(QString s, qLFilePaths)
+    {
+        QFileInfo fi(s);
+        if(fi.isFile())
+            vtAdd.append(s);
+    }
+    if(vtAdd.isEmpty())
+        return;
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    m_fileManager->addFiles(vtAdd);
+    QApplication::restoreOverrideCursor();
+
+    refreshFilePathView();
+    m_acSaveFile->setEnabled(m_fileManager->isDirty());
 }
 
 void MainWindow::onActionDelFileTriggered()
 {
-    QMessageBox::information(this, tr("删除文件"), tr("功能开发中，敬请期待。"));
+    if(!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, tr("删除文件"),
+                                 tr("请先通过“加载文件”打开一个归档文件。"));
+        return;
+    }
+
+    int nCurRow = m_tvFilePath->currentIndex().row();
+    if(nCurRow == -1)
+    {
+        QMessageBox::information(this, tr("删除文件"),
+                                 tr("请先在列表中选择要删除的文件。"));
+        return;
+    }
+
+    FILEINFO fileInfo = m_hModelFilePath->item(nCurRow)->data().value<FILEINFO>();
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    bool bOk = m_fileManager->deleteFile(fileInfo.sFilePath);
+    QApplication::restoreOverrideCursor();
+
+    if(!bOk)
+    {
+        QMessageBox::critical(this, tr("删除文件"),
+                              tr("删除失败，归档文件可能已损坏。"));
+        return;
+    }
+
+    refreshFilePathView();
+    m_acSaveFile->setEnabled(m_fileManager->isDirty());
 }
 
 void MainWindow::onActionOutputFileTriggered()
@@ -390,7 +471,27 @@ void MainWindow::onActionOutputFileTriggered()
 
 void MainWindow::onActionSaveFileTriggered()
 {
-    QMessageBox::information(this, tr("保存文件"), tr("功能开发中，敬请期待。"));
+    if(!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, tr("保存文件"),
+                                 tr("没有已加载的归档文件，无法保存。"));
+        return;
+    }
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    bool bOk = m_fileManager->save();
+    QApplication::restoreOverrideCursor();
+
+    if(!bOk)
+    {
+        QMessageBox::critical(this, tr("保存文件"),
+                              tr("保存失败，归档文件可能已损坏或磁盘写入失败。"));
+        return;
+    }
+
+    // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮
+    refreshFilePathView();
+    m_acSaveFile->setEnabled(m_fileManager->isDirty());
 }
 
 void MainWindow::on_actionAbout_triggered()
@@ -406,7 +507,11 @@ void MainWindow::on_actionPluginMap_triggered()
 
 void MainWindow::on_actionUnloadFile_triggered()
 {
+    if (!confirmDiscardOrSaveIfDirty())
+        return;
+
     m_fileManager->unLoadMergedFile();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     m_tvFilePath->header()->setVisible(false);
+    m_acSaveFile->setEnabled(false);
 }

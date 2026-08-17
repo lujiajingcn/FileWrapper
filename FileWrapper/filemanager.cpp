@@ -651,6 +651,303 @@ void FileManager::unLoadMergedFile()
     m_mapFileInfos.clear();
 }
 
+bool FileManager::isArchiveLoaded() const
+{
+    return m_qFile.isOpen() && !m_qFile.fileName().isEmpty();
+}
+
+void FileManager::addFiles(const QVector<QString> &vtNewFiles)
+{
+    if (!isArchiveLoaded())
+        return;
+
+    bool bChanged = false;
+    for (int i = 0; i < vtNewFiles.size(); ++i)
+    {
+        QString fp = vtNewFiles.at(i);
+        QFileInfo fi(fp);
+        if (!fi.exists() || !fi.isFile())
+            continue;
+        // 同一路径去重，避免重复写入
+        if (m_mapFileInfos.contains(fp))
+            continue;
+
+        FILEINFO info;
+        info.sFilePath = fp;
+        info.sFileName = getFileName(fp);
+        info.nFileLen = fi.size();
+        info.nContentPositon = 0;   // 占位，重写归档后由 QLoadMergedFile 刷新
+        info.nState = 0;
+        m_vtFileInfos.append(info);
+        m_mapFileInfos[fp] = info;
+        m_setPendingFiles.insert(fp);
+        bChanged = true;
+    }
+
+    // 仅修改内存，落盘动作交由 save()；没有任何实际新增则不置脏
+    if (bChanged)
+        m_bDirty = true;
+}
+
+bool FileManager::deleteFile(const QString &sFilePath)
+{
+    int idx = -1;
+    for (int i = 0; i < m_vtFileInfos.size(); ++i)
+    {
+        if (m_vtFileInfos.at(i).sFilePath == sFilePath)
+        {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0)
+        return false;
+
+    m_vtFileInfos.remove(idx);
+    m_mapFileInfos.remove(sFilePath);
+    m_setPendingFiles.remove(sFilePath);
+
+    // 仅修改内存，落盘动作交由 save()
+    m_bDirty = true;
+    return true;
+}
+
+bool FileManager::isDirty() const
+{
+    return m_bDirty;
+}
+
+bool FileManager::save()
+{
+    if (!isArchiveLoaded())
+        return false;
+
+    // 没有待保存的改动
+    if (!m_bDirty)
+        return true;
+
+    // 所有文件都被删除 -> 落盘时直接删除归档文件
+    if (m_vtFileInfos.isEmpty())
+    {
+        QString sArchivePath = m_qFile.fileName();
+        m_qFile.close();  // 必须先关闭句柄，Windows 才能删除该文件
+        if (!QFile::remove(sArchivePath))
+        {
+            qWarning() << "删除空归档文件失败（可能被占用或只读）:" << sArchivePath;
+            // 重新打开原文件，保留内存中的“已全部删除”状态与脏标记，便于下次重试
+            m_qFile.setFileName(sArchivePath);
+            m_qFile.open(QIODevice::ReadOnly);
+            m_bDirty = true;
+            return false;
+        }
+        m_vtFileInfos.clear();
+        m_mapFileInfos.clear();
+        m_setPendingFiles.clear();
+        m_bDirty = false;
+        return true;
+    }
+
+    // 重写整个归档并原子替换，成功后清除脏标记
+    bool bOk = rewriteArchive();
+    if (bOk)
+        m_bDirty = false;
+    return bOk;
+}
+
+bool FileManager::rewriteArchive()
+{
+    if (!isArchiveLoaded())
+        return false;
+
+    QString sArchivePath = m_qFile.fileName();
+    int nCount = m_vtFileInfos.size();
+
+    // 1) 仅需各条目大小即可计算头部与各内容偏移，无需读取内容
+    qint64 contentStart = FWDAT_GLOBAL_HDR;
+    for (int i = 0; i < nCount; ++i)
+        contentStart += FWDAT_ENTRY_FIXED + m_vtFileInfos.at(i).sFilePath.toUtf8().size();
+    qint64 totalHdrSize = contentStart;
+
+    if (totalHdrSize < FWDAT_GLOBAL_HDR
+        || totalHdrSize > 512LL * 1024 * 1024
+        || quint64(totalHdrSize) > quint64(0xFFFFFFFFULL))
+    {
+        qWarning() << "归档头部过大:" << totalHdrSize;
+        return false;
+    }
+
+    QVector<qint64> contentPosVec(nCount);
+    qint64 cp = totalHdrSize;
+    for (int i = 0; i < nCount; ++i)
+    {
+        contentPosVec[i] = cp;
+        cp += m_vtFileInfos.at(i).nFileLen;
+    }
+
+    // 2) 写入临时文件：先写全局头 + 各条目元数据
+    QString sTmpPath = sArchivePath + ".tmp.fwda";
+    QFile::remove(sTmpPath);
+    QFile fTmp(sTmpPath);
+    if (!fTmp.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    {
+        qWarning() << "创建临时文件失败:" << sTmpPath;
+        return false;
+    }
+
+    // 计算 CRC（与 QMergeFiles 完全一致：全局头不含 checksum + 全部条目）
+    QByteArray crcData;
+    crcData.reserve(quint32(totalHdrSize));
+    crcData.append(FWDAT_MAGIC, 4);
+    appendU32(crcData, FWDAT_VERSION);
+    appendU32(crcData, quint32(totalHdrSize));
+    appendU32(crcData, quint32(nCount));
+    crcData.append(4, '\0'); // Reserved
+    for (int i = 0; i < nCount; ++i)
+    {
+        QByteArray pathBytes = m_vtFileInfos.at(i).sFilePath.toUtf8();
+        appendU32(crcData, quint32(pathBytes.size()));
+        appendU64(crcData, quint64(m_vtFileInfos.at(i).nFileLen));
+        appendU64(crcData, quint64(contentPosVec.at(i)));
+        crcData.append(pathBytes);
+    }
+    quint32 headerChecksum = computeCrc32(crcData);
+
+    // 写全局头部
+    fTmp.write(FWDAT_MAGIC, 4);
+    writeU32(fTmp, FWDAT_VERSION);
+    writeU32(fTmp, quint32(totalHdrSize));
+    writeU32(fTmp, quint32(nCount));
+    writeU32(fTmp, headerChecksum);
+    writeU32(fTmp, 0); // Reserved
+
+    // 写条目
+    for (int i = 0; i < nCount; ++i)
+    {
+        QByteArray pathBytes = m_vtFileInfos.at(i).sFilePath.toUtf8();
+        writeU32(fTmp, quint32(pathBytes.size()));
+        writeU64(fTmp, quint64(m_vtFileInfos.at(i).nFileLen));
+        writeU64(fTmp, quint64(contentPosVec.at(i)));
+        fTmp.write(pathBytes);
+    }
+
+    // 3) 流式写入内容：边从源（磁盘原文件 / 当前归档）读取、边写入临时文件，
+    //    采用固定大小缓冲，避免一次性把全部文件内容读入内存（支持超大文件）。
+    //    注意：流式写入失败分支在 m_qFile 仍打开时返回，原归档句柄与内存状态均保持不变。
+    const qint64 kChunk = 1024 * 1024;  // 1MB 读写缓冲
+    QByteArray buf;
+    buf.resize(int(kChunk));
+
+    for (int i = 0; i < nCount; ++i)
+    {
+        const FILEINFO &fi = m_vtFileInfos.at(i);
+        qint64 nRemaining = fi.nFileLen;
+
+        if (m_setPendingFiles.contains(fi.sFilePath))
+        {
+            // 新加入的文件：内容来自磁盘原文件
+            QFile src(fi.sFilePath);
+            if (!src.open(QIODevice::ReadOnly))
+            {
+                qWarning() << "读取新增文件失败:" << fi.sFilePath;
+                fTmp.close();
+                QFile::remove(sTmpPath);
+                return false;
+            }
+            while (nRemaining > 0)
+            {
+                qint64 toRead = qMin(nRemaining, kChunk);
+                qint64 nGot = src.read(buf.data(), toRead);
+                if (nGot <= 0)
+                {
+                    qWarning() << "读取新增文件内容不完整:" << fi.sFilePath;
+                    src.close();
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
+                if (fTmp.write(buf.data(), nGot) != nGot)
+                {
+                    qWarning() << "写入内容失败";
+                    src.close();
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
+                nRemaining -= nGot;
+            }
+            src.close();
+        }
+        else
+        {
+            // 已存在于归档中的文件：内容来自当前 m_qFile
+            if (!m_qFile.seek(fi.nContentPositon))
+            {
+                qWarning() << "定位内容失败:" << fi.sFilePath;
+                fTmp.close();
+                QFile::remove(sTmpPath);
+                return false;
+            }
+            while (nRemaining > 0)
+            {
+                qint64 toRead = qMin(nRemaining, kChunk);
+                qint64 nGot = m_qFile.read(buf.data(), toRead);
+                if (nGot <= 0)
+                {
+                    qWarning() << "读取内容不完整:" << fi.sFilePath;
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
+                if (fTmp.write(buf.data(), nGot) != nGot)
+                {
+                    qWarning() << "写入内容失败";
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
+                nRemaining -= nGot;
+            }
+        }
+    }
+    fTmp.close();
+
+    // 关键：此时所有内容已写入临时文件，必须关闭对原归档的句柄，
+    // 否则在 Windows 下 QFile::rename 会因共享冲突（文件被本进程打开且无 FILE_SHARE_DELETE）而失败。
+    m_qFile.close();
+
+    // 4) 校验临时文件，再原子替换原文件（先备份，失败可还原）
+    if (!validateMergedFile(sTmpPath))
+    {
+        qWarning() << "临时归档校验失败，取消替换";
+        QFile::remove(sTmpPath);
+        QLoadMergedFile(sArchivePath);  // 重新打开原归档，恢复为已加载状态
+        return false;
+    }
+
+    QString sBak = sArchivePath + ".bak.fwda";
+    QFile::remove(sBak);
+    if (!QFile::rename(sArchivePath, sBak))
+    {
+        qWarning() << "备份原文件失败，取消替换";
+        QFile::remove(sTmpPath);
+        QLoadMergedFile(sArchivePath);  // 重新打开原归档，恢复为已加载状态
+        return false;
+    }
+    if (!QFile::rename(sTmpPath, sArchivePath))
+    {
+        qWarning() << "替换原文件失败，尝试还原";
+        QFile::rename(sBak, sArchivePath);
+        QLoadMergedFile(sArchivePath);  // 重新打开原归档，恢复为已加载状态
+        return false;
+    }
+    QFile::remove(sBak);
+
+    // 5) 重新以只读方式加载，刷新内存中的条目与偏移
+    QLoadMergedFile(sArchivePath);
+    m_setPendingFiles.clear();
+    return true;
+}
+
 void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen)
 {
     *szBuf = nullptr;
@@ -666,6 +963,30 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
     nFileLen = cIt.value().nFileLen;
     if (nFileLen <= 0)
         return;
+
+    // 尚未落盘的待添加文件，内容直接来自磁盘原文件
+    if (m_setPendingFiles.contains(sFilePath))
+    {
+        QFile src(sFilePath);
+        if (!src.open(QIODevice::ReadOnly))
+        {
+            qWarning() << "读取新增文件失败:" << sFilePath;
+            nFileLen = 0;
+            return;
+        }
+        *szBuf = new char[nFileLen];
+        qint64 nRead = src.read(*szBuf, nFileLen);
+        src.close();
+        if (nRead != nFileLen)
+        {
+            qWarning() << "读取新增文件内容不完整:" << sFilePath;
+            delete[] *szBuf;
+            *szBuf = nullptr;
+            nFileLen = 0;
+            return;
+        }
+        return;
+    }
 
     if (!m_qFile.seek(cIt.value().nContentPositon))
     {
