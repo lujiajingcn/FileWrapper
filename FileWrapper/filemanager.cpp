@@ -114,6 +114,21 @@ static quint32 computeCrc32(const QByteArray &data)
     return ~crc;
 }
 
+// 人类可读的字节大小，用于进度条状态文本
+static QString formatSize(qint64 bytes)
+{
+    const qint64 kb = 1024;
+    const qint64 mb = 1024 * 1024;
+    const qint64 gb = 1024LL * 1024 * 1024;
+    if (bytes >= gb)
+        return QString::number(double(bytes) / gb, 'f', 2) + " GB";
+    if (bytes >= mb)
+        return QString::number(double(bytes) / mb, 'f', 2) + " MB";
+    if (bytes >= kb)
+        return QString::number(double(bytes) / kb, 'f', 2) + " KB";
+    return QString::number(bytes) + " B";
+}
+
 // ---------- 头部校验 ----------
 
 static bool readAndValidateHeader(QFile &f, quint32 &outFileCount,
@@ -240,14 +255,20 @@ bool FileManager::validateMergedFile(QString sFilePath)
 
 void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile)
 {
+    m_bCancelRequested = false;
+
     int nCount = vtInputFiles.size();
     if (nCount <= 0)
+    {
+        emit operationFinished(false, tr("没有要合并的文件"));
         return;
+    }
 
     QFile fOut(sOutputFile);
     if (!fOut.open(QIODevice::WriteOnly))
     {
         qWarning() << "打开输出文件失败:" << sOutputFile;
+        emit operationFinished(false, tr("打开输出文件失败"));
         return;
     }
 
@@ -272,6 +293,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             qWarning() << "打开输入文件失败:" << fp;
             fOut.close();
             QFile::remove(sOutputFile);  // 清理残留的半成品文件
+            emit operationFinished(false, tr("打开输入文件失败: %1").arg(fp));
             return;
         }
         FileInfo fi;
@@ -290,6 +312,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         qWarning() << "合并文件头部过大:" << totalHdrSize;
         fOut.close();
         QFile::remove(sOutputFile);
+        emit operationFinished(false, tr("合并文件头部过大"));
         return;
     }
 
@@ -327,6 +350,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     {
         qWarning() << "定位输出文件失败";
         fOut.close();
+        emit operationFinished(false, tr("定位输出文件失败"));
         return;
     }
     fOut.write(FWDAT_MAGIC, 4);
@@ -345,6 +369,13 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         writeU64(fOut, quint64(fileVec[i].contentPos));
         fOut.write(pathBytes);
     }
+
+    // 总字节数用于进度条
+    qint64 totalBytes = 0;
+    for (int i = 0; i < nCount; i++)
+        totalBytes += fileVec[i].size;
+    qint64 copiedTotal = 0;
+    int nLastPercent = -1;
 
     // —— 写文件内容 ——
     char *buf = new char[MAXBUFFERSIZE];
@@ -387,7 +418,25 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 break;
             }
             copied += rd;
-            qDebug() << "merge" << fileVec[i].path << copied << "/" << fileVec[i].size;
+            copiedTotal += rd;
+
+            int nPercent = (totalBytes > 0) ? int(100 * copiedTotal / totalBytes) : 100;
+            if (nPercent != nLastPercent)
+            {
+                nLastPercent = nPercent;
+                QString sStatus = tr("正在合并: %1  (%2 / %3)")
+                        .arg(getFileName(fileVec[i].path))
+                        .arg(formatSize(copied))
+                        .arg(formatSize(fileVec[i].size));
+                emit progressChanged(copiedTotal, totalBytes, sStatus);
+                QApplication::processEvents();
+            }
+            if (m_bCancelRequested)
+            {
+                qWarning() << "用户取消合并";
+                bFailed = true;
+                break;
+            }
         }
         fIn.close();
         if (bFailed)
@@ -399,6 +448,20 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     // 任一文件写入失败 → 删除不完整的归档，避免生成"头部有效但内容缺失"的坏文件
     if (bFailed)
         QFile::remove(sOutputFile);
+
+    QString sMsg;
+    if (bFailed && m_bCancelRequested)
+        sMsg = tr("操作已取消");
+    else if (bFailed)
+        sMsg = tr("文件合并失败");
+    else
+        sMsg = tr("文件合并成功");
+    emit operationFinished(!bFailed, sMsg);
+}
+
+void FileManager::cancelOperation()
+{
+    m_bCancelRequested = true;
 }
 
 // ---- 分割文件 ----
@@ -717,6 +780,11 @@ bool FileManager::isDirty() const
     return m_bDirty;
 }
 
+bool FileManager::isCancelRequested() const
+{
+    return m_bCancelRequested;
+}
+
 bool FileManager::save()
 {
     if (!isArchiveLoaded())
@@ -761,6 +829,7 @@ bool FileManager::rewriteArchive()
 
     QString sArchivePath = m_qFile.fileName();
     int nCount = m_vtFileInfos.size();
+    m_bCancelRequested = false;
 
     // 1) 仅需各条目大小即可计算头部与各内容偏移，无需读取内容
     qint64 contentStart = FWDAT_GLOBAL_HDR;
@@ -837,6 +906,13 @@ bool FileManager::rewriteArchive()
     QByteArray buf;
     buf.resize(int(kChunk));
 
+    // 总字节数用于进度条
+    qint64 totalBytes = 0;
+    for (int i = 0; i < nCount; ++i)
+        totalBytes += m_vtFileInfos.at(i).nFileLen;
+    qint64 copiedTotal = 0;
+    int nLastPercent = -1;
+
     for (int i = 0; i < nCount; ++i)
     {
         const FILEINFO &fi = m_vtFileInfos.at(i);
@@ -874,6 +950,27 @@ bool FileManager::rewriteArchive()
                     return false;
                 }
                 nRemaining -= nGot;
+                copiedTotal += nGot;
+
+                int nPercent = (totalBytes > 0) ? int(100 * copiedTotal / totalBytes) : 100;
+                if (nPercent != nLastPercent)
+                {
+                    nLastPercent = nPercent;
+                    QString sStatus = tr("正在保存: %1  (%2 / %3)")
+                            .arg(getFileName(fi.sFilePath))
+                            .arg(formatSize(copiedTotal))
+                            .arg(formatSize(totalBytes));
+                    emit progressChanged(copiedTotal, totalBytes, sStatus);
+                    QApplication::processEvents();
+                }
+                if (m_bCancelRequested)
+                {
+                    qWarning() << "用户取消保存";
+                    src.close();
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
             }
             src.close();
         }
@@ -906,6 +1003,27 @@ bool FileManager::rewriteArchive()
                     return false;
                 }
                 nRemaining -= nGot;
+                copiedTotal += nGot;
+
+                int nPercent = (totalBytes > 0) ? int(100 * copiedTotal / totalBytes) : 100;
+                if (nPercent != nLastPercent)
+                {
+                    nLastPercent = nPercent;
+                    QString sStatus = tr("正在保存: %1  (%2 / %3)")
+                            .arg(getFileName(fi.sFilePath))
+                            .arg(formatSize(copiedTotal))
+                            .arg(formatSize(totalBytes));
+                    emit progressChanged(copiedTotal, totalBytes, sStatus);
+                    QApplication::processEvents();
+                }
+                if (m_bCancelRequested)
+                {
+                    qWarning() << "用户取消保存";
+                    // 注意：此处不关闭 m_qFile，以保留原归档句柄与内存状态（与流式失败分支一致）
+                    fTmp.close();
+                    QFile::remove(sTmpPath);
+                    return false;
+                }
             }
         }
     }

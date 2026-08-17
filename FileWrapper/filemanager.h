@@ -47,9 +47,20 @@ public:
     // 是否存在尚未落盘的改动
     bool isDirty() const;
 
+    // 是否已有取消请求（UI 用于区分“用户取消”与“操作失败”）
+    bool isCancelRequested() const;
+
+signals:
+    // 进度通知：已处理字节数 / 总字节数 / 状态文本
+    void progressChanged(qint64 nCurrent, qint64 nTotal, const QString &sStatus);
+    // 操作结束通知：是否成功 / 结果或错误信息
+    void operationFinished(bool bSuccess, const QString &sMsg);
+
 public slots:
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
     void QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir);
+    // 请求取消正在进行的合并/保存操作（由进度对话框的“取消”按钮触发）
+    void cancelOperation();
 
 private:
     QString getFileName(QString sFilePath);
@@ -63,6 +74,7 @@ private:
     QFile                   m_qFile;
     QSet<QString>           m_setPendingFiles;  // 尚未写入归档、内容需从磁盘原文件读取的路径
     bool                    m_bDirty = false;   // 是否存在尚未落盘的改动
+    bool                    m_bCancelRequested = false;  // 用户是否已请求取消当前操作
 };
 
 #endif // FILEMANAGER_H

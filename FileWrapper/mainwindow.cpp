@@ -12,6 +12,7 @@
 #include <QVariant>
 #include "dlgoutputfile.h"
 #include <QMessageBox>
+#include <QProgressDialog>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -233,7 +234,48 @@ void MainWindow::on_actionMergeFile_triggered()
             }
         }
 
+        // —— 进度条：合并可能耗时，显示进度并支持取消 ——
+        QProgressDialog dlgProgress(tr("正在合并文件..."), tr("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(tr("合并文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);  // 立即显示，不等待 4 秒默认延迟
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        dlgProgress.setValue(0);
+
+        // 清理上一轮可能残留的进度连接：lambda 捕获的是上一轮已销毁的局部对话框，
+        // 若不清理，下一轮再次 emit 进度时会访问悬空引用导致崩溃。
+        disconnect(m_fileManager, nullptr, this, nullptr);
+
+        bool bOk = false;
+        QString sResultMsg;
+        connect(m_fileManager, &FileManager::progressChanged, this,
+                [&dlgProgress](qint64 cur, qint64 total, const QString &status) {
+            if (total > 0)
+                dlgProgress.setValue(int(100 * cur / total));
+            dlgProgress.setLabelText(status);
+        });
+        connect(m_fileManager, &FileManager::operationFinished, this,
+                [&](bool ok, const QString &msg) {
+            dlgProgress.setValue(100);
+            dlgProgress.close();
+            bOk = ok;
+            sResultMsg = msg;
+        });
+        connect(&dlgProgress, &QProgressDialog::canceled,
+                m_fileManager, &FileManager::cancelOperation);
+
+        dlgProgress.show();
+        QApplication::processEvents();  // 让进度对话框先绘制出来
+
         emit QMergeFiles(vtFilesPaths, sMergedFilePath);
+
+        dlgProgress.close();
+
+        if (bOk)
+            QMessageBox::information(this, tr("合并文件"), sResultMsg);
+        else
+            QMessageBox::critical(this, tr("合并文件"), sResultMsg);
     }
 }
 
@@ -478,14 +520,40 @@ void MainWindow::onActionSaveFileTriggered()
         return;
     }
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
+    // —— 进度条：保存（重写归档）可能耗时，显示进度并支持取消 ——
+    QProgressDialog dlgProgress(tr("正在保存文件..."), tr("取消"), 0, 100, this);
+    dlgProgress.setWindowTitle(tr("保存文件"));
+    dlgProgress.setWindowModality(Qt::WindowModal);
+    dlgProgress.setMinimumDuration(0);
+    dlgProgress.setAutoClose(false);
+    dlgProgress.setAutoReset(false);
+    dlgProgress.setValue(0);
+
+    // 清理上一轮可能残留的进度连接，避免 lambda 捕获的局部对话框被悬空引用
+    disconnect(m_fileManager, nullptr, this, nullptr);
+
+    connect(m_fileManager, &FileManager::progressChanged, this,
+            [&dlgProgress](qint64 cur, qint64 total, const QString &status) {
+        if (total > 0)
+            dlgProgress.setValue(int(100 * cur / total));
+        dlgProgress.setLabelText(status);
+    });
+    connect(&dlgProgress, &QProgressDialog::canceled,
+            m_fileManager, &FileManager::cancelOperation);
+
+    dlgProgress.show();
+    QApplication::processEvents();
+
     bool bOk = m_fileManager->save();
-    QApplication::restoreOverrideCursor();
+
+    dlgProgress.close();
 
     if(!bOk)
     {
-        QMessageBox::critical(this, tr("保存文件"),
-                              tr("保存失败，归档文件可能已损坏或磁盘写入失败。"));
+        QString sMsg = m_fileManager->isCancelRequested()
+                ? tr("保存已取消。")
+                : tr("保存失败，归档文件可能已损坏或磁盘写入失败。");
+        QMessageBox::critical(this, tr("保存文件"), sMsg);
         return;
     }
 
