@@ -865,18 +865,6 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     clearFFmpegResources();
     av_channel_layout_default(&out_ch_layout, AUDIO_OUT_CHANNELS);
 
-    // 音频输出设置
-    QAudioFormat fmt;
-    fmt.setSampleRate(AUDIO_OUT_SAMPLE_RATE);
-    fmt.setSampleSize(16);
-    fmt.setChannelCount(AUDIO_OUT_CHANNELS);
-    fmt.setCodec("audio/pcm");
-    fmt.setByteOrder(QAudioFormat::LittleEndian);
-    fmt.setSampleType(QAudioFormat::SignedInt);
-    audioOutput = new QAudioOutput(fmt);
-    audioOutput->setVolume(m_nVolume / 100.0f);
-    streamOut = audioOutput->start();
-
     pFormatCtx = avformat_alloc_context();
     if (!pFormatCtx)
     {
@@ -929,13 +917,28 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     if (audioindex >= 0)
         astream  = pFormatCtx->streams[audioindex];
 
-    // 支持纯音频文件：只要有音频流即可播放，视频流为可选
-    m_bAudioOnly = (videoindex < 0);
-    if (audioindex < 0)
+    // 视频与音频至少要有一种流才能播放（支持纯视频 / 纯音频 / 音视频都有）
+    if (videoindex < 0 && audioindex < 0)
     {
-        qWarning() << "[ShowVideo] 找不到音频流.";
+        qWarning() << "[ShowVideo] 找不到视频或音频流.";
         clearFFmpegResources();
         return -1;
+    }
+    m_bAudioOnly = (videoindex < 0);
+
+    // 音频输出设置（仅在有音频流时创建，无声视频不需要）
+    if (audioindex >= 0)
+    {
+        QAudioFormat fmt;
+        fmt.setSampleRate(AUDIO_OUT_SAMPLE_RATE);
+        fmt.setSampleSize(16);
+        fmt.setChannelCount(AUDIO_OUT_CHANNELS);
+        fmt.setCodec("audio/pcm");
+        fmt.setByteOrder(QAudioFormat::LittleEndian);
+        fmt.setSampleType(QAudioFormat::SignedInt);
+        audioOutput = new QAudioOutput(fmt);
+        audioOutput->setVolume(m_nVolume / 100.0f);
+        streamOut = audioOutput->start();
     }
 
     // ========== 视频解码（仅当存在视频流时）==========
@@ -970,27 +973,30 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         }
     }
 
-    // ========== 音频解码 ==========
-    aCodecCtx = avcodec_alloc_context3(nullptr);
-    if (!aCodecCtx || avcodec_parameters_to_context(aCodecCtx, astream->codecpar) < 0)
+    // ========== 音频解码（仅当存在音频流时）==========
+    if (audioindex >= 0 && astream)
     {
-        qWarning() << "[ShowVideo] 音频解码器上下文初始化失败.";
-        clearFFmpegResources();
-        return -1;
-    }
+        aCodecCtx = avcodec_alloc_context3(nullptr);
+        if (!aCodecCtx || avcodec_parameters_to_context(aCodecCtx, astream->codecpar) < 0)
+        {
+            qWarning() << "[ShowVideo] 音频解码器上下文初始化失败.";
+            clearFFmpegResources();
+            return -1;
+        }
 
-    const AVCodec *audioCodec = avcodec_find_decoder(aCodecCtx->codec_id);
-    if (!audioCodec)
-    {
-        qWarning() << "[ShowVideo] 找不到音频解码器.";
-        clearFFmpegResources();
-        return -1;
-    }
-    if (avcodec_open2(aCodecCtx, audioCodec, nullptr) < 0)
-    {
-        qWarning() << "[ShowVideo] 打开音频解码器失败.";
-        clearFFmpegResources();
-        return -1;
+        const AVCodec *audioCodec = avcodec_find_decoder(aCodecCtx->codec_id);
+        if (!audioCodec)
+        {
+            qWarning() << "[ShowVideo] 找不到音频解码器.";
+            clearFFmpegResources();
+            return -1;
+        }
+        if (avcodec_open2(aCodecCtx, audioCodec, nullptr) < 0)
+        {
+            qWarning() << "[ShowVideo] 打开音频解码器失败.";
+            clearFFmpegResources();
+            return -1;
+        }
     }
 
     byteBuf.clear();
@@ -1015,62 +1021,65 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
 
-    // 音频重采样设置
+    // 音频重采样设置（仅在有音频流时）
     out_sample_rate = AUDIO_OUT_SAMPLE_RATE;
+    int audio_out_samples_max = 0;  // 传递给 worker 作为音频缓冲容量上限；无声视频时为 0
 
-    // 1. 先创建并初始化重采样上下文（参照 resample_audio.c）
-    swr_ctx = nullptr;
-    int swr_ret = swr_alloc_set_opts2(&swr_ctx, &out_ch_layout, AUDIO_OUT_FORMAT, out_sample_rate,
-                                      &aCodecCtx->ch_layout, aCodecCtx->sample_fmt,
-                                      aCodecCtx->sample_rate, 0, nullptr);
-    if (swr_ret < 0 || !swr_ctx)
+    if (audioindex >= 0 && aCodecCtx)
     {
-        QString swrErr;
-        if (swr_ret < 0)
-        { char errbuf[128]; av_strerror(swr_ret, errbuf, sizeof(errbuf)); swrErr = QString::fromUtf8(errbuf); }
-        else
-            swrErr = QStringLiteral("swr_ctx null");
-        qWarning() << "[ShowVideo] 音频重采样上下文创建失败:" << swrErr;
-    }
-    else if (swr_init(swr_ctx) < 0)
-    {
-        qWarning() << "[ShowVideo] 音频重采样初始化失败.";
-        swr_free(&swr_ctx);
+        // 1. 先创建并初始化重采样上下文（参照 resample_audio.c）
         swr_ctx = nullptr;
-    }
-
-    // 2. 计算重采样输出缓冲大小
-    //    使用 swr_get_out_samples() 获取含内部滤波器延迟的实际所需缓冲区大小，
-    //    避免 swr_convert 写入超出缓冲区（特别是采样率不同时的重采样场景）。
-    int in_samples = aCodecCtx->frame_size;
-    if (in_samples <= 0) in_samples = aCodecCtx->sample_rate;
-    int audio_out_samples_max;
-    if (swr_ctx)
-    {
-        audio_out_samples_max = swr_get_out_samples(swr_ctx, in_samples);
-        if (audio_out_samples_max <= 0)
+        int swr_ret = swr_alloc_set_opts2(&swr_ctx, &out_ch_layout, AUDIO_OUT_FORMAT, out_sample_rate,
+                                          &aCodecCtx->ch_layout, aCodecCtx->sample_fmt,
+                                          aCodecCtx->sample_rate, 0, nullptr);
+        if (swr_ret < 0 || !swr_ctx)
         {
-            // swr_get_out_samples 返回非正值时，回退到按比例估算
+            QString swrErr;
+            if (swr_ret < 0)
+            { char errbuf[128]; av_strerror(swr_ret, errbuf, sizeof(errbuf)); swrErr = QString::fromUtf8(errbuf); }
+            else
+                swrErr = QStringLiteral("swr_ctx null");
+            qWarning() << "[ShowVideo] 音频重采样上下文创建失败:" << swrErr;
+        }
+        else if (swr_init(swr_ctx) < 0)
+        {
+            qWarning() << "[ShowVideo] 音频重采样初始化失败.";
+            swr_free(&swr_ctx);
+            swr_ctx = nullptr;
+        }
+
+        // 2. 计算重采样输出缓冲大小
+        //    使用 swr_get_out_samples() 获取含内部滤波器延迟的实际所需缓冲区大小，
+        //    避免 swr_convert 写入超出缓冲区（特别是采样率不同时的重采样场景）。
+        int in_samples = aCodecCtx->frame_size;
+        if (in_samples <= 0) in_samples = aCodecCtx->sample_rate;
+        if (swr_ctx)
+        {
+            audio_out_samples_max = swr_get_out_samples(swr_ctx, in_samples);
+            if (audio_out_samples_max <= 0)
+            {
+                // swr_get_out_samples 返回非正值时，回退到按比例估算
+                audio_out_samples_max = (int)av_rescale_rnd(
+                    in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
+            }
+        }
+        else
+        {
+            // swr_ctx 不可用时，按比例估算
             audio_out_samples_max = (int)av_rescale_rnd(
                 in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
         }
-    }
-    else
-    {
-        // swr_ctx 不可用时，按比例估算
-        audio_out_samples_max = (int)av_rescale_rnd(
-            in_samples, out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
-    }
-    // 额外预留 64 个样本空间以应对边界情况
-    audio_out_samples_max += 64;
+        // 额外预留 64 个样本空间以应对边界情况
+        audio_out_samples_max += 64;
 
-    audio_out_buffer = (uint8_t *)av_malloc(
-        av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS, audio_out_samples_max, AUDIO_OUT_FORMAT, 1));
-    if (!audio_out_buffer)
-    {
-        qWarning() << "[ShowVideo] 音频输出缓冲分配失败.";
-        clearFFmpegResources();
-        return -1;
+        audio_out_buffer = (uint8_t *)av_malloc(
+            av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS, audio_out_samples_max, AUDIO_OUT_FORMAT, 1));
+        if (!audio_out_buffer)
+        {
+            qWarning() << "[ShowVideo] 音频输出缓冲分配失败.";
+            clearFFmpegResources();
+            return -1;
+        }
     }
 
     // === 计算视频输出尺寸并创建 sws 上下文（保持宽高比，仅视频文件） ===

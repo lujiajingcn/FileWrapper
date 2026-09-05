@@ -1,0 +1,7 @@
+{
+    "Name":"pluginBook",
+    "Version":"0.0.1",
+    "Author" : "lujiajing",
+    "Date":"2026-08-21",
+    "Description":"电子书预览插件：基于自包含最小 ZIP 读取器（zlib 解压）+ QDomDocument 解析显示 EPUB / FB2（支持章节导航、图片与缩放）；MOBI/AZW 等私有格式识别后给出提示（需 libmobi）。"
+}

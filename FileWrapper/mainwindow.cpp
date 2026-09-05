@@ -342,25 +342,52 @@ bool MainWindow::CheckFileExt(QString sFileName, QStringList& arrFileExts)
 QString MainWindow::choosePlugin(QString sFileExt)
 {
     QString sPluginName;
-    if(QString::compare(sFileExt, "jpg", Qt::CaseInsensitive) == 0)
+    // PluginText 处理的纯文本格式（大小写不敏感），如需新增格式在此添加
+    static const QStringList arrTextExts = {
+        "txt", "log", "md", "markdown", "csv", "ini", "cfg", "conf",
+        "json", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx",
+        "py", "java", "c", "cpp", "cc", "h", "hpp", "cs", "go", "rb",
+        "php", "sh", "bat", "ps1", "yml", "yaml", "toml", "sql", "tex", "rst"
+    };
+    // PluginPicture 处理的图片格式（大小写不敏感），如需新增格式在此添加
+    static const QStringList arrPictureExts = {
+        "jpg", "jpeg", "png", "bmp", "gif", "xbm", "xpm", "pbm", "pgm", "ppm"
+    };
+    // PluginMedia 处理的音视频格式（基于 FFmpeg；大小写不敏感），如需新增格式在此添加
+    static const QStringList arrMediaExts = {
+        // 视频容器
+        "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm",
+        "mpg", "mpeg", "ts", "3gp", "3g2", "ogv", "vob", "asf", "rm", "rmvb",
+        // 音频
+        "mp3", "wav", "wma", "aac", "m4a", "flac", "ogg", "opus",
+        "amr", "aiff", "ape", "ac3"
+    };
+    // PluginPdf 处理的文档格式（QPdfium 仅支持 PDF，无可扩展项），大小写不敏感
+    static const QStringList arrPdfExts = { "pdf" };
+    // PluginBook 处理的电子书格式（EPUB/FB2 可解析显示；MOBI/AZW 等暂提示不支持），大小写不敏感
+    static const QStringList arrBookExts = {
+        "epub", "fb2", "mobi", "azw", "azw3", "prc", "lit"
+    };
+
+    if(arrPictureExts.contains(sFileExt, Qt::CaseInsensitive))
     {
         sPluginName = "PluginPicture";
     }
-    else if(QString::compare(sFileExt, "txt", Qt::CaseInsensitive) == 0 ||
-            QString::compare(sFileExt, "log", Qt::CaseInsensitive) == 0)
+    else if(arrTextExts.contains(sFileExt, Qt::CaseInsensitive))
     {
         sPluginName = "PluginText";
     }
-    else if(QString::compare(sFileExt, "mp4", Qt::CaseInsensitive) == 0 ||
-            QString::compare(sFileExt, "wmv", Qt::CaseInsensitive) == 0 ||
-            QString::compare(sFileExt, "mp3", Qt::CaseInsensitive) == 0 ||
-            QString::compare(sFileExt, "wav", Qt::CaseInsensitive) == 0)
+    else if(arrMediaExts.contains(sFileExt, Qt::CaseInsensitive))
     {
         sPluginName = "PluginMedia";
     }
-    else if(QString::compare(sFileExt, "pdf", Qt::CaseInsensitive) == 0)
+    else if(arrPdfExts.contains(sFileExt, Qt::CaseInsensitive))
     {
         sPluginName = "PluginPdf";
+    }
+    else if(arrBookExts.contains(sFileExt, Qt::CaseInsensitive))
+    {
+        sPluginName = "PluginBook";
     }
     else
     {

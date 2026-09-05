@@ -44,7 +44,18 @@ LIBS += -L$$PWD/lib/ -lQt5Pdfium
 FORMS += \
         mainwindow.ui
 
-DESTDIR = ../../../build-FileWrapper-Desktop_Qt_5_13_0_MinGW_64_bit-Debug/FileWrapper/debug/plugins  # 输出目录
+# 插件始终输出到主程序 exe 同级的 plugins/ 目录（自动适配 debug/release 与构建根目录）
+debug:   DESTDIR = $$OUT_PWD/../../FileWrapper/debug/plugins
+release: DESTDIR = $$OUT_PWD/../../FileWrapper/release/plugins  # 输出目录
+
+# 部署 PDFium 运行库 Qt5Pdfium.dll 到 exe 同级目录，使 PluginPdf 能被 QPluginLoader 正确加载
+# （PluginPdf.dll 链接 libQt5Pdfium，运行时需要 Qt5Pdfium.dll，缺失时 QPluginLoader 加载失败 -> 取插件接口为 null -> 报"获取插件接口失败"）
+win32 {
+    PDFIUM_SRC = $$PWD/lib/Qt5Pdfium.dll
+    CONFIG(debug, debug|release): PDFIUM_DST = $$OUT_PWD/../../FileWrapper/debug
+    else: PDFIUM_DST = $$OUT_PWD/../../FileWrapper/release
+    QMAKE_POST_LINK = $$QMAKE_COPY \"$$PDFIUM_SRC\" \"$$PDFIUM_DST\" || echo skip
+}
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

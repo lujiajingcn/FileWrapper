@@ -6,7 +6,7 @@
 #include <cstring>
 #include <cstdio>
 
-#define MAXBUFFERSIZE 1024 * 1024 * 4
+#define MAXBUFFERSIZE 1024 * 1024 * 16
 
 // ============================================================
 // 归档格式（二进制，小端）

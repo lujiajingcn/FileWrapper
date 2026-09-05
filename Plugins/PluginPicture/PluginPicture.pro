@@ -28,7 +28,9 @@ HEADERS += \
     mainwindow.h \
     pluginpicture.h
 
-DESTDIR = ../../../build-FileWrapper-Desktop_Qt_5_13_0_MinGW_64_bit-Debug/FileWrapper/debug/plugins  # 输出目录
+# 插件始终输出到主程序 exe 同级的 plugins/ 目录（自动适配 debug/release 与构建根目录）
+debug:   DESTDIR = $$OUT_PWD/../../FileWrapper/debug/plugins
+release: DESTDIR = $$OUT_PWD/../../FileWrapper/release/plugins  # 输出目录
 
 unix {
     target.path = /usr/lib
