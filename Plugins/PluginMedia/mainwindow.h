@@ -128,6 +128,10 @@ public:
     // 当前是否为纯音频播放（无视频流）
     bool isAudioOnly() const { return m_bAudioOnly; }
 
+    // 由 PluginMedia::stopPlayback() 调用：彻底停止后台播放（停解码线程 + 停音频输出 + 释放 FFmpeg 上下文）。
+    // 用于主程序切换文件时，确保被隐藏的旧视频 widget 不再在后台发声/解码。
+    void stopPlayback();
+
 public slots:
    void timeCallback(void);
 

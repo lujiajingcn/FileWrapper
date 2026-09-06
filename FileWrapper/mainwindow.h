@@ -4,6 +4,7 @@
 #include <QMainWindow>
 #include <QStandardItemModel>
 #include "filemanager.h"
+#include "plugininterface.h"
 #include <QTreeView>
 #include <QStackedWidget>
 #include <QHeaderView>
@@ -80,6 +81,8 @@ private:
     QAction                 *m_acSaveFile;
 
     bool                    m_bShowPath = false;  // 当前列表显示模式：true=显示路径, false=显示名称
+
+    PluginInterface         *m_pCurrentInterface = nullptr;  // 当前展示的插件接口，切换文件时用于停止上一插件的后台播放
 
     Ui::MainWindow *ui;
 };

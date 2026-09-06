@@ -23,3 +23,9 @@ QWidget* PluginMedia::getPluginWidget()
 {
     return m_wMainWindow;
 }
+
+void PluginMedia::stopPlayback()
+{
+    if (m_wMainWindow)
+        m_wMainWindow->stopPlayback();
+}

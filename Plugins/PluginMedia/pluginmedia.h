@@ -15,6 +15,7 @@ public:
     ~PluginMedia();
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
+    void stopPlayback();
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
 private:

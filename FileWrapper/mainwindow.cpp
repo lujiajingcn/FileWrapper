@@ -133,12 +133,22 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
         return;
     }
 
+    // Fix: 切换文件（跨插件类型）前，先停止上一个插件的后台播放，
+    // 否则被隐藏的旧视频/音频 widget 仍在后台解码/发声（QAudioOutput + worker 线程不随 tab 移除而停止）。
+    if (nCurIndex != -1 && m_pCurrentInterface && m_pCurrentInterface != pInterface)
+    {
+        m_pCurrentInterface->stopPlayback();
+    }
+
     if (nCurIndex != -1)
     {
         ui->tabWidget->removeTab(nCurIndex);
         // 注意：旧 page widget 不删除，它由其 Plugin 实例持有生命周期
     }
     ui->tabWidget->addTab(wPlugin, "");
+
+    // 记录当前插件接口，供下次切换文件时停止其播放
+    m_pCurrentInterface = pInterface;
 
     // 插件在 sendFileData 返回前会同步复制/使用数据，因此返回后可安全释放
     pInterface->sendFileData(szBuf, nFileLen);

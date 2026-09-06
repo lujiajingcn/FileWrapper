@@ -522,6 +522,19 @@ void MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
     m_videoWorker->waitForDecodingStopped(timeoutMs);
 }
 
+void MainWindow::stopPlayback()
+{
+    // 先停解码线程，再停音频输出，最后释放 FFmpeg 上下文（与 on_stopBtn_clicked 同序，避免竞争）
+    if (m_videoWorker)
+        stopWorkerAndWait(2000);
+
+    if (audioOutput)
+        audioOutput->stop();
+
+    clearFFmpegResources();
+    qDebug() << "[Stop] stopPlayback (切换文件，停止后台播放)";
+}
+
 void MainWindow::clearFFmpegResources()
 {
     // 停止视频解码线程
