@@ -67,3 +67,8 @@ PluginInterface* PluginManager::getInterface(QString sPluginPath)
         return nullptr;
     return cIt.value();
 }
+
+QList<PluginInterface*> PluginManager::getAllInterfaces()
+{
+    return m_mapPluginInterface.values();
+}
