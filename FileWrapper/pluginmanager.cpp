@@ -31,8 +31,28 @@ void PluginManager::loadAllPlugins()
         return;
 
     QDir pluginsDir(qApp->applicationDirPath());
-    pluginsDir.cd("plugins");
-    foreach (QString fileName, pluginsDir.entryList(QDir::Files))
+    if (!pluginsDir.cd("plugins"))
+    {
+        qWarning() << "[Plugin] 插件目录不存在:" << pluginsDir.absoluteFilePath("plugins");
+        return;
+    }
+
+    // 只处理真正的动态库文件。
+    // MinGW 在生成 PluginXxx.dll 的同时会在同目录留下导入库 libPluginXxx.a，
+    // 若不过滤，这些 .a 会被逐个当作插件尝试加载并刷出一堆
+    // "Failed to extract plugin meta data from ...libPluginXxx.a" 报错。
+#ifdef Q_OS_WIN
+    QStringList sFilters;
+    sFilters << "*.dll";
+#elif defined(Q_OS_MAC)
+    QStringList sFilters;
+    sFilters << "*.dylib" << "*.so";
+#else
+    QStringList sFilters;
+    sFilters << "*.so";
+#endif
+
+    foreach (QString fileName, pluginsDir.entryList(sFilters, QDir::Files))
     {
         QString sFilePath = pluginsDir.absoluteFilePath(fileName);
         QPluginLoader *loader = new QPluginLoader(sFilePath, this);

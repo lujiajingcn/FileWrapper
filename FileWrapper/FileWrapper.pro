@@ -62,13 +62,29 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 win32 {
     FFMPEG_BIN = $$PWD/../../ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-shared-8.1/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-shared-8.1/bin
     CONFIG(debug, debug|release) {
-        DST = $$OUT_PWD/debug
+        FFMPEG_DST = $$OUT_PWD/debug
     } else {
-        DST = $$OUT_PWD/release
+        FFMPEG_DST = $$OUT_PWD/release
     }
-    QMAKE_POST_LINK = $$QMAKE_COPY \"$$FFMPEG_BIN/avcodec-62.dll\" \"$$DST\" || echo skip; \
-        $$QMAKE_COPY \"$$FFMPEG_BIN/avformat-62.dll\" \"$$DST\" || echo skip; \
-        $$QMAKE_COPY \"$$FFMPEG_BIN/avutil-60.dll\" \"$$DST\" || echo skip; \
-        $$QMAKE_COPY \"$$FFMPEG_BIN/swresample-6.dll\" \"$$DST\" || echo skip; \
-        $$QMAKE_COPY \"$$FFMPEG_BIN/swscale-9.dll\" \"$$DST\" || echo skip
+
+    # 部署这 5 个 DLL 有两条必须遵守的规则，任一出错都会让 PluginMedia.dll 加载失败
+    # （缺 avformat/swresample/swscale → QPluginLoader 报"找不到指定的模块" → 取不到插件接口）：
+    #
+    # 规则 1：路径必须是 Windows 反斜杠形式。
+    #   cmd.exe 的内置 copy 不认正斜杠路径，"copy /y "E:/a/b.dll" "E:/dst"" 会报
+    #   「系统找不到指定的文件。已复制 0 个文件。」并且静默不报错。
+    #   $$shell_path() 负责在 Windows 上把 / 归一化成 \（换机器/换盘符都不受影响）。
+    #
+    # 规则 2：每条 copy 必须独占一行。
+    #   不能用 ";" 串联：";" 在 sh 里是命令分隔符，在 cmd.exe 里不是 ——
+    #   用 ";" 会导致只有第 1 个 DLL 被拷贝，其余 4 个静默丢失。
+    #   $$escape_expand(\\n\\t) 让 qmake 为每条命令生成独立的一行 recipe。
+    FFMPEG_BIN = $$shell_path($$FFMPEG_BIN)
+    FFMPEG_DST = $$shell_path($$FFMPEG_DST)
+
+    QMAKE_POST_LINK = $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avcodec-62.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
+        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avformat-62.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
+        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avutil-60.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
+        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/swresample-6.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
+        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/swscale-9.dll)\" \"$$FFMPEG_DST\" || echo skip
 }

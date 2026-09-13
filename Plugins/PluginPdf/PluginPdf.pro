@@ -54,6 +54,15 @@ win32 {
     PDFIUM_SRC = $$PWD/lib/Qt5Pdfium.dll
     CONFIG(debug, debug|release): PDFIUM_DST = $$OUT_PWD/../../FileWrapper/debug
     else: PDFIUM_DST = $$OUT_PWD/../../FileWrapper/release
+
+    # 路径必须经 $$shell_path() 归一化成 Windows 反斜杠形式：
+    # cmd.exe 的内置 copy 不认正斜杠路径，"copy /y "E:/a.dll" "E:/dst"" 会报
+    # 「系统找不到指定的文件。已复制 0 个文件。」且不返回错误码，
+    # 于是 Qt Creator 构建出来的 exe 目录里永远没有 Qt5Pdfium.dll，
+    # PluginPdf.dll 加载时报"找不到指定的模块"。
+    PDFIUM_SRC = $$shell_path($$PDFIUM_SRC)
+    PDFIUM_DST = $$shell_path($$PDFIUM_DST)
+
     QMAKE_POST_LINK = $$QMAKE_COPY \"$$PDFIUM_SRC\" \"$$PDFIUM_DST\" || echo skip
 }
 
