@@ -654,6 +654,13 @@ void MainWindow::on_progressSlider_sliderReleased(void)
 }
 
 // ====== 播放/暂停 ======
+// 注意：这里的 setPaused 必须用 Qt::DirectConnection，不能用 QueuedConnection。
+// 原因：VideoWorker 位于 m_videoThread，而 doDecode() 是通过 QueuedConnection 进入的；
+// doDecode() 是一个直到播放结束/停止才返回的长循环，整个播放期间都占着该线程的事件循环，
+// 因此任何 QueuedConnection 的槽调用都会被排进队列却永远得不到执行 ——
+// 表现为「暂停按钮点了没反应，视频照播」（音频因 audioOutput->suspend() 在主线程直接生效而看起来正常）。
+// setPaused() 内部只做「原子标志写入 + 条件变量唤醒」且自身加锁，从主线程直接调用是线程安全的，
+// 与本文件其余控制调用（requestStop / clearStopRequest / updateGenId / seek 里的 setPaused）保持一致。
 void MainWindow::on_playPauseBtn_clicked(void)
 {
     if (!m_bPlaying) return;
@@ -664,15 +671,16 @@ void MainWindow::on_playPauseBtn_clicked(void)
     if (m_bPaused)
     {
         // 暂停：暂停 worker 帧调度 + 停止定时器 + 暂停音频
-        QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::QueuedConnection, Q_ARG(bool, true));
+        QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, true));
         if (timer->isActive()) timer->stop();
         if (audioOutput) audioOutput->suspend();
         qDebug() << "[Play/Pause] Paused";
     }
     else
     {
-        // 继续播放
-        QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::QueuedConnection, Q_ARG(bool, false));
+        // 继续播放（同样必须 DirectConnection：暂停时 worker 正阻塞在条件变量上，
+        // 事件循环依然被 doDecode 占着，队列投递无法唤醒它 → 会「暂停后无法恢复」）
+        QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
         if (!timer->isActive()) timer->start(20);
         if (audioOutput) audioOutput->resume();
         qDebug() << "[Play/Pause] Playing";
