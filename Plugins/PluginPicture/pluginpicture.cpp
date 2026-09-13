@@ -23,3 +23,9 @@ QWidget* PluginPicture::getPluginWidget()
 {
     return m_wMainWindow;
 }
+
+PluginInterface* PluginPicture::createInstance()
+{
+    // 为新标签页创建一个独立实例（含独立的内部窗口），使同类型多标签页各自独立、互不干扰
+    return new PluginPicture;
+}

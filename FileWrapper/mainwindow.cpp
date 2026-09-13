@@ -22,6 +22,7 @@
 #include <QMap>
 #include <QStyle>
 #include <QIcon>
+#include <QSignalBlocker>
 
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
@@ -129,6 +130,14 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
+    // 析构期间不再触发 activateTab，避免销毁标签页时重入渲染逻辑
+    disconnect(ui->tabWidget, nullptr, this, nullptr);
+
+    // 先销毁各标签页（释放其独占的插件实例，会连带销毁内部窗口），再 delete ui，
+    // 避免 tabWidget 析构时把这些窗口当作普通页面重复删除。
+    for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
+        destroyTabAt(i);
+
     delete m_fileManager;
     delete m_hModelFilePath;
     delete ui;
@@ -239,22 +248,21 @@ void MainWindow::newEmptyTab()
 // 关闭全部标签页（用于加载/卸载归档时重置）
 void MainWindow::closeAllTabs()
 {
-    // 先把所有“正作为某标签页页面”的插件 widget 卸下（setParent(nullptr)），
-    // 否则 ui->tabWidget->clear() 会删除它们，而插件 widget 由插件自身持有生命周期，误删会导致崩溃。
-    for (int i = 0; i < ui->tabWidget->count(); ++i)
-    {
-        QWidget *w = ui->tabWidget->widget(i);
-        if (m_setPluginWidgets.contains(w))
-            w->setParent(nullptr);
-    }
-
     // 断开信号，避免逐个 removeTab 触发多余的 activateTab
     disconnect(ui->tabWidget, &QTabWidget::currentChanged, this, &MainWindow::onTabCurrentChanged);
     disconnect(ui->tabWidget, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
 
-    ui->tabWidget->clear();
-    m_vTabDocs.clear();
-    m_pMountedWidget = nullptr;
+    // 先停止当前实例的后台播放，再逐个销毁标签页（避免音视频在实例销毁前仍在后台运行）
+    if (m_pCurrentInterface != nullptr)
+    {
+        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface = nullptr;
+    }
+
+    // 逐个销毁标签页（含各自独占的插件实例，会连带销毁其内部窗口）
+    for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
+        destroyTabAt(i);
+
     m_pCurrentInterface = nullptr;
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, &MainWindow::onTabCurrentChanged);
@@ -264,12 +272,16 @@ void MainWindow::closeAllTabs()
     newEmptyTab();
 }
 
-// 根据文件后缀选择插件并解析接口；失败返回空指针并通过 outIface 返回接口
-// （复用已有的 choosePlugin + PluginManager 逻辑）
-bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface)
+// 根据文件后缀选择插件，并为标签页准备插件实例：
+// 优先调用插件的 createInstance() 创建**独占实例**（使同类型多标签页各自独立）；
+// 返回 nullptr 时回退到插件管理器中的共享实例（bOwned=false，关闭标签页时不 delete）。
+bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
+                               PluginInterface* &pInterface, bool &bOwned)
 {
     sPluginPath.clear();
     pInterface = nullptr;
+    bOwned = false;
+
     QString sExt = QFileInfo(info.sFilePath).suffix();
     sPluginPath = choosePlugin(sExt);
     if (sPluginPath.isEmpty())
@@ -277,21 +289,34 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath, Plugi
         QMessageBox::information(this, "", "没有插件来处理该类型文件，请手动映射插件");
         return false;
     }
-    pInterface = PluginManager::getInstance()->getInterface(sPluginPath);
-    if (!pInterface)
+
+    PluginInterface *pTemplate = PluginManager::getInstance()->getInterface(sPluginPath);
+    if (!pTemplate)
     {
         qDebug() << "获取插件接口失败:" << sPluginPath;
         return false;
     }
+
+    pInterface = pTemplate->createInstance();
+    if (pInterface)
+    {
+        bOwned = true;
+        return true;
+    }
+
+    // 降级：插件不支持多实例，改用共享实例（此时同类型多标签页会共用同一内容区）
+    qWarning() << "[Plugin] 不支持多实例, 回退为共享实例:" << sPluginPath;
+    pInterface = pTemplate;
     return true;
 }
 
-// 新建标签页并打开选中的记录项文件
+// 新建标签页并打开选中的记录项文件（该页独占一个插件实例）
 void MainWindow::openFileInNewTab(const FILEINFO &info)
 {
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
-    if (!resolvePlugin(info, sPluginPath, pInterface))
+    bool bOwned = false;
+    if (!resolvePlugin(info, sPluginPath, pInterface, bOwned))
         return;
 
     TabDoc doc;
@@ -299,6 +324,8 @@ void MainWindow::openFileInNewTab(const FILEINFO &info)
     doc.info = info;
     doc.pluginPath = sPluginPath;
     doc.interface = pInterface;
+    doc.ownsInterface = bOwned;
+    doc.needsRender = true;
     m_vTabDocs.append(doc);
 
     int newIdx = ui->tabWidget->addTab(new QWidget(), info.sFileName);
@@ -315,18 +342,109 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
         return;
     }
 
+    TabDoc doc = m_vTabDocs.at(cur);   // 用副本，避免下方摘除/插入元素后引用失效
+
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
-    if (!resolvePlugin(info, sPluginPath, pInterface))
+    bool bOwned = false;
+    if (!resolvePlugin(info, sPluginPath, pInterface, bOwned))
         return;
 
-    m_vTabDocs[cur].hasFile = true;
-    m_vTabDocs[cur].info = info;
-    m_vTabDocs[cur].pluginPath = sPluginPath;
-    m_vTabDocs[cur].interface = pInterface;
+    // 该页已持有同一插件的独占实例：直接复用，仅替换文件并重新渲染
+    if (doc.hasFile && doc.ownsInterface && bOwned
+        && doc.interface != nullptr && doc.pluginPath == sPluginPath)
+    {
+        delete pInterface;             // 刚新建的实例不再需要
+        m_vTabDocs[cur].info = info;
+        m_vTabDocs[cur].needsRender = true;
+        ui->tabWidget->setTabText(cur, info.sFileName);   // 标题跟随新文件
+        activateTab(cur);
+        return;
+    }
 
-    // 当前页可能未变化，currentChanged 不会触发，这里显式激活
-    activateTab(cur);
+    // 其它情况：该页需要换成新的插件实例（可能换了插件类型）。
+    // 若旧实例正在播放，先停止，避免其解码线程/音频输出残留。
+    if (doc.interface != nullptr && doc.interface == m_pCurrentInterface)
+        stopCurrentPlaybackAndInvalidate();
+
+    // 摘页并销毁旧的独占实例（连带其内部窗口）；共享实例与插件窗口不删
+    QWidget *pOldPage = ui->tabWidget->widget(cur);
+    m_vTabDocs.removeAt(cur);          // 先同步文档列表，使 removeTab 触发的 currentChanged 下标对齐
+    ui->tabWidget->removeTab(cur);
+
+    QWidget *pOldOwned = nullptr;
+    if (doc.interface != nullptr && doc.ownsInterface)
+    {
+        pOldOwned = doc.interface->getPluginWidget();
+        delete doc.interface;
+    }
+    if (pOldPage != nullptr && pOldPage != pOldOwned && !m_setPluginWidgets.contains(pOldPage))
+        delete pOldPage;
+
+    // 复用原下标位置重建该页，并切回该页
+    doc.hasFile = true;
+    doc.info = info;
+    doc.pluginPath = sPluginPath;
+    doc.interface = pInterface;
+    doc.ownsInterface = bOwned;
+    doc.needsRender = true;
+    m_vTabDocs.insert(cur, doc);
+
+    ui->tabWidget->insertTab(cur, new QWidget(), info.sFileName);
+    ui->tabWidget->setCurrentIndex(cur); // 触发 currentChanged -> activateTab
+    activateTab(cur);                    // 当前页未变化时 currentChanged 不触发，这里兜底显式激活
+}
+
+// 销毁某个标签页：先把页面从 tabWidget 摘下，再释放该页独占的插件实例（连带销毁其内部窗口），
+// 最后删除自建的占位页面。共享实例与插件（模板实例）窗口一律不删。
+void MainWindow::destroyTabAt(int index)
+{
+    if (index < 0 || index >= m_vTabDocs.size() || index >= ui->tabWidget->count())
+        return;
+
+    TabDoc doc = m_vTabDocs.at(index);
+    QWidget *pPage = ui->tabWidget->widget(index);
+
+    // 先同步文档列表，再摘页：removeTab 可能触发 currentChanged -> activateTab，
+    // 此时 m_vTabDocs 的下标必须已与 tabWidget 对齐。
+    m_vTabDocs.removeAt(index);
+    ui->tabWidget->removeTab(index);   // removeTab 不删除页面 widget
+
+    // 独占实例：delete 会连带 delete 其内部窗口（即该页面）
+    QWidget *pOwnedWidget = nullptr;
+    if (doc.interface != nullptr && doc.ownsInterface)
+    {
+        pOwnedWidget = doc.interface->getPluginWidget();
+        delete doc.interface;
+    }
+
+    // 其余需要删除的页面：自建占位页（不是插件窗口、也不是已随实例销毁的窗口）
+    if (pPage != nullptr && pPage != pOwnedWidget && !m_setPluginWidgets.contains(pPage))
+        delete pPage;
+}
+
+// 停止当前激活实例的后台播放；对带后台播放的插件，让其所在标签页在下次激活时重新渲染
+void MainWindow::stopCurrentPlaybackAndInvalidate()
+{
+    PluginInterface *pOld = m_pCurrentInterface;
+    m_pCurrentInterface = nullptr;
+    if (pOld == nullptr)
+        return;
+
+    pOld->stopPlayback();
+
+    if (!pOld->hasBackgroundPlayback())
+        return;
+
+    // 解码资源已被释放，切回该页需要重新渲染，否则只剩最后一帧/黑屏
+    for (int i = 0; i < m_vTabDocs.size(); ++i)
+    {
+        if (m_vTabDocs[i].interface == pOld)
+        {
+            m_vTabDocs[i].needsRender = true;
+            break;
+        }
+    }
 }
 
 // 读取文件内容并送入插件渲染
@@ -345,95 +463,77 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     delete[] szBuf;
 }
 
-// 激活某个标签页：将对应插件 widget 迁移/挂载到该页，并渲染其文件
+// 激活某个标签页：挂载该页独占的插件窗口，并按需渲染其文件
 void MainWindow::activateTab(int index)
 {
     if (index < 0 || index >= ui->tabWidget->count() || index >= m_vTabDocs.size())
     {
-        m_pMountedWidget = nullptr;
-        m_pCurrentInterface = nullptr;
+        // 索引无效（如最后一个标签页被移除时的 currentChanged(-1)）：
+        // 仍要停止上一个实例的后台播放，避免无人接管的解码线程继续运行
+        stopCurrentPlaybackAndInvalidate();
         return;
     }
 
     TabDoc &doc = m_vTabDocs[index];
 
-    // 空白标签页：停止上一个插件的后台播放，不挂载任何插件 widget
-    if (!doc.hasFile)
+    // 空白标签页：停止上一个实例的后台播放，页面保持空白
+    if (!doc.hasFile || doc.interface == nullptr)
     {
-        if (m_pCurrentInterface)
-            m_pCurrentInterface->stopPlayback();
-        m_pCurrentInterface = nullptr;
-        m_pMountedWidget = nullptr;
+        stopCurrentPlaybackAndInvalidate();
         return;
     }
 
-    PluginInterface *iface = doc.interface;
-    QWidget *w = iface->getPluginWidget();
+    QWidget *w = doc.interface->getPluginWidget();
 
-    // 1) 若此插件 widget 当前正挂载在别的标签页（同类型多标签页场景），
-    //    先把它从那个标签页拆下，换成一个占位 widget。
-    for (int i = 0; i < ui->tabWidget->count(); ++i)
+    // 挂载：保证本页展示的正是本标签页独占的窗口。
+    // 摘页/插页会改变 currentIndex 并可能递归触发 currentChanged，
+    // 这里先屏蔽信号完成挂载并锁定当前页，避免重入。
+    if (ui->tabWidget->widget(index) != w)
     {
-        if (i == index)
-            continue;
-        if (ui->tabWidget->widget(i) == w)
+        QWidget *pOldPage = ui->tabWidget->widget(index);
         {
-            QWidget *old = ui->tabWidget->widget(i);
-            ui->tabWidget->removeTab(i);
-            ui->tabWidget->insertTab(i, new QWidget(),
-                                    m_vTabDocs[i].hasFile ? m_vTabDocs[i].info.sFileName
-                                                         : QStringLiteral("新标签页"));
-            // old 即插件 widget，由插件持有生命周期，不删除
-            Q_UNUSED(old);
+            QSignalBlocker blocker(ui->tabWidget);
+            ui->tabWidget->removeTab(index);
+            ui->tabWidget->insertTab(index, w, doc.info.sFileName);
+            ui->tabWidget->setCurrentIndex(index);
         }
+        // 仅删除自建占位页；插件窗口（本页独占或插件共享）不删
+        if (pOldPage != nullptr && pOldPage != w && !m_setPluginWidgets.contains(pOldPage))
+            delete pOldPage;
     }
 
-    // 2) 把该插件 widget 挂载到当前激活的标签页
-    QWidget *cur = ui->tabWidget->widget(index);
-    if (cur != w)
+    // 切换实例时停止上一个实例的后台播放（同类型的两个标签页也是各自独立的实例）
+    if (m_pCurrentInterface && m_pCurrentInterface != doc.interface)
+        stopCurrentPlaybackAndInvalidate();
+    m_pCurrentInterface = doc.interface;
+
+    // 渲染：首次打开、文件被替换，或带后台播放的实例被停播后（缓存已失效）时，
+    // 重新读取文件内容并送入插件
+    if (doc.needsRender)
     {
-        QWidget *old = ui->tabWidget->widget(index);
-        ui->tabWidget->removeTab(index);
-        ui->tabWidget->insertTab(index, w, doc.info.sFileName);
-        // 仅删除占位 widget；插件 widget 不删（由插件持有）
-        if (old != nullptr && !m_setPluginWidgets.contains(old))
-            delete old;
+        renderFile(doc.info, doc.interface);
+        doc.needsRender = false;
     }
-
-    m_pMountedWidget = w;
-
-    // 3) 切换插件类型时，停止上一个插件的后台播放（视频/音频）
-    if (m_pCurrentInterface && m_pCurrentInterface != iface)
-        m_pCurrentInterface->stopPlayback();
-    m_pCurrentInterface = iface;
-
-    // 4) 渲染文件内容
-    renderFile(doc.info, iface);
 }
 
 // 用户点击标签页关闭按钮
 void MainWindow::onTabCloseRequested(int index)
 {
-    if (index < 0 || index >= ui->tabWidget->count())
+    if (index < 0 || index >= ui->tabWidget->count() || index >= m_vTabDocs.size())
         return;
 
-    QWidget *w = ui->tabWidget->widget(index);
-    bool bIsPluginWidget = m_setPluginWidgets.contains(w);
+    // 关闭正在播放的页前，先停止其后台播放，避免解码线程/音频输出残留
+    if (m_vTabDocs.at(index).interface != nullptr
+        && m_vTabDocs.at(index).interface == m_pCurrentInterface)
+    {
+        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface = nullptr;
+    }
 
-    // 先同步文档列表（使后续 currentChanged 引用的索引与 tabWidget 一致）
-    m_vTabDocs.removeAt(index);
-    ui->tabWidget->removeTab(index);   // 可能触发 currentChanged -> activateTab
-
-    // 占位 widget 删除；插件 widget 不删（由插件持有），留待后续标签页复用
-    if (!bIsPluginWidget)
-        delete w;
+    destroyTabAt(index);   // 摘页 + 释放该页独占的插件实例
 
     if (ui->tabWidget->count() == 0)
-    {
-        m_pMountedWidget = nullptr;
-        m_pCurrentInterface = nullptr;
-        newEmptyTab(); // 始终保持至少一个标签页
-    }
+        newEmptyTab();     // 始终保持至少一个标签页
 }
 
 // 切换标签页

@@ -15,6 +15,7 @@ public:
     ~PluginBook();
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
+    PluginInterface* createInstance();
 
 private:
     MainWindow* m_wMainWindow;

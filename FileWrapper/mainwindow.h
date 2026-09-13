@@ -93,14 +93,17 @@ protected:
     bool confirmDiscardOrSaveIfDirty();
 private:
     // 一个标签页对应一个“已打开的文档”。
-    // 注意：每种插件类型只有唯一一个共享 widget（由插件自身持有生命周期），
-    // 因此同一时刻只有一个标签页能“挂载”某类型的插件 widget；切换标签页时
-    // 该 widget 在标签页之间迁移，非激活标签页显示为占位；切换回来时重新渲染。
+    // 每个文件标签页各自持有一个**独立**的插件实例（由 PluginInterface::createInstance()
+    // 创建，含独立内部窗口），因此同一插件类型的多个标签页可同时各自显示不同内容、互不干扰。
+    // 若插件不支持多实例（createInstance() 返回 nullptr），则降级为共享实例
+    // （此时同类型多标签页会共用同一内容区）。
     struct TabDoc {
-        bool             hasFile = false;  // 是否为已打开文件的标签页（false=空白标签页）
-        FILEINFO         info;             // 记录项文件信息
-        QString          pluginPath;       // 处理该文件的插件路径
-        PluginInterface *interface = nullptr;
+        bool             hasFile = false;        // 是否为已打开文件的标签页（false=空白标签页）
+        FILEINFO         info;                   // 记录项文件信息
+        QString          pluginPath;             // 处理该文件的插件路径
+        PluginInterface *interface = nullptr;    // 处理该文件的插件实例
+        bool             ownsInterface = false;  // true=本页独占、关闭时需 delete；false=插件共享实例
+        bool             needsRender = true;     // 再次激活该页时是否需要重新渲染
     };
 
     QStandardItemModel      *m_hModelFilePath;
@@ -121,21 +124,23 @@ private:
     bool                    m_bTreeMode = true;   // 列表展示模式：true=按原始路径层级树形展示, false=平铺
     bool                    m_bShowPath = false;  // 平铺模式下列表文本：true=显示路径, false=显示名称
 
-    PluginInterface         *m_pCurrentInterface = nullptr;  // 当前展示的插件接口，切换文件时用于停止上一插件的后台播放
+    PluginInterface         *m_pCurrentInterface = nullptr;  // 当前激活标签页的插件实例（切换时用于停止其后台播放）
 
     // —— 多标签页相关成员 ——
     QVector<TabDoc>          m_vTabDocs;          // 与 tabWidget 各页一一对应的文档描述
-    QSet<QWidget*>           m_setPluginWidgets;  // 所有插件 widget 集合（关闭标签页时据此避免误删）
-    QWidget                 *m_pMountedWidget = nullptr; // 当前挂载在激活标签页中的插件 widget
+    QSet<QWidget*>           m_setPluginWidgets;  // 插件（模板实例）自带窗口：不归标签页所有，关闭标签页时不可删除
 
-    void initTabWidget();                         // 初始化 tabWidget（清空默认页、可关闭、新建按钮、信号连接）
-    void openFileInNewTab(const FILEINFO& info);  // 新建标签页并打开文件
+    void openFileInNewTab(const FILEINFO& info);  // 新建标签页并打开文件（该页独占一个插件实例）
     void openFileInCurrentTab(const FILEINFO& info); // 在当前激活标签页打开文件
-    void activateTab(int index);                 // 激活某标签页：迁移并挂载插件 widget、渲染文件
+    void activateTab(int index);                 // 激活某标签页：挂载其独立窗口并渲染文件
     void renderFile(const FILEINFO& info, PluginInterface* iface); // 读取文件内容并送入插件
+    void destroyTabAt(int index);                // 销毁某标签页：摘页 + 释放其独占插件实例
+    void stopCurrentPlaybackAndInvalidate();     // 停止当前实例后台播放，并让其所在页下次激活时重渲染
     void closeAllTabs();                         // 关闭全部标签页（用于加载/卸载归档）
     void newEmptyTab();                          // 新建一个空白标签页
-    bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface); // 选择并解析插件接口
+    // 选择插件并为标签页准备插件实例：优先创建独占实例（bOwned=true），
+    // 插件不支持多实例时回退为共享实例（bOwned=false）
+    bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);
 
     Ui::MainWindow *ui;
 };

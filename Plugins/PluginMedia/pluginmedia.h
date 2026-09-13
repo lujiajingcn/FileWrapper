@@ -16,6 +16,8 @@ public:
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
     void stopPlayback();
+    bool hasBackgroundPlayback() const;
+    PluginInterface* createInstance();
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
 private:
