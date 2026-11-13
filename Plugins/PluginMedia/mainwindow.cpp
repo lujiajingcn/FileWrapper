@@ -10,6 +10,54 @@
 #include <QMutexLocker>
 #include <QElapsedTimer>
 #include <QSize>
+#include <QStatusBar>
+#include <cstring>
+#include <cstdio>
+#include <cerrno>
+#include <limits>
+
+// ============================================================
+// 自定义内存 IO 回调
+// ============================================================
+// 旧实现把整个文件一次性塞进 AVIOContext 的 buffer，且 read / seek 回调全为 NULL。
+// FFmpeg 因此把该 IO 标记为不可 seek（pb->seekable == 0、avio_size() 返回 ENOSYS）：
+//   - FLV / MPEG-TS / AVI 的 av_seek_frame 直接返回「Operation not permitted」；
+//   - MP3 / TS 拿不到文件长度，duration 估算失败，进度条被强行设成 60 秒；
+//   - 而 MP4 / MOV / MKV / WebM / ASF 恰好因为整个文件都在同一块 buffer 内、
+//     FFmpeg 能做 buffer 内 seek，表现正常。
+// 这就是「只有部分格式不能拖动进度条」的原因。提供 read/seek 回调后所有容器统一可 seek。
+static int memIORead(void *opaque, uint8_t *buf, int bufSize)
+{
+    MemIOData *m = static_cast<MemIOData *>(opaque);
+    if (!m || !m->data || bufSize <= 0)
+        return AVERROR(EINVAL);
+    qint64 remain = m->size - m->pos;
+    if (remain <= 0)
+        return AVERROR_EOF;
+    int n = (int)qMin<qint64>(remain, bufSize);
+    memcpy(buf, m->data + m->pos, (size_t)n);
+    m->pos += n;
+    return n;
+}
+
+static int64_t memIOSeek(void *opaque, int64_t offset, int whence)
+{
+    MemIOData *m = static_cast<MemIOData *>(opaque);
+    if (!m)
+        return AVERROR(EINVAL);
+    if (whence == AVSEEK_SIZE)
+        return m->size;
+    int w = whence & ~AVSEEK_FORCE;
+    int64_t base = 0;
+    if (w == SEEK_CUR)      base = m->pos;
+    else if (w == SEEK_END) base = m->size;
+    else if (w != SEEK_SET) return AVERROR(EINVAL);
+    int64_t newPos = base + offset;
+    if (newPos < 0)
+        return AVERROR(EINVAL);
+    m->pos = newPos;   // 允许越过文件尾；后续 read 返回 EOF，与真实文件行为一致
+    return newPos;
+}
 
 // ============================================================
 // VideoWorker 实现 — 运行在独立线程，负责所有解码 + 帧调度
@@ -57,10 +105,16 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
     m_outSampleRate = outSampleRate;
     m_audioOutBufCapacity = audioOutBufCapacity;
     m_genId = genId;
-    // 新播放开始时清除 stop 与 pause 标志
+    // 新播放开始时清除 stop / pause / seek 快进标志
     m_stopRequested.store(0, std::memory_order_relaxed);
     m_paused.store(0, std::memory_order_relaxed);
+    m_seekTargetAbsMs.store(0, std::memory_order_relaxed);
     m_pauseCond.wakeAll();
+}
+
+void VideoWorker::setSeekTarget(qint64 absMs)
+{
+    m_seekTargetAbsMs.store(absMs, std::memory_order_relaxed);
 }
 
 void VideoWorker::requestStop()
@@ -168,6 +222,31 @@ void VideoWorker::doDecode()
             break;
         }
 
+        // seek 快进：AVSEEK_FLAG_BACKWARD 会定位到目标前的关键帧。
+        // 目标前的包必须照常送进解码器（否则 P/B 帧没有参考帧，根本解不出画面），
+        // 但解码结果不显示、不送音频输出、也不做实时帧调度，全速追上目标。
+        // 用包 PTS 判断，音视频统一处理。
+        bool fastForwarding = false;
+        qint64 seekTarget = m_seekTargetAbsMs.load(std::memory_order_relaxed);
+        if (seekTarget > 0)
+        {
+            if (pkt->pts == AV_NOPTS_VALUE)
+            {
+                // 无时间戳时无法判断，放弃快进以免永远卡住
+                m_seekTargetAbsMs.store(0, std::memory_order_relaxed);
+            }
+            else if (pkt->stream_index >= 0
+                     && pkt->stream_index < (int)pFormatCtx->nb_streams)
+            {
+                double secs = pkt->pts
+                            * av_q2d(pFormatCtx->streams[pkt->stream_index]->time_base);
+                qint64 pktMs = (qint64)(secs * 1000);
+                fastForwarding = (pktMs < seekTarget);
+                if (!fastForwarding)
+                    m_seekTargetAbsMs.store(0, std::memory_order_relaxed);
+            }
+        }
+
         if (pkt->stream_index == videoindex)
         {
             // ====== 视频解码 ======
@@ -183,6 +262,14 @@ void VideoWorker::doDecode()
                         { char errbuf[128]; av_strerror(ret, errbuf, sizeof(errbuf));
                         qWarning() << "[VideoWorker] 视频解码失败:" << errbuf; }
                         break;
+                    }
+
+                    if (fastForwarding)
+                    {
+                        // 快进：帧已解码（为后续 P/B 帧建立参考），但不显示、不等待
+                        if (m_stopRequested.load(std::memory_order_relaxed))
+                            goto stop_decode;
+                        continue;
                     }
 
                     // 像素格式转换 + 直接缩放到目标尺寸（保持宽高比由 sws 上下文保证）
@@ -262,6 +349,14 @@ void VideoWorker::doDecode()
                         { char errbuf[128]; av_strerror(ret, errbuf, sizeof(errbuf));
                         qWarning() << "[VideoWorker] 音频解码失败:" << errbuf; }
                         break;
+                    }
+
+                    if (fastForwarding)
+                    {
+                        // 快进：音频不写入缓冲、不做调度、不更新进度
+                        if (m_stopRequested.load(std::memory_order_relaxed))
+                            goto stop_decode;
+                        continue;
                     }
 
                     if (swr_ctx)
@@ -462,9 +557,15 @@ void MainWindow::onFrameDecoded(QImage img, qint64 ptsMs, int genId)
 
     if (ptsMs > 0)
     {
-        m_nCurrentMs = ptsMs;
-        if (m_nCurrentMs > m_nDurationMs)
-            m_nCurrentMs = m_nDurationMs;
+        // 绝对 PTS -> 相对时间轴（MPEG-TS / MP3 的 PTS 起点非 0）
+        qint64 relMs = ptsMs - m_nStartMs;
+        if (relMs < 0) relMs = 0;
+        // AVSEEK_FLAG_BACKWARD 会先解出目标前的关键帧；在追上目标之前
+        // 保持进度条在用户选中的位置，避免「拖了又弹回开头」。
+        if (m_nSeekTargetMs > 0 && relMs + 500 < m_nSeekTargetMs)
+            return;
+        m_nSeekTargetMs = 0;
+        m_nCurrentMs = qMin(relMs, m_nDurationMs);
     }
 }
 
@@ -498,9 +599,15 @@ void MainWindow::onAudioPtsUpdated(qint64 ptsMs, int genId)
 
     if (ptsMs > 0)
     {
-        m_nCurrentMs = ptsMs;
-        if (m_nCurrentMs > m_nDurationMs)
-            m_nCurrentMs = m_nDurationMs;
+        // 绝对 PTS -> 相对时间轴（MPEG-TS / MP3 的 PTS 起点非 0）
+        qint64 relMs = ptsMs - m_nStartMs;
+        if (relMs < 0) relMs = 0;
+        // AVSEEK_FLAG_BACKWARD 会先解出目标前的关键帧；在追上目标之前
+        // 保持进度条在用户选中的位置，避免「拖了又弹回开头」。
+        if (m_nSeekTargetMs > 0 && relMs + 500 < m_nSeekTargetMs)
+            return;
+        m_nSeekTargetMs = 0;
+        m_nCurrentMs = qMin(relMs, m_nDurationMs);
     }
 }
 
@@ -557,10 +664,15 @@ void MainWindow::clearFFmpegResources()
     if (pCodecCtx)  { avcodec_free_context(&pCodecCtx);  pCodecCtx = nullptr; }
     if (aCodecCtx)  { avcodec_free_context(&aCodecCtx);  aCodecCtx = nullptr; }
     if (pFormatCtx) { avformat_close_input(&pFormatCtx); pFormatCtx = nullptr; }
-    // m_avioCtx 释放时会连带释放其内部 buffer，因此这里不再单独 av_freep(m_avioBuffer)，
-    // 否则会导致双重释放崩溃。
+    // avio_context_free 会释放 AVIOContext 当前使用的内部 buffer（m_avioInternalBuffer
+    // 可能被 FFmpeg 替换过），因此这里只置空指针，不能单独再 free 一次。
     if (m_avioCtx)  { avio_context_free(&m_avioCtx); m_avioCtx = nullptr; }
-    m_avioBuffer = nullptr;
+    m_avioInternalBuffer = nullptr;
+    // 数据源与 AVIO 内部缓冲已分离：完整文件数据需要单独释放
+    if (m_avioBuffer) { av_freep(&m_avioBuffer); m_avioBuffer = nullptr; }
+    m_memIO.data = nullptr;
+    m_memIO.size = 0;
+    m_memIO.pos  = 0;
 
     videoindex = -1;
     audioindex = -1;
@@ -720,6 +832,8 @@ void MainWindow::on_stopBtn_clicked(void)
     }
 
     m_nCurrentMs = 0;
+    m_nSeekTargetMs = 0;
+    m_videoWorker->setSeekTarget(0);
     ui->progressSlider->blockSignals(true);
     ui->progressSlider->setValue(0);
     ui->progressSlider->blockSignals(false);
@@ -762,6 +876,9 @@ void MainWindow::doSeek(qint64 ms)
     if (ms < 0) ms = 0;
     if (ms > m_nDurationMs) ms = m_nDurationMs;
 
+    const qint64 previousMs = m_nCurrentMs;
+    const bool   wasPlaying = m_bPlaying;
+
     m_bPlaying = false;
     m_bPaused = false;
     updatePlayPauseIcon();
@@ -770,16 +887,64 @@ void MainWindow::doSeek(qint64 ms)
     // 暂停视频解码线程（避免 seek 期间继续读帧）
     stopWorkerAndWait(2000);
 
-    // stream_index = -1 时，av_seek_frame 期望时间戳单位为 AV_TIME_BASE (微秒)
-    int64_t target_ts_us = ms * 1000;
+    // stream_index = -1 时，av_seek_frame 期望时间戳单位为 AV_TIME_BASE (微秒)；
+    // UI 是相对时间轴，容器 PTS 起点非 0 时要补上起始偏移。
+    int64_t target_ts_us = (ms + m_nStartMs) * 1000;
     qDebug() << "[Seek] doSeek to" << ms << "ms (ts=" << target_ts_us << "us)";
 
-    // 执行 seek（回退到关键帧，避免花屏）
+    // 优先回退到关键帧避免花屏；不支持的容器依次降级，尽量保证跳转可用
     int seek_ret = av_seek_frame(pFormatCtx, -1, target_ts_us, AVSEEK_FLAG_BACKWARD);
     if (seek_ret < 0)
+        seek_ret = av_seek_frame(pFormatCtx, -1, target_ts_us, AVSEEK_FLAG_ANY);
+    if (seek_ret < 0)
+        seek_ret = avformat_seek_file(pFormatCtx, -1,
+                                      std::numeric_limits<int64_t>::min(),
+                                      target_ts_us,
+                                      std::numeric_limits<int64_t>::max(), 0);
+
+    // 重启解码线程（成功与失败两条路径共用）
+    auto restartDecode = [this](int genId)
     {
-        { char errbuf[128]; av_strerror(seek_ret, errbuf, sizeof(errbuf));
-        qWarning() << "[Seek] Seek failed at" << ms << "ms:" << errbuf; }
+        // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded / onAudioPtsUpdated 过滤掉
+        QMetaObject::invokeMethod(m_videoWorker, "updateGenId", Qt::DirectConnection, Q_ARG(int, genId));
+        QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
+        QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
+        QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);
+        timer->start(20);
+    };
+
+    if (seek_ret < 0)
+    {
+        char errbuf[128];
+        av_strerror(seek_ret, errbuf, sizeof(errbuf));
+        qWarning() << "[Seek] Seek failed at" << ms << "ms:" << errbuf;
+
+        // 不再假装成功。seek 失败时 IO 位置往往已被推到文件尾（FLV/TS 实测如此），
+        // 先试着回到拖动前的位置，再不行就回到开头，避免恢复播放后立刻 EOF 结束。
+        int64_t backTs = (previousMs + m_nStartMs) * 1000;
+        if (av_seek_frame(pFormatCtx, -1, backTs, AVSEEK_FLAG_BACKWARD) < 0)
+            av_seek_frame(pFormatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
+
+        if (pCodecCtx) avcodec_flush_buffers(pCodecCtx);
+        if (aCodecCtx) avcodec_flush_buffers(aCodecCtx);
+        {
+            QMutexLocker locker(&m_audioMutex);
+            byteBuf.clear();
+        }
+
+        m_nCurrentMs = previousMs;
+        m_nSeekTargetMs = 0;
+        // 清掉可能残留的快进标志，避免恢复播放后继续跳过输出
+        m_videoWorker->setSeekTarget(0);
+        m_bPlaying = wasPlaying;
+        m_bPaused = false;
+        updatePlayPauseIcon();
+        if (audioOutput) audioOutput->resume();
+
+        m_genCounter++;
+        restartDecode(m_genCounter);
+        statusBar()->showMessage(QStringLiteral("该媒体不支持拖动定位，已恢复原位播放"), 3000);
+        return;
     }
 
     // 清理解码器内部缓冲，从关键帧开始重新解码
@@ -793,20 +958,20 @@ void MainWindow::doSeek(qint64 ms)
     }
 
     m_nCurrentMs = ms;
+    // 关键帧回退期间保护进度条，不让更早的帧 PTS 把位置拉回去
+    m_nSeekTargetMs = ms;
     m_bPlaying = true;
+
+    // 让解码线程进入快进：目标前的包照常解码但不显示，快速追上选中位置。
+    // 直接调用即可：setSeekTarget 只做一次原子写，无需经元对象字符串调用
+    // （qint64 的元类型名在 Qt5/Qt6 间并不一致，字符串调用可能静默失败）。
+    qDebug() << "[Seek] fast-forward target(abs ms) =" << (ms + m_nStartMs);
+    m_videoWorker->setSeekTarget(ms + m_nStartMs);
 
     if (audioOutput) audioOutput->resume();
 
-    // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded / onAudioPtsUpdated 过滤掉
     m_genCounter++;
-    QMetaObject::invokeMethod(m_videoWorker, "updateGenId", Qt::DirectConnection, Q_ARG(int, m_genCounter));
-
-    // 清除 stop 标志，然后重新启动视频解码线程
-    QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
-    QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
-    QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);
-
-    timer->start(20);
+    restartDecode(m_genCounter);
 }
 
 // 计算保持宽高比的目标输出尺寸（letterbox，竖条/横条留白由 Label 对齐控制）
@@ -894,7 +1059,7 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
 
-    // 将传入的数据拷贝到 AVIOContext（内存播放，无需网络初始化）
+    // 将传入的数据拷贝为独立的内存数据源
     m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
     if (!m_avioBuffer)
     {
@@ -903,13 +1068,32 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
     memcpy(m_avioBuffer, szFileData, nFileLen);
-    m_avioCtx = avio_alloc_context(m_avioBuffer, nFileLen, 0, nullptr, nullptr, nullptr, nullptr);
-    if (!m_avioCtx)
+    m_memIO.data = m_avioBuffer;
+    m_memIO.size = nFileLen;
+    m_memIO.pos  = 0;
+
+    // AVIOContext 的内部读缓冲与数据源分离，并挂上 read / seek 回调。
+    // 有了 seek 回调，pb->seekable = AVIO_SEEKABLE_NORMAL 且 avio_size() 可用，
+    // av_seek_frame 与容器时长估算才能对所有格式正常工作。
+    const int avioBufSize = 64 * 1024;
+    m_avioInternalBuffer = (unsigned char *)av_malloc(avioBufSize);
+    if (!m_avioInternalBuffer)
     {
-        qWarning() << "[ShowVideo] AVIO context allocation failed.";
+        qWarning() << "[ShowVideo] AVIO read buffer allocation failed.";
         clearFFmpegResources();
         return -1;
     }
+    m_avioCtx = avio_alloc_context(m_avioInternalBuffer, avioBufSize, 0,
+                                   &m_memIO, &memIORead, nullptr, &memIOSeek);
+    if (!m_avioCtx)
+    {
+        qWarning() << "[ShowVideo] AVIO context allocation failed.";
+        // 创建失败时 AVIOContext 尚未接管 buffer，需要自行释放
+        av_freep(&m_avioInternalBuffer);
+        clearFFmpegResources();
+        return -1;
+    }
+    m_avioCtx->seekable = AVIO_SEEKABLE_NORMAL;
     pFormatCtx->pb = m_avioCtx;
     // 标记自定义 IO：avformat_close_input 将不负责释放 pb，
     // 由我们手动 avio_context_free 释放，避免双重释放导致崩溃。
@@ -952,12 +1136,17 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     {
         QAudioFormat fmt;
         fmt.setSampleRate(AUDIO_OUT_SAMPLE_RATE);
-        fmt.setSampleSize(16);
         fmt.setChannelCount(AUDIO_OUT_CHANNELS);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+        // Qt6：QAudioSink 取代 Qt5 的 QAudioOutput，采样格式改用 setSampleFormat
+        fmt.setSampleFormat(QAudioFormat::Int16);
+#else
+        fmt.setSampleSize(16);
         fmt.setCodec("audio/pcm");
         fmt.setByteOrder(QAudioFormat::LittleEndian);
         fmt.setSampleType(QAudioFormat::SignedInt);
-        audioOutput = new QAudioOutput(fmt);
+#endif
+        audioOutput = new AudioOutputDevice(fmt);
         audioOutput->setVolume(m_nVolume / 100.0f);
         streamOut = audioOutput->start();
     }
@@ -1117,17 +1306,31 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         rebuildSwsContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, outW, outH);
     }
 
-    // 总时长(毫秒)；纯音频时回退到音频流时长
+    // 总时长(毫秒)：容器 -> 流 -> 按比特率/文件大小估算 -> 兜底
     m_nDurationMs = 0;
     if (pFormatCtx->duration > 0)
         m_nDurationMs = pFormatCtx->duration / 1000;
     AVStream *durStream = (videoindex >= 0) ? vstream : astream;
     if (m_nDurationMs <= 0 && durStream && durStream->duration > 0)
         m_nDurationMs = (qint64)(durStream->duration * av_q2d(durStream->time_base) * 1000);
+    if (m_nDurationMs <= 0 && pFormatCtx->bit_rate > 0)
+    {
+        int64_t fileSize = avio_size(m_avioCtx);
+        if (fileSize > 0)
+            m_nDurationMs = (qint64)(fileSize * 8.0 * 1000.0 / pFormatCtx->bit_rate);
+    }
     if (m_nDurationMs <= 0) m_nDurationMs = 60000;
     qDebug() << "[ShowVideo] 总时长(ms) = " << m_nDurationMs;
 
+    // 部分容器（MPEG-TS / MP3）的 PTS 起点非 0：进度显示要减去该偏移，
+    // seek 目标要加上该偏移，才能与 UI 的相对时间轴对齐。
+    m_nStartMs = 0;
+    if (pFormatCtx->start_time != AV_NOPTS_VALUE && pFormatCtx->start_time > 0)
+        m_nStartMs = pFormatCtx->start_time / 1000;
+    qDebug() << "[ShowVideo] 起始偏移(ms) = " << m_nStartMs;
+
     m_nCurrentMs = 0;
+    m_nSeekTargetMs = 0;
 
     // 进度条范围
     ui->progressSlider->setRange(0, (int)m_nDurationMs);

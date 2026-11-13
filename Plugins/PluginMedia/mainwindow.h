@@ -5,7 +5,13 @@
 #include <QDebug>
 #include <QTimer>
 #include <QTime>
+#include <QtGlobal>
+#include <QAudioFormat>
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QAudioSink>
+#else
 #include <QAudioOutput>
+#endif
 #include <QThread>
 #include <QMutex>
 #include <QWaitCondition>
@@ -28,7 +34,24 @@ extern "C"
     #include <libswresample/swresample.h>
 }
 
-// 音频输出通道数、采样率与采样格式（固定 stereo / S16 / 44100，与 QAudioOutput 配置一致）
+// Qt6 用 QAudioSink 取代 Qt5 的 QAudioOutput（推模式 PCM 输出）
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+typedef QAudioSink   AudioOutputDevice;
+#else
+typedef QAudioOutput AudioOutputDevice;
+#endif
+
+// 自定义内存 IO 的游标数据：AVIOContext 的 read/seek 回调通过它访问完整文件数据。
+// 必须提供 seek 回调，否则 pb->seekable=0、avio_size() 失败，
+// FLV / MPEG-TS / AVI / MP3 等容器会无法跳转或拿不到正确时长。
+struct MemIOData
+{
+    unsigned char *data = nullptr;
+    qint64 size = 0;
+    qint64 pos  = 0;
+};
+
+// 音频输出通道数、采样率与采样格式（固定 stereo / S16 / 44100，与 QAudioFormat 配置一致）
 static const int           AUDIO_OUT_CHANNELS    = 2;
 static const int           AUDIO_OUT_SAMPLE_RATE = 44100;
 static const AVSampleFormat AUDIO_OUT_FORMAT     = AV_SAMPLE_FMT_S16;
@@ -80,6 +103,8 @@ public slots:
     void setPaused(bool paused);
     // 更新当前播放世代（用于 seek 时过滤排队的旧帧信号）
     void updateGenId(int genId);
+    // 设置 seek 快进目标（绝对 PTS，毫秒）：>0 时丢弃目标前的包
+    void setSeekTarget(qint64 absMs);
 
     bool isDecodingActive() const { return m_running.load(std::memory_order_relaxed) != 0; }
 
@@ -107,6 +132,8 @@ private:
 
     int m_genId = -1;
 
+    // seek 后的快进目标（绝对 PTS 毫秒）；解码循环按它丢弃目标前的包
+    std::atomic<qint64> m_seekTargetAbsMs{0};
     std::atomic<int> m_stopRequested{0};
     std::atomic<int> m_running{0};
     std::atomic<int> m_paused{0};      // 暂停标志：1 表示暂停帧调度
@@ -176,14 +203,16 @@ private:
     AVCodecContext  *pCodecCtx  = nullptr;
     AVFrame         *pFrame     = nullptr, *pFrameRGB = nullptr;
     AVFrame         *pAudioFrame = nullptr;
-    unsigned char   *m_avioBuffer = nullptr;
+    unsigned char   *m_avioBuffer = nullptr;          // 完整文件数据（内存 IO 的数据源）
+    unsigned char   *m_avioInternalBuffer = nullptr;  // AVIOContext 内部读缓冲，由 avio_context_free 释放
+    MemIOData        m_memIO;                        // read / seek 回调使用的游标
     AVIOContext     *m_avioCtx   = nullptr;
     int videoindex = -1;
 
     int             audioindex = -1;
     AVCodecContext  *aCodecCtx  = nullptr;
     QByteArray      byteBuf;
-    QAudioOutput    *audioOutput = nullptr;
+    AudioOutputDevice *audioOutput = nullptr;
     QIODevice       *streamOut = nullptr;
 
     // ===== 音频重采样 =====
@@ -206,6 +235,12 @@ private:
     qint64 m_nTargetMs = 0;
     qint64 m_nDurationMs = 0;
     qint64 m_nCurrentMs = 0;
+    // 部分容器（MPEG-TS、MP3 等）的 PTS 不从 0 开始：进度显示要减去起始偏移，
+    // seek 目标则要加上它，两者才能与 UI 的相对时间轴保持一致。
+    qint64 m_nStartMs = 0;
+    // >0 表示 seek 后正处于「回退到关键帧」阶段，进度条暂不接受更早的 PTS 覆盖，
+    // 避免 AVSEEK_FLAG_BACKWARD 把刚拖到的位置又拉回开头。
+    qint64 m_nSeekTargetMs = 0;
     int    m_nVolume = 80;
     int    m_genCounter = 0;  // 用于过滤过期 decodingFinished 信号
 

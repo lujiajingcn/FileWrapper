@@ -23,8 +23,8 @@
 // ============================================================
 static QString joinPath(const QString &base, const QString &rel)
 {
-    QStringList parts    = base.split('/', QString::SkipEmptyParts);
-    QStringList relParts = rel.split('/', QString::SkipEmptyParts);
+    QStringList parts    = base.split('/', Qt::SkipEmptyParts);
+    QStringList relParts = rel.split('/', Qt::SkipEmptyParts);
     for (const QString &r : relParts)
     {
         if (r == ".")  continue;

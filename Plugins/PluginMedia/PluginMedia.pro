@@ -14,7 +14,8 @@ TEMPLATE = lib
 # Emit warnings for deprecated Qt APIs
 DEFINES += QT_DEPRECATED_WARNINGS
 
-CONFIG += c++11
+# Qt6 需要 C++17（Qt5 也可用），播放器代码使用了 lambda / 泛型等 C++11+ 特性
+CONFIG += c++17
 
 SOURCES += \
         mainwindow.cpp \

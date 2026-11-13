@@ -48,7 +48,7 @@ static QStringList commonDirPrefix(const QVector<FILEINFO> &vtInfos)
     bool bFirst = true;
     for (const FILEINFO &fi : vtInfos)
     {
-        QStringList segs = normalizePath(fi.sFilePath).split('/', QString::SkipEmptyParts);
+        QStringList segs = normalizePath(fi.sFilePath).split('/', Qt::SkipEmptyParts);
         int nDirCount = qMax(0, segs.size() - 1);   // 排除文件名段
 
         if (bFirst)
@@ -935,7 +935,7 @@ void MainWindow::populateFilePathTree()
     QMap<QString, QStandardItem*> mapDirItems;   // 相对目录路径 -> 目录节点
     for (const FILEINFO &info : vtFileInfos)
     {
-        QStringList segs = normalizePath(info.sFilePath).split('/', QString::SkipEmptyParts);
+        QStringList segs = normalizePath(info.sFilePath).split('/', Qt::SkipEmptyParts);
         if (segs.size() < prefixSegs.size() + 1)
             continue;   // 防御：路径比公共前缀还短（理论上不会出现）
 

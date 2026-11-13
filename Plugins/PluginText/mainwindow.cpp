@@ -1,7 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
-#include <QTextCodec>
+// Qt6 已移除 QTextCodec；本地编码回退改用 QString::fromLocal8Bit
 #include <cstring>
 #include <algorithm>
 
@@ -96,10 +96,8 @@ QString MainWindow::decodeText(const QByteArray &data)
     if (isStrictUtf8(data))
         return QString::fromUtf8(data);
 
-    // 3) 回退到系统本地编码（中文 Windows 上为 GBK），并兜底 toLocal8Bit
-    QTextCodec *codec = QTextCodec::codecForLocale();
-    if (codec)
-        return codec->toUnicode(data);
+    // 3) 回退到系统本地编码（中文 Windows 上为 GBK）
+    // Qt6 中 codecForLocale()->toUnicode() 等价于 QString::fromLocal8Bit()
     return QString::fromLocal8Bit(data);
 }
 
