@@ -1162,6 +1162,14 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
             return -1;
         }
 
+        // 解码包的时间基必须与所属流一致。libavcodec 用 pkt_timebase 把
+        // skip_samples / discard_padding（MP3 LAME/Xing、AAC priming、Opus pre-skip
+        // 等 gapless 信息）换算成时间戳来修正 frame->pts / duration。
+        // 未设置时 pkt_timebase.num == 0，FFmpeg 只能打印
+        // "Could not update timestamps for skipped/discarded samples" 并放弃修正，
+        // 导致音频帧 PTS 偏早约一个 encoder delay（mp3 约 25ms）。
+        pCodecCtx->pkt_timebase = vstream->time_base;
+
         // 启用多线程解码（大文件/高分辨率下显著提升流畅度）
         // threads=0 让 FFmpeg 根据 CPU 核心数自动选择线程数
         // 同时允许帧级和分片级线程，由解码器自行选择其支持的模式
@@ -1193,6 +1201,9 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
             clearFFmpegResources();
             return -1;
         }
+
+        // 同视频解码器：不设置 pkt_timebase 会让 gapless 跳过样本无法修正 PTS
+        aCodecCtx->pkt_timebase = astream->time_base;
 
         const AVCodec *audioCodec = avcodec_find_decoder(aCodecCtx->codec_id);
         if (!audioCodec)
