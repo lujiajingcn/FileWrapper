@@ -1,8 +1,8 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QDebug>
-#include <QFile>
-#include <climits>
+#include <QImage>
+#include <QPixmap>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -34,17 +34,43 @@ void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
     if (szBuf == nullptr || nFileLen <= 0)
         return;
 
-    // 复制一份数据由本对象持有：PDFium 的 loadFromMem 只保存数据指针而不复制，
-    // 主程序会在 sendFileData 返回后释放原始缓冲区，
-    // 若不复制，翻页时访问已释放内存会导致 use-after-free 崩溃。
-    m_pdfData = QByteArray(szBuf, (int)nFileLen);
-    // loadFromMem 形参为 int；超过 int 范围的 PDF 已超出该库支持能力，做上限校验
-    if (m_pdfData.size() > INT_MAX)
-        m_pdfData = m_pdfData.left(INT_MAX);
-    m_pdfium.loadFromMem(m_pdfData.constData(), m_pdfData.size());
-    m_nPageCount = m_pdfium.pageCount();
+    // 主程序会在 sendFileData 返回后释放原始缓冲区，因此必须复制一份数据。
+    // QBuffer::setData() 会在内部保存副本；QPdfDocument::load(QIODevice*) 对
+    // 可随机访问的 QBuffer 是同步的（Qt 6.9 实测：load 返回即 status=Ready、
+    // pageCount 可用），无需等待 statusChanged 信号。
+    m_doc.close();
+    m_pdfBuf.close();
+    m_pdfBuf.setData(QByteArray(szBuf, static_cast<qsizetype>(nFileLen)));
+    if (!m_pdfBuf.open(QIODevice::ReadOnly))
+    {
+        qWarning() << "[PluginPdf] 无法打开内存 PDF 缓冲区.";
+        return;
+    }
+
+    m_doc.load(&m_pdfBuf);
+    if (m_doc.error() != QPdfDocument::Error::None)
+        qWarning() << "[PluginPdf] PDF 加载错误, code =" << int(m_doc.error());
+
+    m_nPageCount = m_doc.pageCount();
     if (m_nPageCount < 0) m_nPageCount = 0;
+    m_nCurPage = 0;
     gotoPage();
+}
+
+bool MainWindow::showPdfFile(const QString &sPath)
+{
+    m_doc.close();
+    m_pdfBuf.close();
+    m_pdfBuf.setData(QByteArray());   // 释放内存副本
+    if (m_doc.load(sPath) != QPdfDocument::Error::None)
+    {
+        qWarning() << "[PluginPdf] 按路径加载 PDF 失败:" << sPath << "code =" << int(m_doc.error());
+        return false;
+    }
+    m_nPageCount = qMax(0, m_doc.pageCount());
+    m_nCurPage = 0;
+    gotoPage();
+    return true;
 }
 
 void MainWindow::on_actionFirstPage_triggered()
@@ -105,29 +131,28 @@ void MainWindow::gotoPage()
     getLineEditPageNum();
     setLineEditPageNum();
     updatePage();
-
-//    用以下写法得到的QPixmap变量值为空。
-//    QPixmap pixMap;
-//    pixMap.fromImage(pdfImage);
-//    qDebug()<<pixMap.isNull();
 }
 
 void MainWindow::updatePage()
 {
-    if(!m_pdfium.isValid() || m_nPageCount <= 0 || m_nCurPage < 0 || m_nCurPage >= m_nPageCount)
+    if (m_nPageCount <= 0 || m_nCurPage < 0 || m_nCurPage >= m_nPageCount)
         return;
 
-    QPdfiumPage pfPage = m_pdfium.page(m_nCurPage);
-    int nPageWidth = pfPage.width();
-    int nPageHeight = pfPage.height();
-    QImage pdfImage = pfPage.image();
-    if(pdfImage.isNull())
+    // pagePointSize() 返回页面尺寸（单位 point，1/72 inch）。沿用原 QtPdfium
+    // 的 72dpi 基准：100% 缩放时 A4 约为 595x842 像素，保持视觉尺寸不变。
+    // 直接按目标分辨率调用 render()，比先渲染再缩放更清晰。
+    const QSizeF pt = m_doc.pagePointSize(m_nCurPage);
+    if (pt.isEmpty())
         return;
-    QPixmap pixMap = QPixmap::fromImage(pdfImage);
-    int nNewWidth = nPageWidth * m_nScale / 100;
-    int nNewHeight = nPageHeight * m_nScale / 100;
-    pixMap = pixMap.scaled(nNewWidth, nNewHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    m_lbContent->setPixmap(pixMap);
+
+    const qreal factor = qreal(m_nScale) / 100.0;
+    const QSize target(qMax(1, qRound(pt.width()  * factor)),
+                       qMax(1, qRound(pt.height() * factor)));
+    const QImage pdfImage = m_doc.render(m_nCurPage, target);
+    if (pdfImage.isNull())
+        return;
+
+    m_lbContent->setPixmap(QPixmap::fromImage(pdfImage));
 }
 
 void MainWindow::getLineEditPageNum()

@@ -1040,9 +1040,18 @@ void MainWindow::rebuildSwsContext(int srcW, int srcH, AVPixelFormat srcPixFmt, 
     videoH = outH;
 }
 
+// 大文件路径通道入口：设置一个待打开路径，再复用 showVideo 的通用流程（P1-2）
+int MainWindow::showVideoFile(const QString &sPath)
+{
+    m_sPendingPath = sPath;
+    return showVideo(nullptr, 0);
+}
+
 int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 {
-    if (szFileData == nullptr || nFileLen <= 0)
+    const QString byPath = m_sPendingPath;
+    m_sPendingPath.clear();
+    if (byPath.isEmpty() && (szFileData == nullptr || nFileLen <= 0))
         return -1;
 
     if (timer->isActive()) timer->stop();
@@ -1059,51 +1068,65 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         return -1;
     }
 
-    // 将传入的数据拷贝为独立的内存数据源
-    m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
-    if (!m_avioBuffer)
+    if (byPath.isEmpty())
     {
-        qWarning() << "[ShowVideo] AVIO buffer allocation failed.";
-        clearFFmpegResources();
-        return -1;
-    }
-    memcpy(m_avioBuffer, szFileData, nFileLen);
-    m_memIO.data = m_avioBuffer;
-    m_memIO.size = nFileLen;
-    m_memIO.pos  = 0;
+        // —— 内存播放：整个文件由主程序读入后交给插件 ——
+        // 将传入的数据拷贝为独立的内存数据源
+        m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
+        if (!m_avioBuffer)
+        {
+            qWarning() << "[ShowVideo] AVIO buffer allocation failed.";
+            clearFFmpegResources();
+            return -1;
+        }
+        memcpy(m_avioBuffer, szFileData, nFileLen);
+        m_memIO.data = m_avioBuffer;
+        m_memIO.size = nFileLen;
+        m_memIO.pos  = 0;
 
-    // AVIOContext 的内部读缓冲与数据源分离，并挂上 read / seek 回调。
-    // 有了 seek 回调，pb->seekable = AVIO_SEEKABLE_NORMAL 且 avio_size() 可用，
-    // av_seek_frame 与容器时长估算才能对所有格式正常工作。
-    const int avioBufSize = 64 * 1024;
-    m_avioInternalBuffer = (unsigned char *)av_malloc(avioBufSize);
-    if (!m_avioInternalBuffer)
-    {
-        qWarning() << "[ShowVideo] AVIO read buffer allocation failed.";
-        clearFFmpegResources();
-        return -1;
+        // AVIOContext 的内部读缓冲与数据源分离，并挂上 read / seek 回调。
+        // 有了 seek 回调，pb->seekable = AVIO_SEEKABLE_NORMAL 且 avio_size() 可用，
+        // av_seek_frame 与容器时长估算才能对所有格式正常工作。
+        const int avioBufSize = 64 * 1024;
+        m_avioInternalBuffer = (unsigned char *)av_malloc(avioBufSize);
+        if (!m_avioInternalBuffer)
+        {
+            qWarning() << "[ShowVideo] AVIO read buffer allocation failed.";
+            clearFFmpegResources();
+            return -1;
+        }
+        m_avioCtx = avio_alloc_context(m_avioInternalBuffer, avioBufSize, 0,
+                                       &m_memIO, &memIORead, nullptr, &memIOSeek);
+        if (!m_avioCtx)
+        {
+            qWarning() << "[ShowVideo] AVIO context allocation failed.";
+            // 创建失败时 AVIOContext 尚未接管 buffer，需要自行释放
+            av_freep(&m_avioInternalBuffer);
+            clearFFmpegResources();
+            return -1;
+        }
+        m_avioCtx->seekable = AVIO_SEEKABLE_NORMAL;
+        pFormatCtx->pb = m_avioCtx;
+        // 标记自定义 IO：avformat_close_input 将不负责释放 pb，
+        // 由我们手动 avio_context_free 释放，避免双重释放导致崩溃。
+        pFormatCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
+        if (avformat_open_input(&pFormatCtx, nullptr, nullptr, nullptr) != 0)
+        {
+            qWarning() << "[ShowVideo] 无法打开输入流.";
+            clearFFmpegResources();
+            return -1;
+        }
     }
-    m_avioCtx = avio_alloc_context(m_avioInternalBuffer, avioBufSize, 0,
-                                   &m_memIO, &memIORead, nullptr, &memIOSeek);
-    if (!m_avioCtx)
+    else
     {
-        qWarning() << "[ShowVideo] AVIO context allocation failed.";
-        // 创建失败时 AVIOContext 尚未接管 buffer，需要自行释放
-        av_freep(&m_avioInternalBuffer);
-        clearFFmpegResources();
-        return -1;
-    }
-    m_avioCtx->seekable = AVIO_SEEKABLE_NORMAL;
-    pFormatCtx->pb = m_avioCtx;
-    // 标记自定义 IO：avformat_close_input 将不负责释放 pb，
-    // 由我们手动 avio_context_free 释放，避免双重释放导致崩溃。
-    pFormatCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
-
-    if (avformat_open_input(&pFormatCtx, nullptr, nullptr, nullptr) != 0)
-    {
-        qWarning() << "[ShowVideo] 无法打开输入流.";
-        clearFFmpegResources();
-        return -1;
+        // —— 大文件路径通道：FFmpeg 直接按文件流式读取，无需把数 GB 内容读入内存 ——
+        const QByteArray pathUtf8 = byPath.toUtf8();
+        if (avformat_open_input(&pFormatCtx, pathUtf8.constData(), nullptr, nullptr) != 0)
+        {
+            qWarning() << "[ShowVideo] 无法打开输入文件:" << byPath;
+            clearFFmpegResources();
+            return -1;
+        }
     }
 
     if (avformat_find_stream_info(pFormatCtx, nullptr) < 0)

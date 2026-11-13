@@ -5,12 +5,15 @@
 #include <QLayout>
 #include <QDomDocument>
 #include <QRegularExpression>
+#include <limits>
 #include <QImage>
 #include <QUrl>
 #include <QLabel>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QRegularExpression>
 #include <cstdlib>   // ::free（libmobi 返回的标题需 free）
 
 #ifdef WITH_LIBMOBI
@@ -156,8 +159,14 @@ void MainWindow::showBook(char *szBuf, qint64 nFileLen)
         return;
     }
 
-    // 复制数据由本对象持有：主程序在 sendFileData 返回后会释放原始缓冲区
-    m_bookData = QByteArray(szBuf, (int)nFileLen);
+    // 复制数据由本对象持有：主程序在 sendFileData 返回后会释放原始缓冲区。
+    // 使用 qsizetype（Qt6 为 64 位）而非 int，避免 >2 GiB 长度被截断或变负（P3-1）。
+    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    {
+        showMessage("文件过大，无法载入内存。");
+        return;
+    }
+    m_bookData = QByteArray(szBuf, static_cast<qsizetype>(nFileLen));
 
     QString fmt = detectFormat(m_bookData);
     bool ok = false;
@@ -287,7 +296,7 @@ bool MainWindow::loadEpub(const QByteArray &data)
 
     // 书名
     m_bookTitle = textOfTag(opfStr, "title");
-    if (m_bookTitle.isEmpty()) m_bookTitle = "未命名电子书";
+    if (m_bookTitle.isEmpty()) m_bookTitle = fallbackTitle();
 
     // manifest：id -> href
     QMap<QString, QString> id2href;
@@ -362,7 +371,8 @@ bool MainWindow::loadFb2(const QByteArray &data)
 
     // 书名
     QDomNodeList tl = root.elementsByTagName("book-title");
-    m_bookTitle = (tl.size() > 0) ? tl.at(0).toElement().text() : QString("未命名电子书");
+    m_bookTitle = (tl.size() > 0) ? tl.at(0).toElement().text() : QString();
+    if (m_bookTitle.trimmed().isEmpty()) m_bookTitle = fallbackTitle();
 
     // 内嵌二进制图片（base64）
     QDomNodeList bins = root.elementsByTagName("binary");
@@ -423,7 +433,7 @@ bool MainWindow::loadMobi(const QByteArray &data)
             m_bookTitle = QString::fromUtf8(fn);
     }
     if (title) ::free(title);
-    if (m_bookTitle.isEmpty()) m_bookTitle = "未命名电子书";
+    if (m_bookTitle.isEmpty()) m_bookTitle = fallbackTitle();
 
     MOBIRawml *rawml = mobi_init_rawml(m);
     if (!rawml) { mobi_free(m); return false; }
@@ -576,11 +586,31 @@ QString MainWindow::findTagAttr(const QString &xml, const QString &tag, const QS
 
 QString MainWindow::textOfTag(const QString &xml, const QString &tag) const
 {
-    QString pat = "(?:<|:)" + QRegularExpression::escape(tag) + "(?=[>\\s/])[^>]*>(.*?)(?:<|:)/"
-                  + QRegularExpression::escape(tag) + "(?=[>\\s/])";
+    const QString t = QRegularExpression::escape(tag);
+    // 支持带命名空间前缀的标签：<dc:title>…</dc:title>（EPUB OPF 的常见写法）
+    const QString ns = QStringLiteral("(?:[A-Za-z_][\\w.-]*:)?");
+    QString pat = QStringLiteral("<") + ns + t
+                + QStringLiteral("(?=[>\\s/])[^>]*>(.*?)</") + ns + t
+                + QStringLiteral("(?=[>\\s/])");
     QRegularExpression re(pat, QRegularExpression::CaseInsensitiveOption
                                | QRegularExpression::DotMatchesEverythingOption);
     QRegularExpressionMatch m = re.match(xml);
     if (m.hasMatch()) return m.captured(1).trimmed();
+
+    // 兼容旧式 / 非标准写法（:tag … :/tag）
+    QString oldPat = QStringLiteral("(?:<|:)") + t
+                   + QStringLiteral("(?=[>\\s/])[^>]*>(.*?)(?:<|:)/") + t
+                   + QStringLiteral("(?=[>\\s/])");
+    QRegularExpression oldRe(oldPat, QRegularExpression::CaseInsensitiveOption
+                                     | QRegularExpression::DotMatchesEverythingOption);
+    m = oldRe.match(xml);
+    if (m.hasMatch()) return m.captured(1).trimmed();
     return QString();
+}
+
+QString MainWindow::fallbackTitle() const
+{
+    if (!m_sourceName.isEmpty())
+        return QFileInfo(m_sourceName).completeBaseName();
+    return QStringLiteral("未命名电子书");
 }

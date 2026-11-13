@@ -2,6 +2,8 @@
 #include "ui_dlgmergefile.h"
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QFileInfo>
+#include <QDirIterator>
 
 DlgMergeFile::DlgMergeFile(QWidget *parent) :
     QDialog(parent),
@@ -99,10 +101,50 @@ void DlgMergeFile::on_btnOk_clicked()
         return;
     }
 
-    if(ui->leMergedFilePath->text().isEmpty())
+    const QString sOutput = ui->leMergedFilePath->text();
+    if(sOutput.isEmpty())
     {
         QMessageBox::information(this, "提示", "合并后的文件路径为空");
         return;
+    }
+
+    // P0-1：输出文件不能是任一输入文件（目录输入需展开后逐一比较）。
+    // 底层 FileManager 也会再校验一次，这里提前拦截可给出更明确的提示。
+    const QString outKey = QFileInfo(sOutput).absoluteFilePath().toLower();
+    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+    {
+        const QString sItem = m_hModelFilePath->item(i, 0)->text();
+        const QFileInfo info(sItem);
+        if (info.isDir())
+        {
+            QDirIterator it(sItem, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext())
+            {
+                const QString sub = it.next();
+                if (QFileInfo(sub).absoluteFilePath().toLower() == outKey)
+                {
+                    QMessageBox::warning(this, "提示",
+                        "输出文件不能是待合并文件之一：\n" + sub +
+                        "\n\n合并会先清空输出文件再读取输入，导致源数据丢失。请选择其它输出路径。");
+                    return;
+                }
+            }
+        }
+        else if (info.absoluteFilePath().toLower() == outKey)
+        {
+            QMessageBox::warning(this, "提示",
+                "输出文件不能是待合并文件之一：\n" + sItem +
+                "\n\n合并会先清空输出文件再读取输入，导致源数据丢失。请选择其它输出路径。");
+            return;
+        }
+    }
+
+    if (QFileInfo::exists(sOutput))
+    {
+        if (QMessageBox::question(this, "提示",
+                "输出文件已存在，合并后会替换它：\n" + sOutput + "\n\n是否继续？",
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+            return;
     }
     accept();
 }

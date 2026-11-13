@@ -1,28 +1,20 @@
 #-------------------------------------------------
-#
 # Project created by QtCreator 2023-07-09T09:39:23
-#
 #-------------------------------------------------
 
-QT       += core gui
-
-greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
+# Qt6 迁移：PDF 渲染改用 Qt 自带的 QtPdf 模块（QPdfDocument）。
+# 原实现链接 Qt5 编译的 libQt5Pdfium.a / Qt5Pdfium.dll，后者导入 Qt5Core.dll
+# 与 Qt5Gui.dll；本机升级到 Qt6 后这两个 DLL 不存在，QPluginLoader 加载
+# PluginPdf.dll 时解析依赖链失败，报「找不到指定的模块」(ERROR_MOD_NOT_FOUND 126)。
+QT       += core gui widgets pdf
 
 TARGET = PluginPdf
 TEMPLATE = lib
 
-# The following define makes your compiler emit warnings if you use
-# any feature of Qt which has been marked as deprecated (the exact warnings
-# depend on your compiler). Please consult the documentation of the
-# deprecated API in order to know how to port your code away from it.
 DEFINES += QT_DEPRECATED_WARNINGS
 
-# You can also make your code fail to compile if you use deprecated APIs.
-# In order to do so, uncomment the following line.
-# You can also select to disable deprecated APIs only up to a certain version of Qt.
-#DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
-
-CONFIG += c++11
+# Qt6 头文件要求 C++17
+CONFIG += c++17
 
 SOURCES += \
         main.cpp \
@@ -30,16 +22,8 @@ SOURCES += \
         pluginpdf.cpp
 
 HEADERS += \
-        include/QtPdfium/qpdfium.h \
-        include/QtPdfium/qpdfiumglobal.h \
-        include/QtPdfium/qpdfiumpage.h \
-        include/QtPdfium/qtpdfiumversion.h \
         mainwindow.h \
         pluginpdf.h
-
-INCLUDEPATH += include/QtPdfium
-
-LIBS += -L$$PWD/lib/ -lQt5Pdfium
 
 FORMS += \
         mainwindow.ui
@@ -48,22 +32,22 @@ FORMS += \
 debug:   DESTDIR = $$OUT_PWD/../../FileWrapper/debug/plugins
 release: DESTDIR = $$OUT_PWD/../../FileWrapper/release/plugins  # 输出目录
 
-# 部署 PDFium 运行库 Qt5Pdfium.dll 到 exe 同级目录，使 PluginPdf 能被 QPluginLoader 正确加载
-# （PluginPdf.dll 链接 libQt5Pdfium，运行时需要 Qt5Pdfium.dll，缺失时 QPluginLoader 加载失败 -> 取插件接口为 null -> 报"获取插件接口失败"）
+# 部署 Qt6Pdf.dll 及其运行依赖 Qt6Network.dll 到 exe 同级目录。
+# Qt6Pdf 的 qmake 模块声明 QT.pdf.run_depends = network：Qt6Pdf.dll 运行时会加载
+# Qt6Network.dll；Qt Creator 运行时 PATH 里有 Qt bin 所以能找到，
+# 脱离 IDE 直接运行 exe 时必须把这两个 DLL 放在 exe 目录。
 win32 {
-    PDFIUM_SRC = $$PWD/lib/Qt5Pdfium.dll
-    CONFIG(debug, debug|release): PDFIUM_DST = $$OUT_PWD/../../FileWrapper/debug
-    else: PDFIUM_DST = $$OUT_PWD/../../FileWrapper/release
+    CONFIG(debug, debug|release): PDF_DST = $$OUT_PWD/../../FileWrapper/debug
+    else: PDF_DST = $$OUT_PWD/../../FileWrapper/release
 
     # 路径必须经 $$shell_path() 归一化成 Windows 反斜杠形式：
-    # cmd.exe 的内置 copy 不认正斜杠路径，"copy /y "E:/a.dll" "E:/dst"" 会报
-    # 「系统找不到指定的文件。已复制 0 个文件。」且不返回错误码，
-    # 于是 Qt Creator 构建出来的 exe 目录里永远没有 Qt5Pdfium.dll，
-    # PluginPdf.dll 加载时报"找不到指定的模块"。
-    PDFIUM_SRC = $$shell_path($$PDFIUM_SRC)
-    PDFIUM_DST = $$shell_path($$PDFIUM_DST)
+    # cmd.exe 的内置 copy 不认正斜杠路径，且不返回错误码，会导致 DLL 静默没复制到。
+    PDF_DST    = $$shell_path($$PDF_DST)
+    QT_PDF_DLL = $$shell_path($$[QT_INSTALL_BINS]/Qt6Pdf.dll)
+    QT_NET_DLL = $$shell_path($$[QT_INSTALL_BINS]/Qt6Network.dll)
 
-    QMAKE_POST_LINK = $$QMAKE_COPY \"$$PDFIUM_SRC\" \"$$PDFIUM_DST\" || echo skip
+    QMAKE_POST_LINK = $$QMAKE_COPY \"$$QT_PDF_DLL\" \"$$PDF_DST\" || echo skip$$escape_expand(\\n\\t) \
+        $$QMAKE_COPY \"$$QT_NET_DLL\" \"$$PDF_DST\" || echo skip
 }
 
 # Default rules for deployment.

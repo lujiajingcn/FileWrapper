@@ -44,6 +44,8 @@ public:
     ~MainWindow();
 
     void showBook(char *szBuf, qint64 nFileLen);
+    // 主程序在送数据前告知文件名，用作书名缺失时的回退（P2-7）
+    void setSourceName(const QString &sName) { m_sourceName = sName; }
 
 private slots:
     void on_actionPrevChapter_triggered();
@@ -66,6 +68,7 @@ private:
     QList<QMap<QString, QString>> findTags(const QString &xml, const QString &tag) const;
     QString findTagAttr(const QString &xml, const QString &tag, const QString &name) const;
     QString textOfTag(const QString &xml, const QString &tag) const;
+    QString fallbackTitle() const;
 
     Ui::MainWindow *ui;
     BookBrowser     *m_browser    = nullptr;
@@ -80,6 +83,7 @@ private:
     int                          m_curChapter = 0;
     int                          m_zoomSteps  = 0;    // 累计缩放步数，切章后重新应用
     QString                      m_bookTitle;
+    QString                      m_sourceName;
 };
 
 #endif // MAINWINDOW_H

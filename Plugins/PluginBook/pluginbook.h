@@ -16,6 +16,7 @@ public:
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
     PluginInterface* createInstance();
+    void setSourceName(const QString &name) override;
 
 private:
     MainWindow* m_wMainWindow;

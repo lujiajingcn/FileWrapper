@@ -1,4 +1,5 @@
 #include "pluginmedia.h"
+#include <QFileInfo>
 
 PluginMedia::PluginMedia(QObject *parent) : QObject(parent)
 {
@@ -41,4 +42,18 @@ PluginInterface* PluginMedia::createInstance()
 {
     // 为新标签页创建一个独立实例（含独立的内部窗口），使同类型多标签页各自独立、互不干扰
     return new PluginMedia;
+}
+
+bool PluginMedia::prefersFileByPath() const
+{
+    return true;
+}
+
+bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName)
+{
+    Q_UNUSED(displayName);
+    if (path.isEmpty() || !QFileInfo::exists(path) || m_wMainWindow == nullptr)
+        return false;
+    // 临时文件在整个会话期间有效，FFmpeg 的后台解码线程可以持续按路径读取
+    return m_wMainWindow->showVideoFile(path) >= 0;
 }

@@ -16,6 +16,8 @@ public:
     void sendFileData(char *szFileData, qint64 nFileLen);
     QWidget* getPluginWidget();
     PluginInterface* createInstance();
+    bool prefersFileByPath() const override;
+    bool sendFileByPath(const QString &path, const QString &displayName) override;
 
 private:
     MainWindow*         m_wMainWindow;

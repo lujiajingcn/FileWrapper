@@ -6,16 +6,19 @@
 #include <QFileDialog>
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
+#include "dlgpluginmap.h"
+#include "builtinviewer.h"
 #include "pluginmanager.h"
 #include <QDebug>
 #include "dlgabout.h"
 #include <QVariant>
 #include "dlgoutputfile.h"
 #include <QMessageBox>
+#include <QPushButton>
+#include <QAbstractButton>
 #include <QProgressDialog>
 #include <QMenu>
 #include <QToolButton>
-#include <QLabel>
 #include <QVBoxLayout>
 #include <QSet>
 #include <QList>
@@ -23,6 +26,14 @@
 #include <QStyle>
 #include <QIcon>
 #include <QSignalBlocker>
+#include <QDir>
+#include <QFileInfo>
+#include <QStatusBar>
+#include <QDateTime>
+#include <QSettings>
+
+// 超过该阈值的文件优先走「临时文件 + 路径」通道，避免整块载入内存（P1-2）
+static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
 
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
@@ -126,6 +137,29 @@ MainWindow::MainWindow(QWidget *parent) :
 
     connect(this, &MainWindow::QMergeFiles, m_fileManager, &FileManager::QMergeFiles);
     connect(this, &MainWindow::QSplitFiles, m_fileManager, &FileManager::QSplitFiles);
+    connect(m_fileManager, &FileManager::warningOccurred,
+            this, &MainWindow::onFileManagerWarning);
+
+    // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
+    QAction *actVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
+    actVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
+    connect(actVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
+    ui->menu->addAction(actVerify);
+
+    // 清理上一次会话遗留的临时抽取文件。只删 24 小时以前的陈旧文件，
+    // 避免误删同一台机器上另一个正在运行的实例刚抽取出来的大文件。
+    QDir tmpDir(QDir::tempPath() + QStringLiteral("/FileWrapper"));
+    if (tmpDir.exists())
+    {
+        const QDateTime cutoff = QDateTime::currentDateTime().addDays(-1);
+        const QStringList old = tmpDir.entryList(QStringList() << QStringLiteral("fw_*"), QDir::Files);
+        for (const QString &n : old)
+        {
+            const QFileInfo fi(tmpDir.absoluteFilePath(n));
+            if (!fi.lastModified().isValid() || fi.lastModified() < cutoff)
+                tmpDir.remove(n);
+        }
+    }
 }
 
 MainWindow::~MainWindow()
@@ -133,14 +167,40 @@ MainWindow::~MainWindow()
     // 析构期间不再触发 activateTab，避免销毁标签页时重入渲染逻辑
     disconnect(ui->tabWidget, nullptr, this, nullptr);
 
-    // 先销毁各标签页（释放其独占的插件实例，会连带销毁内部窗口），再 delete ui，
-    // 避免 tabWidget 析构时把这些窗口当作普通页面重复删除。
+    // 先停止后台播放，再销毁标签页，最后清理临时文件
+    if (m_pCurrentInterface != nullptr)
+    {
+        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface = nullptr;
+    }
     for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
         destroyTabAt(i);
+    cleanupTempFiles();
 
     delete m_fileManager;
     delete m_hModelFilePath;
     delete ui;
+}
+
+void MainWindow::cleanupTempFiles()
+{
+    discardTempCache();
+}
+
+// 切换归档时丢弃本会话抽取出的临时文件：此时后台播放已停止、插件实例已销毁，
+// 文件不再被占用。避免旧归档的临时副本一直占着磁盘。
+void MainWindow::discardTempCache()
+{
+    for (const QString &p : m_setTempFiles)
+        QFile::remove(p);
+    m_setTempFiles.clear();
+    m_mapTempCache.clear();
+    m_listTempOrder.clear();
+}
+
+void MainWindow::onFileManagerWarning(const QString &sMsg)
+{
+    statusBar()->showMessage(sMsg, 10000);
 }
 
 // 初始化【文件列表】窗口
@@ -192,8 +252,8 @@ void MainWindow::initWidgetFilePath()
     vbLytFilePath->addWidget(m_tvFilePath);
     ui->dockWidgetContents->setLayout(vbLytFilePath);
 
-    // 默认树形模式，故平铺模式专属的两个按钮置灰
-    updateViewActionState();
+    // 默认树形模式，故平铺模式专属的两个按钮置灰；同时统一刷新保存按钮等状态
+    syncActionStates();
 
     // 文件列表右键菜单（含“打开新标签页”）
     m_tvFilePath->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -263,6 +323,9 @@ void MainWindow::closeAllTabs()
     for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
         destroyTabAt(i);
 
+    // 旧归档的临时副本已无人使用，立即回收磁盘（避免反复加载大归档堆积 GB 级副本）
+    discardTempCache();
+
     m_pCurrentInterface = nullptr;
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, &MainWindow::onTabCurrentChanged);
@@ -282,12 +345,42 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
     pInterface = nullptr;
     bOwned = false;
 
-    QString sExt = QFileInfo(info.sFilePath).suffix();
+    const QString sExt = QFileInfo(info.sFilePath).suffix();
     sPluginPath = choosePlugin(sExt);
     if (sPluginPath.isEmpty())
     {
-        QMessageBox::information(this, "", "没有插件来处理该类型文件，请手动映射插件");
-        return false;
+        // P2-2：不再把用户指向一个「功能开发中」的空菜单，而是给出可用的兜底入口
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("未找到插件"));
+        box.setIcon(QMessageBox::Information);
+        box.setText(QStringLiteral("没有插件来处理 .%1 类型的文件：%2\n\n"
+                                   "可以临时用内置查看器打开，或在「插件映射」里为该后缀指定默认插件。")
+                    .arg(sExt.isEmpty() ? QStringLiteral("(无后缀)") : sExt, info.sFileName));
+        QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::AcceptRole);
+        QPushButton *bHex    = box.addButton(QStringLiteral("以十六进制查看"), QMessageBox::AcceptRole);
+        QPushButton *bMap    = box.addButton(QStringLiteral("设置插件映射"), QMessageBox::ActionRole);
+        QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(bCancel);
+        box.exec();
+        QAbstractButton *clicked = box.clickedButton();
+        if (clicked == bMap)
+        {
+            DlgPluginMap dlg(this);
+            dlg.exec();
+            return false;
+        }
+        if (clicked == bText)       sPluginPath = QStringLiteral("builtin://text");
+        else if (clicked == bHex)   sPluginPath = QStringLiteral("builtin://hex");
+        else return false;
+    }
+
+    if (sPluginPath.startsWith(QStringLiteral("builtin://")))
+    {
+        const BuiltinViewer::Mode mode = sPluginPath.endsWith(QStringLiteral("hex"))
+                                       ? BuiltinViewer::HexMode : BuiltinViewer::TextMode;
+        pInterface = new BuiltinViewer(mode);
+        bOwned = true;
+        return true;
     }
 
     PluginInterface *pTemplate = PluginManager::getInstance()->getInterface(sPluginPath);
@@ -447,15 +540,94 @@ void MainWindow::stopCurrentPlaybackAndInvalidate()
     }
 }
 
+// 大文件抽取到临时文件（流式，内存占用固定 1 MB）
+bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QString &sErr)
+{
+    // 同一条目重复打开时复用已抽取的副本，避免为 10 GB 条目反复复制几十 GB
+    const QString key = QStringLiteral("%1|%2|%3")
+            .arg(info.sFilePath).arg(info.nFileLen).arg(info.nContentPositon);
+    auto cached = m_mapTempCache.constFind(key);
+    if (cached != m_mapTempCache.constEnd()
+        && QFileInfo::exists(cached.value())
+        && QFileInfo(cached.value()).size() == info.nFileLen)
+    {
+        sOutPath = cached.value();
+        return true;
+    }
+
+    QDir dir(QDir::tempPath() + QStringLiteral("/FileWrapper"));
+    if (!dir.exists() && !dir.mkpath(dir.absolutePath()))
+    {
+        sErr = QStringLiteral("无法创建临时目录: %1").arg(dir.absolutePath());
+        return false;
+    }
+
+    // 上限淘汰：最多保留 8 个临时副本。删除失败说明仍被插件占用，
+    // 保留在 m_setTempFiles 里等析构时再清，但不再计入缓存与顺序表。
+    static const int kMaxTempFiles = 8;
+    while (m_listTempOrder.size() >= kMaxTempFiles)
+    {
+        const QString oldest = m_listTempOrder.takeFirst();
+        if (QFile::remove(oldest) || !QFileInfo::exists(oldest))
+        {
+            m_setTempFiles.remove(oldest);
+            for (auto it = m_mapTempCache.begin(); it != m_mapTempCache.end(); )
+            {
+                if (it.value() == oldest) it = m_mapTempCache.erase(it);
+                else ++it;
+            }
+        }
+    }
+
+    const QString name = QStringLiteral("fw_%1_%2_%3")
+            .arg(QDateTime::currentMSecsSinceEpoch())
+            .arg(++m_uTempSerial)
+            .arg(info.sFileName);
+    // 文件名里可能含路径分隔符（伪造的归档路径），只保留 basename
+    const QString safe = QFileInfo(name).fileName();
+    sOutPath = dir.absoluteFilePath(safe);
+
+    if (!m_fileManager->extractEntryToTempFile(info.sFilePath, sOutPath, sErr))
+        return false;
+    m_setTempFiles.insert(sOutPath);
+    m_mapTempCache.insert(key, sOutPath);
+    m_listTempOrder.append(sOutPath);
+    return true;
+}
+
 // 读取文件内容并送入插件渲染
 void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
 {
+    if (iface == nullptr) return;
+    iface->setSourceName(info.sFileName);
+
+    // —— P1-2：大文件优先走「临时文件 + 路径」通道，插件可自行流式打开 ——
+    if (info.nFileLen >= kLargeFileThreshold && iface->prefersFileByPath())
+    {
+        QString sTemp, sErr;
+        if (extractToTempFile(info, sTemp, sErr))
+        {
+            if (iface->sendFileByPath(sTemp, info.sFileName))
+                return;
+            // 插件拒绝该文件路径，回退到内存通道
+        }
+        else
+        {
+            onFileManagerWarning(QStringLiteral("大文件准备失败，将尝试内存方式：%1").arg(sErr));
+        }
+    }
+
     char *szBuf = nullptr;
     qint64 nFileLen = 0;
     m_fileManager->QGetFileContent(info.sFilePath, &szBuf, nFileLen);
     if (szBuf == nullptr)
     {
-        qDebug() << "获取文件内容失败:" << info.sFilePath;
+        // 区分「0 字节空文件」与「读取失败」，并给出可读提示（P3-2 / P1-2）
+        QString sErr = m_fileManager->lastError();
+        if (sErr.isEmpty())
+            sErr = QStringLiteral("文件为空（0 字节），没有可显示的内容");
+        onFileManagerWarning(QStringLiteral("打开 %1 失败：%2").arg(info.sFileName, sErr));
+        iface->sendFileData(nullptr, 0);
         return;
     }
     // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放
@@ -616,8 +788,10 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
         QApplication::restoreOverrideCursor();
         if (!bOk)
         {
+            const QString sReason = m_fileManager->lastError();
             QMessageBox::critical(this, tr("保存失败"),
-                                  tr("保存失败，归档文件可能已损坏或磁盘写入失败。操作已取消。"));
+                tr("保存失败，操作已取消。改动仍保留在内存中，可以重试。\n\n原因：%1")
+                   .arg(sReason.isEmpty() ? tr("未知错误") : sReason));
             return false;
         }
     }
@@ -634,18 +808,27 @@ void MainWindow::on_actionLoadFile_triggered()
     if(sFileName.isEmpty())
         return;
 
-    m_fileManager->QLoadMergedFile(sFileName);
-
-    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
-    if(vtFileInfos.isEmpty())
+    // —— P1-6：先做完整解析校验，失败时完全不触碰当前归档 / 视图 / 脏状态 ——
+    QString sErr;
+    if (!m_fileManager->validateMergedFile(sFileName, &sErr))
     {
-        m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
-        m_tvFilePath->header()->setVisible(false);
-        updateViewActionState();
-        QMessageBox::critical(this, "加载失败", "不是有效的归档文件或文件已损坏。\n"
-                                "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
+        QMessageBox::critical(this, QStringLiteral("加载失败"),
+            QStringLiteral("不是有效的归档文件或文件已损坏。\n%1\n\n原有归档与未保存的改动保持不变。").arg(sErr));
         return;
     }
+
+    m_fileManager->QLoadMergedFile(sFileName);
+    if (!m_fileManager->isArchiveLoaded() || m_fileManager->getFileInfos().isEmpty())
+    {
+        QMessageBox::critical(this, QStringLiteral("加载失败"),
+            QStringLiteral("归档解析失败，原有归档保持不变。\n%1")
+               .arg(m_fileManager->lastError()));
+        syncActionStates();
+        return;
+    }
+
+    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
+    Q_UNUSED(vtFileInfos);
 
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, sFileName);
     m_tvFilePath->header()->setVisible(true);
@@ -654,7 +837,7 @@ void MainWindow::on_actionLoadFile_triggered()
     closeAllTabs();
 
     populateFilePathView(false);
-    m_acSaveFile->setEnabled(false);
+    syncActionStates();
 }
 
 void MainWindow::on_actionMergeFile_triggered()
@@ -687,47 +870,33 @@ void MainWindow::on_actionMergeFile_triggered()
         }
 
         // —— 进度条：合并可能耗时，显示进度并支持取消 ——
-        QProgressDialog dlgProgress(tr("正在合并文件..."), tr("取消"), 0, 100, this);
-        dlgProgress.setWindowTitle(tr("合并文件"));
+        QProgressDialog dlgProgress(QStringLiteral("正在合并文件..."), QStringLiteral("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(QStringLiteral("合并文件"));
         dlgProgress.setWindowModality(Qt::WindowModal);
-        dlgProgress.setMinimumDuration(0);  // 立即显示，不等待 4 秒默认延迟
+        dlgProgress.setMinimumDuration(0);
         dlgProgress.setAutoClose(false);
         dlgProgress.setAutoReset(false);
         dlgProgress.setValue(0);
 
-        // 清理上一轮可能残留的进度连接：lambda 捕获的是上一轮已销毁的局部对话框，
-        // 若不清理，下一轮再次 emit 进度时会访问悬空引用导致崩溃。
-        disconnect(m_fileManager, nullptr, this, nullptr);
-
         bool bOk = false;
         QString sResultMsg;
-        connect(m_fileManager, &FileManager::progressChanged, this,
-                [&dlgProgress](qint64 cur, qint64 total, const QString &status) {
-            if (total > 0)
-                dlgProgress.setValue(int(100 * cur / total));
-            dlgProgress.setLabelText(status);
-        });
-        connect(m_fileManager, &FileManager::operationFinished, this,
-                [&](bool ok, const QString &msg) {
-            dlgProgress.setValue(100);
-            dlgProgress.close();
-            bOk = ok;
-            sResultMsg = msg;
-        });
-        connect(&dlgProgress, &QProgressDialog::canceled,
-                m_fileManager, &FileManager::cancelOperation);
+        beginProgressOperation(&dlgProgress, &bOk, &sResultMsg);   // 只替换这三条连接，不影响常驻连接
 
         dlgProgress.show();
-        QApplication::processEvents();  // 让进度对话框先绘制出来
+        QApplication::processEvents();
+        setOperationsEnabled(false);   // 防止 processEvents 期间重入（P3-2）
 
         emit QMergeFiles(vtFilesPaths, sMergedFilePath);
 
         dlgProgress.close();
+        endProgressOperation();
+        setOperationsEnabled(true);
+        syncActionStates();
 
         if (bOk)
-            QMessageBox::information(this, tr("合并文件"), sResultMsg);
+            QMessageBox::information(this, QStringLiteral("合并文件"), sResultMsg);
         else
-            QMessageBox::critical(this, tr("合并文件"), sResultMsg);
+            QMessageBox::critical(this, QStringLiteral("合并文件"), sResultMsg);
     }
 }
 
@@ -793,6 +962,18 @@ bool MainWindow::CheckFileExt(QString sFileName, QStringList& arrFileExts)
 
 QString MainWindow::choosePlugin(QString sFileExt)
 {
+    // 用户自定义「后缀 → 插件」映射优先（P2-2）
+    const QString mapped = DlgPluginMap::mappingFor(sFileExt);
+    auto toPath = [](const QString &name) {
+        return QString("%1/plugins/%2.dll").arg(qApp->applicationDirPath()).arg(name);
+    };
+    if (!mapped.isEmpty())
+    {
+        if (mapped.startsWith(QStringLiteral("builtin://"))) return mapped;
+        if (mapped.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0) return QString();
+        return toPath(mapped);
+    }
+
     QString sPluginName;
     // PluginText 处理的纯文本格式（大小写不敏感），如需新增格式在此添加
     static const QStringList arrTextExts = {
@@ -845,31 +1026,77 @@ QString MainWindow::choosePlugin(QString sFileExt)
     {
         return "";
     }
-    QString sPluginPath = QString("%1/plugins/%2.dll").arg(qApp->applicationDirPath()).arg(sPluginName);
-    return sPluginPath;
+    return toPath(sPluginName);
 }
 
 void MainWindow::on_actionSplitFile_triggered()
 {
-    DlgSplitFile dlgSplitFile;
+    DlgSplitFile dlgSplitFile(this);
     if(dlgSplitFile.exec() == QDialog::Accepted)
     {
-        QString sMergedFilePath = dlgSplitFile.getMergedFilePath();
+        const QString sMergedFilePath = dlgSplitFile.getMergedFilePath();
 
-        if(!m_fileManager->validateMergedFile(sMergedFilePath))
+        // —— P2-3：完整解析 + 逐条合法性校验，与加载使用同一套规则 ——
+        FwArc::Meta meta;
+        QString sErr;
+        if (!FileManager::inspectArchive(sMergedFilePath, meta, sErr))
         {
-            QMessageBox::critical(this, "分割失败", "不是有效的归档文件或文件已损坏。\n"
-                                    "（缺少 FWDA 标识、版本不兼容或头部校验失败）");
+            QMessageBox::critical(this, QStringLiteral("分割失败"),
+                QStringLiteral("不是有效的归档文件或文件已损坏。\n%1").arg(sErr));
             return;
         }
-        bool bIsSaveAsOldPath = dlgSplitFile.getIsSaveAsOldPath();
-        QString sSplitFileDir = "";
-        if(!bIsSaveAsOldPath)
-        {
+        const bool bIsSaveAsOldPath = dlgSplitFile.getIsSaveAsOldPath();
+        QString sSplitFileDir;
+        if (!bIsSaveAsOldPath)
             sSplitFileDir = dlgSplitFile.getSplitFileDir();
+
+        // —— P0-2：按原路径写入是危险操作，必须二次确认 ——
+        if (bIsSaveAsOldPath)
+        {
+            int nAbs = 0;
+            qint64 nTotal = 0;
+            for (const FwArc::Entry &e : meta.entries)
+            {
+                if (FwArc::isAbsolutePath(e.displayPath)) ++nAbs;
+                nTotal += qint64(e.size);
+            }
+            const QString sWarn = QStringLiteral(
+                "将按归档内记录的原始路径把 %1 个文件（共 %2）写回磁盘。\n"
+                "其中 %3 个是绝对路径；换机器、换盘符或目录被复用时，可能写到完全无关的位置。\n\n"
+                "已存在的目标文件不会被覆盖，程序会自动重命名。是否继续？")
+                .arg(meta.entries.size()).arg(FwArc::formatSize(nTotal)).arg(nAbs);
+            if (QMessageBox::warning(this, QStringLiteral("按原路径分割"), sWarn,
+                                     QMessageBox::Yes | QMessageBox::No,
+                                     QMessageBox::No) != QMessageBox::Yes)
+                return;
         }
 
+        // —— P1-4：进度 / 取消 / 完成汇总 ——
+        QProgressDialog dlgProgress(QStringLiteral("正在分割文件..."), QStringLiteral("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(QStringLiteral("分割文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        dlgProgress.setValue(0);
+
+        bool bOk = false;
+        QString sResultMsg;
+        beginProgressOperation(&dlgProgress, &bOk, &sResultMsg);
+        dlgProgress.show();
+        QApplication::processEvents();
+        setOperationsEnabled(false);
+
         emit QSplitFiles(sMergedFilePath, bIsSaveAsOldPath, sSplitFileDir);
+
+        dlgProgress.close();
+        endProgressOperation();
+        setOperationsEnabled(true);
+        syncActionStates();
+
+        if (sResultMsg.isEmpty()) sResultMsg = QStringLiteral("分割未返回结果（归档可能已损坏）");
+        if (bOk) QMessageBox::information(this, QStringLiteral("分割文件"), sResultMsg);
+        else     QMessageBox::warning(this, QStringLiteral("分割文件"), sResultMsg);
     }
 }
 
@@ -991,16 +1218,122 @@ void MainWindow::populateFilePathTree()
     }
 }
 
-// 按“归档是否已加载 + 当前展示模式”刷新工具栏动作可用状态
+// 按「归档是否已加载 + 当前展示模式」刷新工具栏动作可用状态
 void MainWindow::updateViewActionState()
 {
     const bool bLoaded = m_fileManager->isArchiveLoaded();
 
     m_acViewTree->setEnabled(bLoaded && !m_bTreeMode);
     m_acViewFlat->setEnabled(bLoaded && m_bTreeMode);
-    // “显示路径/显示名称”仅在平铺模式下有意义
+    // 「显示路径/显示名称」仅在平铺模式下有意义
     m_acShowFilePath->setEnabled(bLoaded && !m_bTreeMode && !m_bShowPath);
     m_acShowFileName->setEnabled(bLoaded && !m_bTreeMode && m_bShowPath);
+}
+
+// 唯一的状态刷新入口：包含保存按钮与所有菜单动作（P1-5 / P1-6）
+void MainWindow::syncActionStates()
+{
+    const bool bLoaded = m_fileManager->isArchiveLoaded();
+    const bool bBusy   = m_fileManager->isBusy();
+
+    updateViewActionState();
+    m_acSaveFile->setEnabled(bLoaded && m_fileManager->isDirty() && !bBusy);
+    m_acAddFile->setEnabled(bLoaded && !bBusy);
+    m_acDelFile->setEnabled(bLoaded && !bBusy);
+    m_acOutputFile->setEnabled(bLoaded && !bBusy);
+
+    ui->actionLoadFile->setEnabled(!bBusy);
+    ui->actionUnloadFile->setEnabled(!bBusy);
+    ui->actionMergeFile->setEnabled(!bBusy);
+    ui->actionSplitFile->setEnabled(!bBusy);
+    ui->actionPluginMap->setEnabled(!bBusy);
+}
+
+// 长操作期间禁用可重入动作（P3-2）
+void MainWindow::setOperationsEnabled(bool bEnabled)
+{
+    const bool bLoaded = m_fileManager->isArchiveLoaded();
+    const bool bBusy   = !bEnabled;
+    ui->actionLoadFile->setEnabled(bEnabled);
+    ui->actionUnloadFile->setEnabled(bEnabled);
+    ui->actionMergeFile->setEnabled(bEnabled);
+    ui->actionSplitFile->setEnabled(bEnabled);
+    ui->actionPluginMap->setEnabled(bEnabled);
+    m_acAddFile->setEnabled(bEnabled && bLoaded);
+    m_acDelFile->setEnabled(bEnabled && bLoaded);
+    m_acOutputFile->setEnabled(bEnabled && bLoaded);
+    m_acSaveFile->setEnabled(bEnabled && bLoaded && m_fileManager->isDirty() && !bBusy);
+}
+
+// 统一管理进度对话框的三条连接，避免 disconnect(sender, nullptr, ...) 误伤常驻连接
+void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QString *psResultMsg)
+{
+    endProgressOperation();
+    m_pActiveProgress = dlg;
+    *pbOk = false;
+    psResultMsg->clear();
+
+    m_connProgress = connect(m_fileManager, &FileManager::progressChanged, this,
+        [this](qint64 cur, qint64 total, const QString &status) {
+            if (m_pActiveProgress == nullptr) return;
+            if (total > 0) m_pActiveProgress->setValue(int(100 * cur / total));
+            m_pActiveProgress->setLabelText(status);
+        });
+    m_connFinished = connect(m_fileManager, &FileManager::operationFinished, this,
+        [this, pbOk, psResultMsg](bool ok, const QString &msg) {
+            if (m_pActiveProgress) { m_pActiveProgress->setValue(100); m_pActiveProgress->close(); }
+            *pbOk = ok;
+            *psResultMsg = msg;
+        });
+    m_connCancel = connect(dlg, &QProgressDialog::canceled,
+                           m_fileManager, &FileManager::cancelOperation);
+}
+
+void MainWindow::endProgressOperation()
+{
+    disconnect(m_connProgress);
+    disconnect(m_connFinished);
+    disconnect(m_connCancel);
+    m_connProgress = QMetaObject::Connection();
+    m_connFinished = QMetaObject::Connection();
+    m_connCancel   = QMetaObject::Connection();
+    m_pActiveProgress = nullptr;
+}
+
+void MainWindow::onActionVerifyArchiveTriggered()
+{
+    if (!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, QStringLiteral("校验归档"),
+                                 QStringLiteral("请先加载一个归档文件。"));
+        return;
+    }
+    QProgressDialog dlg(QStringLiteral("正在校验归档内容..."), QStringLiteral("取消"), 0, 100, this);
+    dlg.setWindowTitle(QStringLiteral("校验归档"));
+    dlg.setWindowModality(Qt::WindowModal);
+    dlg.setMinimumDuration(0);
+    dlg.setAutoClose(false);
+    dlg.setAutoReset(false);
+    dlg.setValue(0);
+
+    bool bDummy = false;
+    QString sDummy;
+    beginProgressOperation(&dlg, &bDummy, &sDummy);
+    dlg.show();
+    QApplication::processEvents();
+    setOperationsEnabled(false);
+
+    QString sReport;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool bOk = m_fileManager->verifyArchive(&sReport);
+    QApplication::restoreOverrideCursor();
+
+    dlg.close();
+    endProgressOperation();
+    setOperationsEnabled(true);
+    syncActionStates();
+    if (bOk) QMessageBox::information(this, QStringLiteral("校验归档"), sReport);
+    else     QMessageBox::warning(this, QStringLiteral("校验归档"), sReport);
 }
 
 // 递归收集当前已展开的节点（键 = 从根到该节点的文本链）
@@ -1097,7 +1430,7 @@ void MainWindow::onActionAddFileTriggered()
     QApplication::restoreOverrideCursor();
 
     refreshFilePathView();
-    m_acSaveFile->setEnabled(m_fileManager->isDirty());
+    syncActionStates();
 }
 
 void MainWindow::onActionDelFileTriggered()
@@ -1131,14 +1464,13 @@ void MainWindow::onActionDelFileTriggered()
     }
 
     refreshFilePathView();
-    m_acSaveFile->setEnabled(m_fileManager->isDirty());
+    syncActionStates();
 }
 
 void MainWindow::onActionOutputFileTriggered()
 {
     // 树形模式下目录节点不可导出，需选中具体文件
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(m_tvFilePath->currentIndex());
-    if (!isFileLeafItem(pItem))
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(m_tvFilePath->currentIndex());    if (!isFileLeafItem(pItem))
     {
         QMessageBox::information(this, tr("导出文件"),
                                  tr("请先在列表中选择要导出的文件（目录节点不可导出）。"));
@@ -1149,8 +1481,35 @@ void MainWindow::onActionOutputFileTriggered()
     DlgOutputFile dlgOutputFile(this);
     if(dlgOutputFile.exec() == QDialog::Accepted)
     {
-        QString sOutputDir = dlgOutputFile.getOutputDir();
+        const QString sOutputDir = dlgOutputFile.getOutputDir();
+
+        QProgressDialog dlgProgress(QStringLiteral("正在导出文件..."), QStringLiteral("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(QStringLiteral("导出文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        dlgProgress.setValue(0);
+        bool bDummy = false;
+        QString sDummy;
+        beginProgressOperation(&dlgProgress, &bDummy, &sDummy);
+        dlgProgress.show();
+        QApplication::processEvents();
+        setOperationsEnabled(false);
+
         m_fileManager->outputFile(fileInfo.sFilePath, sOutputDir);
+        const QString sErr = m_fileManager->lastError();
+
+        dlgProgress.close();
+        endProgressOperation();
+        setOperationsEnabled(true);
+        syncActionStates();
+
+        if (!sErr.isEmpty())
+            QMessageBox::warning(this, QStringLiteral("导出文件"), sErr);
+        else
+            QMessageBox::information(this, QStringLiteral("导出文件"),
+                                     QStringLiteral("导出完成：%1").arg(fileInfo.sFileName));
     }
 }
 
@@ -1172,37 +1531,35 @@ void MainWindow::onActionSaveFileTriggered()
     dlgProgress.setAutoReset(false);
     dlgProgress.setValue(0);
 
-    // 清理上一轮可能残留的进度连接，避免 lambda 捕获的局部对话框被悬空引用
-    disconnect(m_fileManager, nullptr, this, nullptr);
-
-    connect(m_fileManager, &FileManager::progressChanged, this,
-            [&dlgProgress](qint64 cur, qint64 total, const QString &status) {
-        if (total > 0)
-            dlgProgress.setValue(int(100 * cur / total));
-        dlgProgress.setLabelText(status);
-    });
-    connect(&dlgProgress, &QProgressDialog::canceled,
-            m_fileManager, &FileManager::cancelOperation);
+    bool bDummy = false;
+    QString sDummy;
+    beginProgressOperation(&dlgProgress, &bDummy, &sDummy);
 
     dlgProgress.show();
     QApplication::processEvents();
+    setOperationsEnabled(false);
 
-    bool bOk = m_fileManager->save();
+    const bool bOk = m_fileManager->save();
+    const QString sReason = m_fileManager->lastError();
 
     dlgProgress.close();
+    endProgressOperation();
+    setOperationsEnabled(true);
+    syncActionStates();
 
     if(!bOk)
     {
         QString sMsg = m_fileManager->isCancelRequested()
-                ? tr("保存已取消。")
-                : tr("保存失败，归档文件可能已损坏或磁盘写入失败。");
+                ? tr("保存已取消。改动仍保留在内存中，可重试。")
+                : tr("保存失败。改动仍保留在内存中，可重试。\n\n原因：%1")
+                    .arg(sReason.isEmpty() ? tr("未知错误") : sReason);
         QMessageBox::critical(this, tr("保存文件"), sMsg);
         return;
     }
 
     // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮
     refreshFilePathView();
-    m_acSaveFile->setEnabled(m_fileManager->isDirty());
+    syncActionStates();
 }
 
 void MainWindow::on_actionAbout_triggered()
@@ -1213,7 +1570,8 @@ void MainWindow::on_actionAbout_triggered()
 
 void MainWindow::on_actionPluginMap_triggered()
 {
-    QMessageBox::information(this, tr("插件映射"), tr("功能开发中，敬请期待。"));
+    DlgPluginMap dlg(this);
+    dlg.exec();
 }
 
 void MainWindow::on_actionUnloadFile_triggered()
@@ -1224,8 +1582,7 @@ void MainWindow::on_actionUnloadFile_triggered()
     m_fileManager->unLoadMergedFile();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     m_tvFilePath->header()->setVisible(false);
-    m_acSaveFile->setEnabled(false);
-    updateViewActionState();
+    syncActionStates();
 
     // 卸载归档后关闭所有已打开的文件标签页
     closeAllTabs();

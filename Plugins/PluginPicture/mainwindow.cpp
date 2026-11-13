@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 #include <QDebug>
 #include <QTransform>
+#include <limits>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -19,9 +20,16 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
     if (szBuf == nullptr || nFileLen <= 0)
         return;
+    // Qt6 的 loadFromData 接受 qsizetype（64 位），直接传 qint64，
+    // 不再强转 int，避免 >2 GiB 数据长度被截断（P3-1）。
+    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    {
+        ui->labelPicture->setText("文件过大，无法载入内存显示。");
+        return;
+    }
 
     QPixmap pix;
-    if (!pix.loadFromData(reinterpret_cast<uchar*>(szBuf), (int)nFileLen))
+    if (!pix.loadFromData(reinterpret_cast<uchar*>(szBuf), static_cast<qsizetype>(nFileLen)))
     {
         // 图片解码失败：给出提示，避免静默显示空白
         ui->labelPicture->setText("无法加载图片：数据已损坏或格式不受支持。");

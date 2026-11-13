@@ -1,0 +1,39 @@
+# ------------------------------------------------------------
+# libmobi 静态库构建（MinGW / Qt 工具链）
+#
+# 单独用本 Makefile 编译 libmobi，而不放进 Qt 的 SOURCES，
+# 是因为 miniz.c 采用 amalgamation 模式（miniz.h 内 #include "miniz.c"）：
+# 其它 .c 通过 include miniz.h 只拿到声明，真正的 mz_uncompress 等定义
+# 必须来自「单独编译 miniz.c」。qmake 会把 miniz.c 误判为头文件依赖而丢弃，
+# 导致链接时 mz_uncompress 未定义，因此这里独立编成 libmobi.a 再让插件链接。
+#
+# 加密相关 3 个文件（encryption/sha1/randombytes）未编入，对应关闭 USE_ENCRYPTION，
+# 因此无需链接 advapi32，且加密（DRM）MOBI 本就无法解密，不影响普通正文解析。
+# ------------------------------------------------------------
+
+CC      = gcc
+AR      = ar
+CFLAGS  = -O2 -Wall -I src \
+          -DUSE_MINIZ -DUSE_XMLWRITER -DHAVE_STRDUP -DHAVE_UNISTD_H \
+          -DMOBI_INLINE=inline -DHAVE_ATTRIBUTE_NORETURN \
+          -DMINIZ_NO_STDIO -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES -DMINIZ_NO_TIME \
+          -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ARCHIVE_WRITING_APIS
+
+SRCS = src/buffer.c src/compression.c src/debug.c src/index.c src/memory.c \
+       src/meta.c src/parse_rawml.c src/read.c src/structure.c src/util.c \
+       src/write.c src/opf.c src/xmlwriter.c src/miniz.c
+OBJS = $(SRCS:.c=.o)
+LIB  = libmobi.a
+
+.PHONY: all clean
+
+all: $(LIB)
+
+$(LIB): $(OBJS)
+	$(AR) rcs $(LIB) $(OBJS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJS) $(LIB)

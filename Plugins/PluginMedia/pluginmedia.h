@@ -18,6 +18,11 @@ public:
     void stopPlayback();
     bool hasBackgroundPlayback() const;
     PluginInterface* createInstance();
+
+    // 大文件走文件路径通道，FFmpeg 直接流式读取，避免整块载入内存（P1-2）
+    bool prefersFileByPath() const override;
+    bool sendFileByPath(const QString &path, const QString &displayName) override;
+
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
 private:

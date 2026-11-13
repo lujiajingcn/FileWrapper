@@ -1,0 +1,72 @@
+# ==============================================================
+# FileWrapper - Qt / qmake 项目忽略规则
+#
+# 原则：只忽略可再生的构建产物与本机 IDE 配置。
+# 注意：Plugins/*/lib/ 下的 FFmpeg / Qt5Pdfium 预编译库是项目依赖且已入库，
+#      因此下面的二进制规则对该目录做了例外，不要删掉 !Plugins/*/lib/**。
+#      Plugins/PluginBook/thirdparty/libmobi 是 .pro 直接引用的 vendored 源码，
+#      Plugins/PluginBook/test 是测试工程源码，二者均不整体忽略。
+# ==============================================================
+
+# --- IDE / 编辑器本机配置 ---
+.idea/
+.qtcreator/
+.vscode/
+*.pro.user
+*.pro.user.*
+*.user
+*.user.*
+.qtc_clangd/
+*.autosave
+*~
+*.swp
+
+# --- qmake 生成物 ---
+# 只列 qmake 实际产出的文件名，不用 Makefile.* 通配：
+# thirdparty/libmobi/Makefile.mingw 是构建必需文件，不能被忽略。
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+object_script.*
+moc_*.cpp
+moc_*.h
+moc_predefs.h
+ui_*.h
+qrc_*.cpp
+
+# --- 编译中间产物与可执行文件 ---
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.dll
+*.so
+*.a
+*.lib
+*.dylib
+
+# 例外：预编译依赖库需要随仓库分发
+!Plugins/*/lib/**
+
+# --- 构建输出目录（限定顶层 / 已知影子构建目录，避免误伤第三方源码）---
+/build/
+/build-*/
+/Plugins/*/build_test/
+/debug/
+/release/
+
+# --- WorkBuddy 本地数据 ---
+# tmp 是探针、影子构建与日志，体积大且可重建；memory 是项目笔记，故意保留可见。
+/.workbuddy/tmp/
+/.workbuddy/FileWrapper/debug/
+/.workbuddy/FileWrapper/release/
+
+# --- 日志与操作系统垃圾文件 ---
+*.log
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store

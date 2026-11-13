@@ -4,6 +4,7 @@
 // Qt6 已移除 QTextCodec；本地编码回退改用 QString::fromLocal8Bit
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -106,7 +107,14 @@ void MainWindow::showText(char *szBuf, qint64 nFileLen)
     if (szBuf == nullptr || nFileLen <= 0)
         return;
 
-    // 使用 nFileLen 作为长度（而非 strlen），避免读取越界或 NUL 截断
-    QByteArray array(szBuf, (int)nFileLen);
+    // 使用 nFileLen 作为长度（而非 strlen），避免读取越界或 NUL 截断。
+    // Qt6 的 QByteArray 长度类型为 qsizetype（64 位），不再强转 int 造成
+    // >2 GiB 文件被截断甚至变负（P3-1）。
+    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    {
+        ui->textEdit->setText("文件过大，无法载入内存显示。");
+        return;
+    }
+    QByteArray array(szBuf, static_cast<qsizetype>(nFileLen));
     ui->textEdit->setText(decodeText(array));
 }

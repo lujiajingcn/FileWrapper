@@ -167,6 +167,8 @@ protected:
 
 public slots:
    int showVideo(char *szFileData, qint64 nFileLen);
+   // 大文件路径通道：由 PluginMedia::sendFileByPath 调用，复用 showVideo 的通用流程
+   int showVideoFile(const QString &sPath);
 
 private slots:
    void on_progressSlider_sliderPressed(void);
@@ -205,6 +207,7 @@ private:
     AVFrame         *pAudioFrame = nullptr;
     unsigned char   *m_avioBuffer = nullptr;          // 完整文件数据（内存 IO 的数据源）
     unsigned char   *m_avioInternalBuffer = nullptr;  // AVIOContext 内部读缓冲，由 avio_context_free 释放
+    QString          m_sPendingPath;                   // 大文件按路径打开时暂存的文件路径
     MemIOData        m_memIO;                        // read / seek 回调使用的游标
     AVIOContext     *m_avioCtx   = nullptr;
     int videoindex = -1;

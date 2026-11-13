@@ -3,15 +3,17 @@
 
 #include <QMap>
 #include <QSet>
+#include <QHash>
 #include <QFile>
 #include <QObject>
+#include "archiveformat.h"
 
 typedef struct FILEINFO
 {
-    QString sFilePath;          // 文件路径
+    QString sFilePath;          // 展示路径（v2 = 原始根 + 相对路径；v1 = 归档内原路径）
     QString sFileName;          // 文件名称（包括后缀）
     qint64  nFileLen;           // 文件大小
-    qint64  nContentPositon;    // 文件内容在合并后的文件中的位置
+    qint64  nContentPositon;    // 文件内容在归档中的位置
     int     nState;             // 是否已经删除
 } FILEINFO;
 
@@ -24,57 +26,99 @@ class FileManager : public QObject
 public:
     explicit FileManager(QObject *parent = nullptr);
 
+    // 先解析到临时结构，全部校验成功后才替换内存状态与句柄；
+    // 失败时保留原有归档、视图数据与脏标记不变（P1-6）
     void QLoadMergedFile(QString sFilePath);
     void unLoadMergedFile();
     void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
-    bool validateMergedFile(QString sFilePath);
 
-    // 是否已加载一个有效的归档文件
+    // 完整解析 + 合法性校验（不只是头部 CRC），供加载 / 分割 / 校验共用（P2-3）
+    bool validateMergedFile(QString sFilePath);
+    bool validateMergedFile(QString sFilePath, QString *psErrMsg);
+
     bool isArchiveLoaded() const;
 
-    // 向当前已加载的归档追加若干文件（仅修改内存，标记为待保存）
     void addFiles(const QVector<QString> &vtNewFiles);
-
-    // 从当前已加载的归档中删除指定路径的文件（仅修改内存，标记为待保存）
     bool deleteFile(const QString &sFilePath);
-
-    // 将内存中的增删改动写入磁盘归档（全部删除则删除归档文件）
     bool save();
-
-    // 是否存在尚未落盘的改动
     bool isDirty() const;
-
-    // 是否已有取消请求（UI 用于区分“用户取消”与“操作失败”）
     bool isCancelRequested() const;
 
+    // 最近一次失败的具体原因（含路径与系统错误），UI 据此给出可读提示（P2-5 / P1-3）
+    QString lastError() const;
+    bool isBusy() const;
+
+    // 校验当前归档的内容区 CRC（v1 无校验字段，会明确报告「无法校验」）
+    bool verifyArchive(QString *psReport);
+    FwArc::Meta archiveMeta() const;
+
+    // 读取任意归档的元数据（不做状态变更），供分割「按原路径」二次确认展示
+    static bool inspectArchive(const QString &sPath, FwArc::Meta &meta, QString &sErr);
+
+    // 大文件流式抽取到临时文件（P1-2）：不一次性占用全量内存
+    bool extractEntryToTempFile(const QString &sDisplayName, const QString &sOutPath,
+                                QString &sErr);
+
 signals:
-    // 进度通知：已处理字节数 / 总字节数 / 状态文本
     void progressChanged(qint64 nCurrent, qint64 nTotal, const QString &sStatus);
-    // 操作结束通知：是否成功 / 结果或错误信息
     void operationFinished(bool bSuccess, const QString &sMsg);
+    void warningOccurred(const QString &sMsg);
 
 public slots:
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
     void QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir);
-    // 请求取消正在进行的合并/保存操作（由进度对话框的“取消”按钮触发）
     void cancelOperation();
 
 private:
     QString getFileName(QString sFilePath);
-
-    // 基于当前 m_vtFileInfos 重写出整个归档文件（流式边读源边写临时文件，再原子替换）
     bool rewriteArchive();
+    // v2 快速删除：只把被删条目的 PathLength 置为 0（墓碑）并重算头部 CRC，
+    // 不触碰内容区，避免为一个小删除重写整个 10 GB 归档（P1-3）
+    bool markDeletedOnly(QString &sErr);
+
+    static bool parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr);
+    bool parseFile(const QString &sPath, FwArc::Meta &meta, QString &sErr) const;
+    void setError(const QString &sMsg);
+
+    // 写 v2 头部（CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移
+    bool writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
+                       const QString &sRoot, QVector<qint64> &outCrcFieldPos,
+                       QVector<qint64> &outContentPos, qint64 &outHeaderSize,
+                       QString &sErr);
+    // 回填内容 CRC + 头部 CRC
+    bool finalizeV2Header(QFile &fOut, qint64 headerSize,
+                          const QVector<qint64> &crcFieldPos,
+                          const QVector<quint32> &contentCrcs,
+                          QString &sErr);
+
+    bool streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst,
+                    FwArc::Crc32 &crc, qint64 &copiedTotal, qint64 totalBytes,
+                    const QString &sStatusPrefix, QString &sErr);
+
+    // 安全选择输出路径：目录层级还原 + 冲突自动重命名，绝不静默覆盖
+    QString chooseOutputPath(const QString &sBaseDir, const FwArc::Entry &e,
+                             bool bUseOldPath, QSet<QString> &setUsed, int &nRenamed);
 
 private:
+    struct BusyGuard {
+        explicit BusyGuard(FileManager *fm) : p(fm) { p->m_bBusy = true; p->m_bCancelRequested = false; }
+        ~BusyGuard() { p->m_bBusy = false; }
+        FileManager *p;
+    };
+
     QVector<FILEINFO>        m_vtFileInfos;
-    QMap<QString,FILEINFO>  m_mapFileInfos;
-    QFile                   m_qFile;
-    QSet<QString>           m_setPendingFiles;  // 尚未写入归档、内容需从磁盘原文件读取的路径
-    bool                    m_bDirty = false;   // 是否存在尚未落盘的改动
-    bool                    m_bCancelRequested = false;  // 用户是否已请求取消当前操作
+    QMap<QString,FILEINFO>   m_mapFileInfos;
+    QFile                    m_qFile;
+    QSet<QString>            m_setPendingFiles;
+    bool                     m_bDirty = false;
+    bool                     m_bCancelRequested = false;
+    bool                     m_bBusy = false;
+    QString                  m_sLastError;
+    FwArc::Meta              m_meta;
+    QHash<QString,quint32>   m_mapContentCrc;
 };
 
 #endif // FILEMANAGER_H
