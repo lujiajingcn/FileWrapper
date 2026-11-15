@@ -2,6 +2,7 @@
 
 #include <zlib.h>
 #include <cstring>
+#include <limits>
 
 // ---------- 小端读取 ----------
 static inline quint32 rd32(const char *b)
@@ -61,6 +62,7 @@ bool ZipReader::open(const QByteArray &data)
         if (p + 46 > data.size()) return false;
         if (rd32(data.constData() + p) != 0x02014b50u) return false;
 
+        quint16 flags     = rd16(data.constData() + p + 8);   // general purpose flag
         quint16 method    = rd16(data.constData() + p + 10);
         quint32 compSize  = rd32(data.constData() + p + 20);
         quint32 uncompSize= rd32(data.constData() + p + 24);
@@ -72,13 +74,18 @@ bool ZipReader::open(const QByteArray &data)
         if (p + 46 + nameLen > data.size()) return false;
         QString name = QString::fromUtf8(data.constData() + p + 46, nameLen);
 
-        Entry en;
-        en.name      = normalize(name);
-        en.method    = method;
-        en.compSize  = compSize;
-        en.uncompSize= uncompSize;
-        en.localOff  = localOff;
-        m_entries.append(en);
+        // 加密条目（general purpose flag bit0）无法解压：不收录，
+        // 否则会把密文当正文/图片解析，甚至喂给后续 XML 解析。
+        if (!(flags & 0x1))
+        {
+            Entry en;
+            en.name      = normalize(name);
+            en.method    = method;
+            en.compSize  = compSize;
+            en.uncompSize= uncompSize;
+            en.localOff  = localOff;
+            m_entries.append(en);
+        }
 
         p += 46 + nameLen + extraLen + commLen;
     }
@@ -121,7 +128,10 @@ QByteArray ZipReader::entry(const QString &name) const
         if (dataOff + e.compSize > m_data.size())
             return QByteArray();
 
-        QByteArray comp(m_data.constData() + dataOff, int(e.compSize));
+        // compSize 已被上面的边界检查限制在 m_data 之内；用 Qt6 的 qsizetype
+        // 构造 QByteArray，避免 quint32 -> int 截断成负数或丢失高位。
+        QByteArray comp(m_data.constData() + dataOff,
+                        static_cast<qsizetype>(e.compSize));
 
         if (e.method == 0)        return comp;          // stored
         if (e.method == 8)        return inflate(comp, e.uncompSize);  // deflate
@@ -133,8 +143,19 @@ QByteArray ZipReader::entry(const QString &name) const
 // ---------- zlib 裸 deflate 解压 ----------
 QByteArray ZipReader::inflate(const QByteArray &comp, qint64 uncompSize) const
 {
-    int cap = uncompSize > 0 ? int(uncompSize)
-                              : qMax(16384, comp.size() * 2);
+    // ZIP 头中的 uncompSize 是攻击者可控的 quint32：原实现用 int() 转换会在
+    // >2 GiB 时变负，且按声明值一次分配可被 ZIP bomb 吃掉数 GB 内存。
+    constexpr qint64 kMaxEntryBytes = 64 * 1024 * 1024;   // 单条目解压上限 64 MiB
+    if (uncompSize < 0 || uncompSize > kMaxEntryBytes)
+        return QByteArray();
+    // zlib 的 avail_in / avail_out 是 uInt（32 位），超过会被静默截断
+    if (comp.size() > qint64(std::numeric_limits<uInt>::max()))
+        return QByteArray();
+
+    const qsizetype maxCap = static_cast<qsizetype>(kMaxEntryBytes);
+    qsizetype cap = uncompSize > 0 ? static_cast<qsizetype>(uncompSize)
+                                   : qMax<qsizetype>(16384, comp.size() * 2);
+    if (cap > maxCap) cap = maxCap;
 
     for (int attempt = 0; attempt < 6; ++attempt)
     {
@@ -154,7 +175,7 @@ QByteArray ZipReader::inflate(const QByteArray &comp, qint64 uncompSize) const
         int r = ::inflate(&strm, Z_FINISH);
         if (r == Z_STREAM_END)
         {
-            out.resize(int(strm.total_out));
+            out.resize(static_cast<qsizetype>(strm.total_out));
             ::inflateEnd(&strm);
             return out;
         }
@@ -162,7 +183,7 @@ QByteArray ZipReader::inflate(const QByteArray &comp, qint64 uncompSize) const
 
         if (r != Z_BUF_ERROR)
             return QByteArray();   // 真正的损坏，放弃
-        cap *= 2;                  // 缓冲区不足，放大重试
+        cap = qMin(cap * 2, maxCap);   // 缓冲区不足，放大重试（有上限）
     }
     return QByteArray();
 }

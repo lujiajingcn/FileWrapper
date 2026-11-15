@@ -158,6 +158,8 @@ public:
     // 由 PluginMedia::stopPlayback() 调用：彻底停止后台播放（停解码线程 + 停音频输出 + 释放 FFmpeg 上下文）。
     // 用于主程序切换文件时，确保被隐藏的旧视频 widget 不再在后台发声/解码。
     void stopPlayback();
+    // 打开失败 / 0 字节时停止后台播放并清空画面，避免残留上一个文件
+    void clearContent();
 
 public slots:
    void timeCallback(void);
@@ -184,12 +186,13 @@ private slots:
    void onDecodingFinished(int genId);
 
 private:
-    void clearFFmpegResources();
+    // force=true 时即使解码线程未确认退出也释放（仅析构使用）
+    void clearFFmpegResources(bool force = false);
     void doSeek(qint64 ms);
     void updateProgressDisplay();
     void updatePlayPauseIcon();
-    // 停止 worker 并阻塞等待其退出 doDecode（替换旧的 busy-wait）
-    void stopWorkerAndWait(unsigned long timeoutMs = 2000);
+    // 停止 worker 并阻塞等待其退出 doDecode；返回 false 表示超时、worker 仍在运行
+    bool stopWorkerAndWait(unsigned long timeoutMs = 2000);
     // 根据源宽高与目标区域计算保持宽高比的目标输出尺寸
     QSize computeAspectRatioSize(int srcW, int srcH, int dstW, int dstH) const;
     // （重新）创建 sws 上下文，将源帧缩放为 outW x outH 的 RGB32
@@ -250,6 +253,8 @@ private:
     // ===== 视频解码线程 =====
     QThread     *m_videoThread = nullptr;
     VideoWorker *m_videoWorker = nullptr;
+    // 解码线程超时未退出时挂起资源释放，等 decodingFinished 后再清理，避免 UAF
+    bool         m_bCleanupPending = false;
 };
 
 #endif // MAINWINDOW_H

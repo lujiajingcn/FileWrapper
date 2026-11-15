@@ -16,6 +16,8 @@ public:
     ~MainWindow();
 
     void showPicture(char *szBuf, qint64 nFileLen);
+    // 打开失败 / 0 字节时清空内容区，避免界面残留上一个文件
+    void clearContent();
 
 private slots:
     void on_actZoomIn_triggered();

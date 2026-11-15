@@ -24,8 +24,10 @@ MainWindow::~MainWindow()
 static bool isStrictUtf8(const QByteArray &data)
 {
     const char *p = data.constData();
-    const int n = data.size();
-    int i = 0;
+    // QByteArray::size() 在 Qt6 返回 qsizetype（64 位）；用 int 保存会在
+    // >2 GiB 时变负，循环体一次都不执行，把 GBK 大文件误判成合法 UTF-8。
+    const qsizetype n = data.size();
+    qsizetype i = 0;
     while (i < n)
     {
         const unsigned char c = (unsigned char)p[i];
@@ -81,15 +83,18 @@ QString MainWindow::decodeText(const QByteArray &data)
     if (data.size() >= 2)
     {
         if ((unsigned char)data[0] == 0xFF && (unsigned char)data[1] == 0xFE) // UTF-16LE
-            return QString::fromUtf16(reinterpret_cast<const ushort *>(data.constData() + 2),
+            // Qt6 推荐 char16_t* 重载（ushort* 版本已废弃）；两者都是 16 位单元
+            return QString::fromUtf16(reinterpret_cast<const char16_t *>(data.constData() + 2),
                                       (data.size() - 2) / 2);
         if ((unsigned char)data[0] == 0xFE && (unsigned char)data[1] == 0xFF) // UTF-16BE
         {
             QByteArray le = data.mid(2);
             unsigned char *b = reinterpret_cast<unsigned char *>(le.data());
-            for (int k = 0; k + 1 < le.size(); k += 2)
+            // le.size() 是 qsizetype（64 位）；用 int 计数在 >2 GiB 时会溢出为负，
+            // 造成负下标越界写。
+            for (qsizetype k = 0; k + 1 < le.size(); k += 2)
                 std::swap(b[k], b[k + 1]);
-            return QString::fromUtf16(reinterpret_cast<const ushort *>(le.constData()), le.size() / 2);
+            return QString::fromUtf16(reinterpret_cast<const char16_t *>(le.constData()), le.size() / 2);
         }
     }
 
@@ -102,19 +107,28 @@ QString MainWindow::decodeText(const QByteArray &data)
     return QString::fromLocal8Bit(data);
 }
 
+void MainWindow::clearContent()
+{
+    ui->textEdit->clear();
+}
+
 void MainWindow::showText(char *szBuf, qint64 nFileLen)
 {
     if (szBuf == nullptr || nFileLen <= 0)
         return;
 
     // 使用 nFileLen 作为长度（而非 strlen），避免读取越界或 NUL 截断。
-    // Qt6 的 QByteArray 长度类型为 qsizetype（64 位），不再强转 int 造成
-    // >2 GiB 文件被截断甚至变负（P3-1）。
-    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    // Qt6 的 QByteArray 长度类型为 qsizetype（64 位），无需强转 int。
+    // 64 位下 qsizetype 与 qint64 同宽，原「超过 qsizetype::max()」判断恒为
+    // false（死代码）；这里改成真实的可显示上限，防止超大文本冻结 UI 线程。
+    constexpr qint64 kMaxDisplayBytes = 64 * 1024 * 1024;   // 64 MiB
+    if (nFileLen > kMaxDisplayBytes)
     {
-        ui->textEdit->setText("文件过大，无法载入内存显示。");
+        ui->textEdit->setPlainText("文件过大，无法载入内存显示。");
         return;
     }
     QByteArray array(szBuf, static_cast<qsizetype>(nFileLen));
-    ui->textEdit->setText(decodeText(array));
+    // 必须用 setPlainText：setText 会把内容当富文本解析，打开 HTML/源码文件时
+    // 标签会被吞掉，显示成渲染后的网页（本机 Qt 6.8.3 实测确认）。
+    ui->textEdit->setPlainText(decodeText(array));
 }

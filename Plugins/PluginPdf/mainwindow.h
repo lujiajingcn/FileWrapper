@@ -23,6 +23,8 @@ public:
     void showPdf(char *szBuf, qint64 nFileLen);
     // 大文件按路径加载，QPdfDocument 自行按需读取，避免全量内存副本（P1-2）
     bool showPdfFile(const QString &sPath);
+    // 打开失败 / 0 字节时清空内容区并复位页码状态
+    void clearContent();
 
 private slots:
     void on_actionFirstPage_triggered();

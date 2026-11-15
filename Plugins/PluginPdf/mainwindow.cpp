@@ -29,17 +29,33 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
+void MainWindow::clearContent()
+{
+    // 成员声明顺序保证 m_pdfBuf 在 m_doc.close() 时仍然有效
+    m_doc.close();
+    m_pdfBuf.close();
+    m_pdfBuf.setData(QByteArray());
+    m_nPageCount = 0;
+    m_nCurPage = 0;
+    if (m_lbContent) m_lbContent->clear();
+    if (m_lePageNum) m_lePageNum->clear();
+}
+
 void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
 {
+    // 换文件先清掉上一份的画面/页码/文档：任何失败路径都不会残留旧 PDF 页面。
+    // 原实现只在 load 失败时 qWarning，而 updatePage() 在 m_nPageCount<=0 时
+    // 直接 return，导致界面仍显示上一个文件的内容。
+    clearContent();
+
     if (szBuf == nullptr || nFileLen <= 0)
         return;
 
     // 主程序会在 sendFileData 返回后释放原始缓冲区，因此必须复制一份数据。
     // QBuffer::setData() 会在内部保存副本；QPdfDocument::load(QIODevice*) 对
-    // 可随机访问的 QBuffer 是同步的（Qt 6.9 实测：load 返回即 status=Ready、
-    // pageCount 可用），无需等待 statusChanged 信号。
-    m_doc.close();
-    m_pdfBuf.close();
+    // 可随机访问的 QBuffer 是同步的（本机 Qt 6.8.3 实测：load 返回即
+    // status=Ready、pageCount 可用），无需等待 statusChanged 信号。
+    // 注意该重载返回 void，加载结果只能用 error() / pageCount() 判断。
     m_pdfBuf.setData(QByteArray(szBuf, static_cast<qsizetype>(nFileLen)));
     if (!m_pdfBuf.open(QIODevice::ReadOnly))
     {
@@ -48,26 +64,27 @@ void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
     }
 
     m_doc.load(&m_pdfBuf);
-    if (m_doc.error() != QPdfDocument::Error::None)
-        qWarning() << "[PluginPdf] PDF 加载错误, code =" << int(m_doc.error());
+    if (m_doc.error() != QPdfDocument::Error::None || m_doc.pageCount() <= 0)
+    {
+        qWarning() << "[PluginPdf] PDF 加载失败, code =" << int(m_doc.error())
+                   << ", pageCount =" << m_doc.pageCount();
+        return;
+    }
 
     m_nPageCount = m_doc.pageCount();
-    if (m_nPageCount < 0) m_nPageCount = 0;
     m_nCurPage = 0;
     gotoPage();
 }
 
 bool MainWindow::showPdfFile(const QString &sPath)
 {
-    m_doc.close();
-    m_pdfBuf.close();
-    m_pdfBuf.setData(QByteArray());   // 释放内存副本
-    if (m_doc.load(sPath) != QPdfDocument::Error::None)
+    clearContent();   // 同上：先复位，失败时不会残留旧页面
+    if (m_doc.load(sPath) != QPdfDocument::Error::None || m_doc.pageCount() <= 0)
     {
         qWarning() << "[PluginPdf] 按路径加载 PDF 失败:" << sPath << "code =" << int(m_doc.error());
         return false;
     }
-    m_nPageCount = qMax(0, m_doc.pageCount());
+    m_nPageCount = m_doc.pageCount();
     m_nCurPage = 0;
     gotoPage();
     return true;
@@ -106,7 +123,8 @@ void MainWindow::on_actionLastPage_triggered()
 
 void MainWindow::on_actionZoomIn_triggered()
 {
-    if(m_nScale > 300)
+    // 原判断是 >300，从 300 还能再加到 305%，越过声明的上限；改为 >= 停在 300%
+    if(m_nScale >= 300)
     {
         return;
     }
@@ -117,7 +135,8 @@ void MainWindow::on_actionZoomIn_triggered()
 
 void MainWindow::on_actionZoomOut_triggered()
 {
-    if(m_nScale < 20)
+    // 同理，原判断 <20 会让 20% 再减到 15%，越过声明的下限
+    if(m_nScale <= 20)
     {
         return;
     }
@@ -163,7 +182,13 @@ void MainWindow::getLineEditPageNum()
     int nIndex = sPageNum.indexOf("/");
     if(nIndex != -1)
         return;
-    m_nCurPage = sPageNum.toInt() - 1;
+    // toInt() 失败会返回 0，直接减 1 会把当前页改成 -1（空文档下显示 0/0）。
+    // 只接受合法的正整数页码，其余输入保持当前页不变。
+    bool ok = false;
+    const int typed = sPageNum.toInt(&ok);
+    if (!ok || typed < 1)
+        return;
+    m_nCurPage = typed - 1;
     // 限制页码到有效范围
     if (m_nPageCount > 0)
     {

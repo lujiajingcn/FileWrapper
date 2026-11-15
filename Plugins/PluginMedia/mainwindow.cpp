@@ -146,9 +146,19 @@ void VideoWorker::updateGenId(int genId)
 bool VideoWorker::waitForDecodingStopped(unsigned long timeoutMs)
 {
     QMutexLocker locker(&m_mutex);
-    if (m_running.load(std::memory_order_relaxed) == 0)
-        return true;
-    return m_stoppedCond.wait(&m_mutex, timeoutMs);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    // 带 predicate 重检：QWaitCondition 可能虚假唤醒，单靠 wait() 的返回值
+    // 会把「还没真正退出 doDecode」误判成「已停止」。
+    while (m_running.load(std::memory_order_acquire) != 0)
+    {
+        const qint64 left = qint64(timeoutMs) - elapsed.elapsed();
+        if (left <= 0)
+            return false;
+        if (!m_stoppedCond.wait(&m_mutex, static_cast<unsigned long>(left)))
+            return false;
+    }
+    return true;
 }
 
 void VideoWorker::doDecode()
@@ -571,6 +581,14 @@ void MainWindow::onFrameDecoded(QImage img, qint64 ptsMs, int genId)
 
 void MainWindow::onDecodingFinished(int genId)
 {
+    // worker 已退出 doDecode：此前因等待超时而挂起的资源释放现在可以安全执行。
+    // 必须放在 genId 过滤之前，否则旧世代的信号会让这次清理永远不发生。
+    if (m_bCleanupPending)
+    {
+        clearFFmpegResources(true);
+        return;
+    }
+
     // 过滤过期的信号：只有当 genId 与当前 m_genCounter 一致时，才处理
     if (genId != m_genCounter)
         return;
@@ -619,33 +637,62 @@ void MainWindow::resizeEvent(QResizeEvent*)
     videoH = ui->videoLabel->size().height();
 }
 
-void MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
+bool MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
 {
     if (!m_videoWorker)
-        return;
+        return true;
     // 请求停止（DirectConnection 设置原子标志并唤醒暂停条件变量）
     QMetaObject::invokeMethod(m_videoWorker, "requestStop", Qt::DirectConnection);
-    // 阻塞等待 worker 退出 doDecode（条件变量替代旧的忙等待轮询）
-    m_videoWorker->waitForDecodingStopped(timeoutMs);
+    // 阻塞等待 worker 退出 doDecode（条件变量替代旧的忙等待轮询）。
+    // 返回 false 表示超时、worker 可能仍在访问 FFmpeg 上下文，调用方不得立即释放。
+    return m_videoWorker->waitForDecodingStopped(timeoutMs);
+}
+
+void MainWindow::clearContent()
+{
+    // 主程序在读文件失败或 0 字节时会送 (nullptr, 0)。此时必须停掉仍在运行的
+    // 解码线程与音频输出，否则上一个文件会在后台继续播放/发声。
+    stopPlayback();
+
+    ui->videoLabel->clear();
+    ui->progressSlider->setRange(0, 100);
+    ui->progressSlider->setValue(0);
+    ui->progressSlider->setEnabled(false);
+    ui->timeLabel->setText("0:00 / 0:00");
+
+    m_nCurrentMs = 0;
+    m_nDurationMs = 0;
+    m_nStartMs = 0;
+    m_nTargetMs = 0;
+    m_nSeekTargetMs = 0;
+    m_bSeekPending = false;
+    m_bUserDragging = false;
+    updatePlayPauseIcon();
 }
 
 void MainWindow::stopPlayback()
 {
-    // 先停解码线程，再停音频输出，最后释放 FFmpeg 上下文（与 on_stopBtn_clicked 同序，避免竞争）
-    if (m_videoWorker)
-        stopWorkerAndWait(2000);
-
-    if (audioOutput)
-        audioOutput->stop();
-
+    // clearFFmpegResources 内部先停解码线程，再停音频输出，最后释放 FFmpeg 上下文。
+    // 若等待超时，它会挂起释放（m_bCleanupPending），由 decodingFinished 补做。
     clearFFmpegResources();
     qDebug() << "[Stop] stopPlayback (切换文件，停止后台播放)";
 }
 
-void MainWindow::clearFFmpegResources()
+void MainWindow::clearFFmpegResources(bool force)
 {
     // 停止视频解码线程
-    stopWorkerAndWait(2000);
+    const bool stopped = stopWorkerAndWait(2000);
+    if (!stopped && !force)
+    {
+        // worker 仍在 doDecode 中，持有这些上下文的裸指针副本（VideoWorker::setContexts）；
+        // 此刻释放会造成 use-after-free。挂起清理，等 decodingFinished（worker 已退出）再执行。
+        m_bCleanupPending = true;
+        if (timer->isActive()) timer->stop();
+        if (audioOutput) audioOutput->stop();
+        qWarning() << "[Stop] 解码线程未在 2s 内退出，推迟释放 FFmpeg 资源";
+        return;
+    }
+    m_bCleanupPending = false;
 
     if (timer->isActive()) timer->stop();
 
@@ -690,18 +737,44 @@ MainWindow::~MainWindow()
 {
     if (timer->isActive()) timer->stop();
 
-    // 停止视频线程
+    // 1) 先请求 worker 退出 doDecode，确认它不再访问 FFmpeg 上下文后才能释放资源。
+    bool safelyStopped = true;
     if (m_videoWorker)
     {
         QMetaObject::invokeMethod(m_videoWorker, "requestStop", Qt::DirectConnection);
+        safelyStopped = m_videoWorker->waitForDecodingStopped(3000);
     }
+
+    if (!safelyStopped)
+    {
+        // worker 卡住且仍持有上下文的裸指针副本：释放资源或 delete worker 都会 UAF。
+        // 进程即将结束，宁可泄漏也不崩，交由操作系统回收。
+        qWarning() << "[Media] 解码线程未在 3s 内退出，跳过资源释放与 worker 删除";
+        delete ui;
+        return;
+    }
+
+    // force=true：析构后不再有后续播放，正常路径必须释放干净
+    clearFFmpegResources(true);
+
+    // 2) 结束 QThread 事件循环
     if (m_videoThread && m_videoThread->isRunning())
     {
         m_videoThread->quit();
-        m_videoThread->wait(3000);
+        if (!m_videoThread->wait(3000))
+        {
+            qWarning() << "[Media] QThread 未退出，跳过 worker 删除";
+            m_videoWorker = nullptr;
+        }
     }
 
-    clearFFmpegResources();
+    // 3) worker 无 parent，线程已静止，显式回收；
+    //    m_videoThread 有 parent(this)，由 QObject 析构自动删除。
+    if (m_videoWorker)
+    {
+        delete m_videoWorker;
+        m_videoWorker = nullptr;
+    }
     delete ui;
 }
 
@@ -819,10 +892,12 @@ void MainWindow::on_stopBtn_clicked(void)
     ui->videoLabel->clear();
 
     // ====== 先停止 worker，再操作 FFmpeg 上下文，避免数据竞争导致崩溃 ======
-    stopWorkerAndWait(2000);
+    const bool workerStopped = stopWorkerAndWait(2000);
+    if (!workerStopped)
+        qWarning() << "[Stop] 解码线程未在 2s 内退出，跳过 FFmpeg 上下文重置";
 
     // 重置进度（worker 已停止，此时操作上下文安全）
-    if (pFormatCtx)
+    if (workerStopped && pFormatCtx)
     {
         av_seek_frame(pFormatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
         if (pCodecCtx) avcodec_flush_buffers(pCodecCtx);
@@ -885,7 +960,12 @@ void MainWindow::doSeek(qint64 ms)
     timer->stop();
 
     // 暂停视频解码线程（避免 seek 期间继续读帧）
-    stopWorkerAndWait(2000);
+    if (!stopWorkerAndWait(2000))
+    {
+        qWarning() << "[Seek] 解码线程未在 2s 内退出，放弃本次跳转";
+        m_bSeekPending = false;
+        return;
+    }
 
     // stream_index = -1 时，av_seek_frame 期望时间戳单位为 AV_TIME_BASE (微秒)；
     // UI 是相对时间轴，容器 PTS 起点非 0 时要补上起始偏移。
@@ -1058,6 +1138,13 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     // 清理上次播放的资源（包含停止视频解码线程）
     clearFFmpegResources();
+    if (m_bCleanupPending)
+    {
+        // 上一次的解码线程尚未退出，FFmpeg 上下文仍被 worker 引用；
+        // 此刻不能覆盖指针，否则既泄漏又可能 UAF。等 decodingFinished 补做清理。
+        qWarning() << "[ShowVideo] 上一个解码线程仍在停止中，暂不打开新文件";
+        return -1;
+    }
     av_channel_layout_default(&out_ch_layout, AUDIO_OUT_CHANNELS);
 
     pFormatCtx = avformat_alloc_context();
@@ -1349,7 +1436,10 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         m_nDurationMs = (qint64)(durStream->duration * av_q2d(durStream->time_base) * 1000);
     if (m_nDurationMs <= 0 && pFormatCtx->bit_rate > 0)
     {
-        int64_t fileSize = avio_size(m_avioCtx);
+        // 按路径打开时 FFmpeg 自建的是 pFormatCtx->pb，m_avioCtx 为 nullptr；
+        // 内存通道时 pFormatCtx->pb 就是 m_avioCtx。统一用 pb 两种通道都有效，
+        // 否则大文件按路径打开且容器无时长时会退化为兜底的 60000ms。
+        int64_t fileSize = avio_size(pFormatCtx->pb);
         if (fileSize > 0)
             m_nDurationMs = (qint64)(fileSize * 8.0 * 1000.0 / pFormatCtx->bit_rate);
     }

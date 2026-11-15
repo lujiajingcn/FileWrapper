@@ -3,6 +3,7 @@
 #include <QDebug>
 #include <QTransform>
 #include <limits>
+#include <cmath>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -16,20 +17,31 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
+void MainWindow::clearContent()
+{
+    m_originalPix = QPixmap();
+    m_scale = 1.0;
+    m_rotateDeg = 0;
+    // QLabel::clear() 同时清掉文本与 pixmap
+    ui->labelPicture->clear();
+}
+
 void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
     if (szBuf == nullptr || nFileLen <= 0)
         return;
-    // Qt6 的 loadFromData 接受 qsizetype（64 位），直接传 qint64，
-    // 不再强转 int，避免 >2 GiB 数据长度被截断（P3-1）。
-    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    // QPixmap::loadFromData(const uchar*, uint, ...) 的长度形参是 uint
+    // （本机 Qt 6.8.3 的 qpixmap.h:97 实测只有这一个重载），不是 qsizetype。
+    // 64 位下 qsizetype 与 qint64 同宽，原「超过 qsizetype::max()」判断恒为
+    // false（死代码）；按 uint 的真实范围显式判断，避免隐式截断成错误长度。
+    if (nFileLen > qint64(std::numeric_limits<uint>::max()))
     {
         ui->labelPicture->setText("文件过大，无法载入内存显示。");
         return;
     }
 
     QPixmap pix;
-    if (!pix.loadFromData(reinterpret_cast<uchar*>(szBuf), static_cast<qsizetype>(nFileLen)))
+    if (!pix.loadFromData(reinterpret_cast<const uchar*>(szBuf), static_cast<uint>(nFileLen)))
     {
         // 图片解码失败：给出提示，避免静默显示空白
         ui->labelPicture->setText("无法加载图片：数据已损坏或格式不受支持。");
@@ -73,7 +85,18 @@ void MainWindow::applyTransform()
     qreal h = rotated.height() * m_scale;
     if (w <= 0 || h <= 0)
         return;
-    QPixmap scaled = rotated.scaled((int)w, (int)h, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+
+    // 连续放大（最高 8x）时 QPixmap 会按 4 字节/像素一次性分配，超大图可能
+    // 吃掉数 GB 内存。按总像素夹一个上限，保持宽高比等比缩小。
+    constexpr qreal kMaxPixels = 64.0 * 1024 * 1024;   // 64M 像素 ≈ 256 MiB (ARGB32)
+    if (w * h > kMaxPixels)
+    {
+        const qreal k = std::sqrt(kMaxPixels / (w * h));
+        w *= k;
+        h *= k;
+    }
+    QPixmap scaled = rotated.scaled(qMax(1, qRound(w)), qMax(1, qRound(h)),
+                                    Qt::KeepAspectRatio, Qt::SmoothTransformation);
     ui->labelPicture->setPixmap(scaled);
     ui->labelPicture->adjustSize();
 }

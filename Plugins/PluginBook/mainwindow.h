@@ -46,6 +46,8 @@ public:
     void showBook(char *szBuf, qint64 nFileLen);
     // 主程序在送数据前告知文件名，用作书名缺失时的回退（P2-7）
     void setSourceName(const QString &sName) { m_sourceName = sName; }
+    // 打开失败 / 0 字节时清空内容区与上一本书的状态
+    void clearContent();
 
 private slots:
     void on_actionPrevChapter_triggered();

@@ -150,6 +150,15 @@ void MainWindow::reset()
     if (m_infoLabel) m_infoLabel->clear();
 }
 
+void MainWindow::clearContent()
+{
+    reset();
+    m_bookData.clear();
+    m_bookTitle = QStringLiteral("电子书");
+    m_sourceName.clear();
+    showMessage(QStringLiteral("文件为空或无法读取。"));
+}
+
 void MainWindow::showBook(char *szBuf, qint64 nFileLen)
 {
     reset();
@@ -160,10 +169,13 @@ void MainWindow::showBook(char *szBuf, qint64 nFileLen)
     }
 
     // 复制数据由本对象持有：主程序在 sendFileData 返回后会释放原始缓冲区。
-    // 使用 qsizetype（Qt6 为 64 位）而非 int，避免 >2 GiB 长度被截断或变负（P3-1）。
-    if (nFileLen > qint64(std::numeric_limits<qsizetype>::max()))
+    // Qt6 的 QByteArray 长度类型为 qsizetype（64 位），无需强转 int。
+    // 64 位下 qsizetype 与 qint64 同宽，原「超过 qsizetype::max()」判断恒为
+    // false（死代码）；这里与 loadEpub 的解压后总量上限保持一致。
+    constexpr qint64 kMaxBookBytes = 256 * 1024 * 1024;   // 256 MiB
+    if (nFileLen > kMaxBookBytes)
     {
-        showMessage("文件过大，无法载入内存。");
+        showMessage("电子书文件过大，无法载入内存。");
         return;
     }
     m_bookData = QByteArray(szBuf, static_cast<qsizetype>(nFileLen));
@@ -263,11 +275,23 @@ bool MainWindow::loadEpub(const QByteArray &data)
     ZipReader reader;
     if (!reader.open(data)) return false;
 
-    // 展开所有条目到内存映射（键为归一化路径，避免前导 '/' 导致查不到）
+    // 展开条目到内存映射（键为归一化路径，避免前导 '/' 导致查不到）。
+    // ZIP bomb 防护：单条目上限由 ZipReader::inflate 保证，这里再限制条目数与解压后总量。
+    constexpr int    kMaxEntries    = 4096;
+    constexpr qint64 kMaxTotalBytes = 256 * 1024 * 1024;  // 256 MiB
+    qint64 totalBytes = 0;
     for (const QString &n : reader.entryNames())
     {
         if (n.isEmpty()) continue;
-        m_entries[n] = reader.entry(n);
+        if (m_entries.size() >= kMaxEntries || totalBytes >= kMaxTotalBytes)
+        {
+            qWarning() << "[PluginBook] EPUB 条目过多或解压后体积超限，放弃解析";
+            return false;
+        }
+        const QByteArray entryData = reader.entry(n);
+        if (entryData.isEmpty()) continue;
+        totalBytes += entryData.size();
+        m_entries[n] = entryData;
     }
 
     // 定位 OPF：META-INF/container.xml -> rootfile full-path

@@ -16,7 +16,12 @@ PluginMedia::~PluginMedia()
 void PluginMedia::sendFileData(char *szFileData, qint64 nFileLen)
 {
     if (szFileData == nullptr || nFileLen <= 0)
+    {
+        // 主程序在读文件失败 / 0 字节时也会送 (nullptr, 0)：必须停掉旧播放并清画面，
+        // 否则上一个文件会在后台继续解码/发声。
+        if (m_wMainWindow) m_wMainWindow->clearContent();
         return;
+    }
     emit showVideo(szFileData, nFileLen);
 }
 

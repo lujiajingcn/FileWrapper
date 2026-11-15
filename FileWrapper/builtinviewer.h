@@ -22,7 +22,10 @@ public:
     void setSourceName(const QString &name) override;
 
 private:
-    static const qint64 kMaxDisplayBytes = 1024 * 1024;   // 最多显示 1 MB，避免冻结
+    // C++17：static constexpr 成员隐含 inline，被 qMin 按引用使用（ODR-use）时
+    // 无需在 .cpp 里再写一份类外定义；写成 static const 会让 GCC/MinGW 链接期报
+    // undefined reference to `BuiltinViewer::kMaxDisplayBytes'（MSVC 宽松，不报）。
+    static constexpr qint64 kMaxDisplayBytes = 1024 * 1024;   // 最多显示 1 MB，避免冻结
     Mode         m_mode;
     QWidget     *m_widget;
     QLabel      *m_title;
