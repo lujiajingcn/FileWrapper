@@ -36,16 +36,22 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
     // false（死代码）；按 uint 的真实范围显式判断，避免隐式截断成错误长度。
     if (nFileLen > qint64(std::numeric_limits<uint>::max()))
     {
+        // 同样先清 pixmap 再写提示：QLabel::setPixmap() 会清除文本，
+        // 反之 setText 也会清掉 pixmap，顺序不能反。
+        ui->labelPicture->setPixmap(QPixmap());
         ui->labelPicture->setText("文件过大，无法载入内存显示。");
+        m_originalPix = QPixmap();
         return;
     }
 
     QPixmap pix;
     if (!pix.loadFromData(reinterpret_cast<const uchar*>(szBuf), static_cast<uint>(nFileLen)))
     {
-        // 图片解码失败：给出提示，避免静默显示空白
-        ui->labelPicture->setText("无法加载图片：数据已损坏或格式不受支持。");
+        // 图片解码失败：给出提示，避免静默显示空白。
+        // 注意顺序：QLabel::setPixmap() 会清除已设置的文本，
+        // 因此必须先 setPixmap(空) 清掉旧图，再 setText 写提示文案。
         ui->labelPicture->setPixmap(QPixmap());
+        ui->labelPicture->setText("无法加载图片：数据已损坏或格式不受支持。");
         m_originalPix = QPixmap();
         return;
     }
