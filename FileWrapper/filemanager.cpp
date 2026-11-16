@@ -230,11 +230,28 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         cursor += qint64(entryFixed) + pathLen;
     }
 
-    // 内容区不得重叠
+    // 内容区不得重叠。
+    //
+    // 注意零长度条目（0 字节文件）：写入端 writeV2Header 按文件长度累加内容偏移，
+    // 0 字节文件不推进游标，于是「它自己」和「它后面那条」共享同一个 contentPos。
+    // 这在语义上是正确的 —— 0 字节文件本来就不占任何内容区。
+    //
+    // 但若把零长度区间也放进重叠检测列表，排序后 [P, P) 与 [P, P+N) 首地址相同，
+    // 而 std::sort 不保证稳定，两者的相对次序是未定义的：
+    //   · [P, P)   排在前面 -> P < P     为假 -> 不报错
+    //   · [P, P+N) 排在前面 -> P < P+N   为真 -> 误报「内容区重叠」
+    // 表现为「目录里有空文件就合并失败」，且随文件数/排序实现而变（本次实测
+    // 224 种组合里 22 种触发，报错位置随目录结构漂移）。
+    //
+    // 因此：零长度条目不参与重叠检测（它不占内容区，本就无从重叠）；
+    // 真正的重叠（两个非零长度区间交叠）仍必须被拦截。
     QVector<QPair<quint64, quint64>> ranges;
     ranges.reserve(meta.entries.size());
     for (const FwArc::Entry &e : meta.entries)
+    {
+        if (e.size == 0) continue;   // 零长度条目不占内容区，不参与重叠判定
         ranges.append(qMakePair(e.contentPos, e.contentPos + e.size));
+    }
     std::sort(ranges.begin(), ranges.end(),
               [](const QPair<quint64, quint64> &a, const QPair<quint64, quint64> &b) {
                   return a.first < b.first;
