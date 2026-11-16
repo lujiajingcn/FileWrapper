@@ -33,3 +33,30 @@
 - 本机 PowerShell 进 MSVC 环境会撞 `HTTPS_PROXY`/`https_proxy` 大小写冲突，
   且 `Enter-VsDevShell` 内部调用被黑名单拦的 reg.exe；改用 Bash + 手动设
   `INCLUDE`/`LIB`/`PATH` 调 cl.exe 可绕过。
+
+## 推送到 GitHub 的网络约束（2026-11-16 实测，重要）
+本机到 **`github.com:443` 的所有路径都不可达**：
+- 走本地代理 `http://127.0.0.1:<port>` → `CONNECT tunnel failed, response 502`
+- 直连各 GitHub 真实 IP（20.205.243.166/164/170、20.27.177.113、140.82.113.3/114.3）→ 全部超时
+- 系统 DNS 把 `github.com` 解析到 **20.6.7.17**（Azure 段，非 GitHub IP）→ 不可达
+  （全局 `http.curloptresolve=github.com:443:140.82.112.4` 这个固定 IP 也已失效）
+- 但 **`api.github.com` 双向可达**（代理与直连都 200），`github.com` 不通而
+  `api.github.com` 通，说明是针对 `github.com` 这一 host 的阻断。
+
+**因此 `git push` 无法走标准通道**，需改用 **GitHub REST Git Data API** 推送：
+`POST /git/blobs` → `POST /git/trees` → `POST /git/commits` → `PATCH /git/refs/heads/main`。
+凭据从 `git credential fill`（Windows Credential Manager，`credential.helper=manager`）取。
+参考脚本：`.workbuddy/tmp/push_api2.py`（`.workbuddy/tmp/` 被 gitignore，不会入库）。
+
+**用 API 复现提交时有两个必须踩准的点**（否则 commit SHA 对不上、历史分叉）：
+1. **blob 内容必须取自 git 对象库**（`git cat-file blob <index-sha>`），不能读磁盘原始字节。
+   Windows 上 git 提交时做 CRLF→LF 转换，磁盘是 CRLF、仓库 blob 是 LF；
+   直接上传磁盘字节会得到不同的 blob SHA → tree → commit 全部对不上
+   （踩过一次：3 个 commit 全成孤儿，远端存的是非规范的 CRLF 版本，需覆盖纠正）。
+2. **commit message 必须用 `git cat-file commit <sha>` 取原始字节**（含末尾那个 `\n`）。
+   用 `git log --format=%s` + `%b` 重组会丢掉末尾换行 → SHA 不同。
+3. author/committer 用 `git cat-file commit` 里的原始 `unix timestamp + tz`，
+   转 ISO8601 传入即可（GitHub 会原样存储为同一 tz）。
+
+覆盖远端 ref 前必须先校验**远端与本地文件路径集合一致**（`git ls-tree -r --name-only`），
+否则有覆盖他人提交的风险。
