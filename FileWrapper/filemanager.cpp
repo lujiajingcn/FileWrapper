@@ -871,6 +871,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     // 路径去重：展开归档后很容易撞名（归档里已有 photo.png，同时又选中了 photo.png）。
     // 撞名时在扩展名前加 " (2)"、" (3)"…，与原有条目区分开。
+    int nRenamedTotal = 0;
     {
         QSet<QString> used;
         int nRenamed = 0;
@@ -894,6 +895,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             s.sStoredPath = candidate;
             used.insert(candidate.toLower());
         }
+        nRenamedTotal = nRenamed;
         if (nRenamed > 0)
             qWarning() << "[Merge] 有" << nRenamed << "个条目路径重复，已自动改名";
     }
@@ -1015,6 +1017,9 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     if (nArchiveEntries > 0)
         sDone += tr("\n其中 %1 个条目来自 %2 个已合并归档（已先拆分再合并，不是嵌套归档）。")
                      .arg(nArchiveEntries).arg(nArchiveInputs);
+    if (nRenamedTotal > 0)
+        sDone += tr("\n另有 %1 个条目路径重复，已自动加 \" (2)\" 等后缀改名。")
+                     .arg(nRenamedTotal);
     finish(true, sDone);
 }
 

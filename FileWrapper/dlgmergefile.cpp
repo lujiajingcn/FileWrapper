@@ -6,6 +6,7 @@
 #include <QDirIterator>
 #include <QShortcut>
 #include <QTreeView>
+#include <QScreen>
 
 #include <algorithm>
 #include <functional>
@@ -18,7 +19,10 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 
-    resize(1000, 600);
+    // 自适应尺寸：固定 1000×600 在小屏/高缩放下可能超出可用区域（4K@150% 实测 1500×900）
+    const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 800);
+    resize(qMin(1000, qMax(720, avail.width() - 80)),
+           qMin(600, qMax(420, avail.height() - 80)));
 
     m_hModelFilePath = new QStandardItemModel;
     m_hModelFilePath->setColumnCount(1);

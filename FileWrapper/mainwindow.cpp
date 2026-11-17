@@ -150,6 +150,19 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(m_fileManager, &FileManager::warningOccurred,
             this, &MainWindow::onFileManagerWarning);
 
+    // 常用快捷键（P2）：Ctrl+O 加载、Ctrl+M 合并、Ctrl+S 保存、Ctrl+E 导出、Ctrl+U 卸载
+    auto addShortcut = [this](const QKeySequence &seq, auto slot) {
+        auto *pAction = new QAction(this);
+        pAction->setShortcut(seq);
+        connect(pAction, &QAction::triggered, this, slot);
+        addAction(pAction);
+    };
+    addShortcut(QKeySequence::Open, &MainWindow::on_actionLoadFile_triggered);
+    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_M), &MainWindow::on_actionMergeFile_triggered);
+    addShortcut(QKeySequence::Save, &MainWindow::onActionSaveFileTriggered);
+    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_E), &MainWindow::onActionOutputFileTriggered);
+    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_U), &MainWindow::on_actionUnloadFile_triggered);
+
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
     QAction *actVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
     actVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
@@ -448,7 +461,8 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
             QPushButton *bList   = box.addButton(QStringLiteral("查看支持的格式…"), QMessageBox::ActionRole);
             QPushButton *bMap    = box.addButton(QStringLiteral("设置插件映射…"), QMessageBox::ActionRole);
             QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
-            box.setDefaultButton(bText);
+            // 默认按钮用「取消」：避免回车误触发"以文本查看"把二进制内容灌进文本视图
+            box.setDefaultButton(bCancel);
             box.exec();
 
             QAbstractButton *clicked = box.clickedButton();
@@ -1363,7 +1377,8 @@ void MainWindow::on_actionLoadFile_triggered()
     QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
     Q_UNUSED(vtFileInfos);
 
-    m_hModelFilePath->setHeaderData(0, Qt::Horizontal, sFileName);
+    m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
+    setWindowTitle(tr("文件查看器 - %1").arg(QFileInfo(sFileName).fileName()));
     m_tvFilePath->header()->setVisible(true);
 
     // 加载成功后重置所有已打开的文件标签页（旧归档的文件路径已失效）
@@ -2116,6 +2131,7 @@ void MainWindow::on_actionUnloadFile_triggered()
     m_fileManager->unLoadMergedFile();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     m_tvFilePath->header()->setVisible(false);
+    setWindowTitle(tr("文件查看器"));
     syncActionStates();
 
     // 卸载归档后关闭所有已打开的文件标签页
