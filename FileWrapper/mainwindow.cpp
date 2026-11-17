@@ -31,6 +31,7 @@
 #include <QStatusBar>
 #include <QDateTime>
 #include <QSettings>
+#include <QMouseEvent>
 
 // 超过该阈值的文件优先走「临时文件 + 路径」通道，避免整块载入内存（P1-2）
 static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
@@ -177,8 +178,11 @@ MainWindow::~MainWindow()
         destroyTabAt(i);
     cleanupTempFiles();
 
+    if (m_tvFilePath)
+        m_tvFilePath->viewport()->removeEventFilter(this);
     delete m_fileManager;
     delete m_hModelFilePath;
+    m_hModelFilePath = nullptr;
     delete ui;
 }
 
@@ -259,6 +263,11 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_tvFilePath, &QTreeView::customContextMenuRequested,
             this, &MainWindow::onTreeViewCustomContextMenu);
+
+    // 关闭 QTreeView 自带的「双击展开/折叠」，改由 eventFilter 统一处理：
+    // 自带行为会在业务侧 setExpanded() 之后再次翻转节点，两者互相抵消。
+    m_tvFilePath->setExpandsOnDoubleClick(false);
+    m_tvFilePath->viewport()->installEventFilter(this);
 }
 
 // 初始化【文件内容】窗口（多标签页）
@@ -751,6 +760,14 @@ void MainWindow::onActionNewTabTriggered()
 
 void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
 {
+    handleFileListDoubleClick(index);
+}
+
+// 文件列表双击的统一处理：
+//   目录节点 -> 展开 / 收起该节点（不打开文件）
+//   文件节点 -> 在当前激活的标签页打开该文件
+void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
+{
     if (!index.isValid())
         return;
 
@@ -765,6 +782,33 @@ void MainWindow::on_treeView_doubleClicked(const QModelIndex &index)
     // 双击：在当前激活的标签页打开选中的记录项文件
     FILEINFO fInfo = pItem->data().value<FILEINFO>();
     openFileInCurrentTab(fInfo);
+}
+
+// 事件过滤器：在文件列表 viewport 上直接接管「鼠标双击」。
+//
+// 为什么不能只依赖 doubleClicked 信号：
+// 1) QAbstractItemView 只有在按下时该行「已经是 currentIndex」才会把双击
+//    派发成 doubleClicked。第一次双击一个尚未选中的行会被静默丢弃 ——
+//    表现为「双击文件夹毫无反应」，其实第一次双击只是把它选中了。
+// 2) QTreeView 自带的 expandsOnDoubleClick（默认为 true）会在业务侧
+//    setExpanded() 之后再次展开/折叠该节点，两者互相抵消 ——
+//    表现为「双击文件夹展开后立刻又合上」。
+// 在 viewport 层接管双击可同时绕开这两个问题，且对目录与文件一视同仁。
+bool MainWindow::eventFilter(QObject *obj, QEvent *event)
+{
+    if (m_tvFilePath && m_hModelFilePath
+        && obj == m_tvFilePath->viewport()
+        && event->type() == QEvent::MouseButtonDblClick)
+    {
+        QMouseEvent *me = static_cast<QMouseEvent *>(event);
+        const QModelIndex index = m_tvFilePath->indexAt(me->position().toPoint());
+        if (index.isValid())
+        {
+            handleFileListDoubleClick(index);
+            return true;   // 已处理，不再走 QTreeView 默认的双击逻辑
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
 }
 
 bool MainWindow::confirmDiscardOrSaveIfDirty()
@@ -1272,6 +1316,15 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
     m_pActiveProgress = dlg;
     *pbOk = false;
     psResultMsg->clear();
+
+    // 进度文字左对齐，让「正在合并:」「正在分割:」这类固定前缀稳定贴在左侧。
+    //
+    // QProgressDialog 的状态 label 默认是 AlignHCenter。对话框宽度在首次 show 后固定，
+    // 但状态文本长度随「正在合并: <文件名> (<已写>/<总量>)」变化，文本越宽、居中后
+    // 起始位置越靠左，于是「正在合并:」这几个字会随着文件名长短左右漂移。
+    // 改为左对齐后前缀始终停在左侧，且与下方进度条左端对齐。
+    if (QLabel *pStatusLabel = dlg->findChild<QLabel*>())
+        pStatusLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
     m_connProgress = connect(m_fileManager, &FileManager::progressChanged, this,
         [this](qint64 cur, qint64 total, const QString &status) {

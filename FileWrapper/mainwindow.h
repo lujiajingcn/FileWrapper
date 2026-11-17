@@ -69,6 +69,8 @@ protected:
     bool FindFile(const QString sDir, QStringList& arrFileExts, QStringList& arrFiles, bool bSubDir);
     bool CheckFileExt(QString sFileName, QStringList& arrFileExts);
     QString choosePlugin(QString sFileExt);
+    // 事件过滤器：接管文件列表的鼠标双击（绕开 QAbstractItemView 对首次双击的丢弃）
+    bool eventFilter(QObject *obj, QEvent *event) override;
     void populateFilePathView(bool bShowPath);
     void refreshFilePathView();
     void populateFilePathList(bool bShowPath);
@@ -82,6 +84,8 @@ protected:
     void collectExpandedItems(const QModelIndex &index, const QString &sKeyPrefix, QSet<QString> &setExpanded);
     void restoreExpandedItems(const QModelIndex &index, const QString &sKeyPrefix, const QSet<QString> &setExpanded);
     bool confirmDiscardOrSaveIfDirty();
+    // 文件列表双击的统一处理（目录 -> 展开/收起，文件 -> 打开）
+    void handleFileListDoubleClick(const QModelIndex &index);
 
     // 长操作的进度对话框连接管理（避免每次 disconnect 掉其它常驻连接）
     void beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QString *psResultMsg);
