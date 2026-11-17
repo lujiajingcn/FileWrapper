@@ -3,6 +3,12 @@
 
 // Qt6 已移除 QTextCodec；本地编码回退改用 QString::fromLocal8Bit
 #include <QFileInfo>
+#include <QLineEdit>
+#include <QShortcut>
+#include <QTextDocument>
+#include <QToolBar>
+#include <QStatusBar>
+#include <QAction>
 #include <cstring>
 #include <algorithm>
 #include <limits>
@@ -12,6 +18,74 @@ MainWindow::MainWindow(QWidget *parent) :
     ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
+
+    // 查找栏：工具栏里放搜索框 + 上一个/下一个；Ctrl+F 聚焦搜索框，F3 / Shift+F3 循环查找
+    auto *pSearch = new QLineEdit(this);
+    pSearch->setPlaceholderText(tr("查找…"));
+    pSearch->setClearButtonEnabled(true);
+    pSearch->setMaximumWidth(240);
+    ui->mainToolBar->addWidget(pSearch);
+    QAction *pFindPrev = ui->mainToolBar->addAction(tr("上一个"));
+    QAction *pFindNext = ui->mainToolBar->addAction(tr("下一个"));
+
+    connect(pSearch, &QLineEdit::returnPressed, this, [this, pSearch]() {
+        findText(pSearch->text(), true);
+    });
+    connect(pFindPrev, &QAction::triggered, this, [this, pSearch]() {
+        findText(pSearch->text(), false);
+    });
+    connect(pFindNext, &QAction::triggered, this, [this, pSearch]() {
+        findText(pSearch->text(), true);
+    });
+
+    auto *pScFind = new QShortcut(QKeySequence::Find, this);
+    connect(pScFind, &QShortcut::activated, this, [pSearch]() {
+        pSearch->setFocus();
+        pSearch->selectAll();
+    });
+    auto *pScNext = new QShortcut(QKeySequence::FindNext, this);
+    connect(pScNext, &QShortcut::activated, this, [this, pSearch]() {
+        if (!pSearch->text().isEmpty()) findText(pSearch->text(), true);
+    });
+    auto *pScPrev = new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_F3), this);
+    connect(pScPrev, &QShortcut::activated, this, [this, pSearch]() {
+        if (!pSearch->text().isEmpty()) findText(pSearch->text(), false);
+    });
+}
+
+// 在当前文本里查找；找不到时自动从头（或从尾）再找一次，实现循环查找
+bool MainWindow::findText(const QString &sText, bool bForward)
+{
+    if (sText.isEmpty())
+        return false;
+
+    QTextDocument *pDoc = ui->textEdit->document();
+    QTextCursor c = ui->textEdit->textCursor();
+    QTextDocument::FindFlags flags;
+    if (!bForward)
+        flags |= QTextDocument::FindBackward;
+
+    QTextCursor found = pDoc->find(sText, c, flags);
+    if (found.isNull())
+    {
+        QTextCursor start(pDoc);
+        if (!bForward)
+            start.movePosition(QTextCursor::End);
+        found = pDoc->find(sText, start, flags);
+    }
+
+    if (!found.isNull())
+    {
+        ui->textEdit->setTextCursor(found);
+        ui->textEdit->ensureCursorVisible();
+        statusBar()->showMessage(tr("找到：%1").arg(sText), 2000);
+    }
+    else
+    {
+        statusBar()->showMessage(tr("未找到：%1").arg(sText), 3000);
+    }
+    ui->textEdit->setFocus();
+    return !found.isNull();
 }
 
 MainWindow::~MainWindow()

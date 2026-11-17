@@ -24,6 +24,9 @@ public:
     // 主程序在送数据前告知文件名：.html/.htm 用富文本渲染，其它仍按纯文本显示
     void setSourceName(const QString &name) { m_sourceName = name; }
 
+    // 在当前文本中查找（Ctrl+F / F3 / 工具栏），找不到时自动从头/尾循环一次
+    bool findText(const QString &sText, bool bForward = true);
+
 private:
     // 按编码（BOM -> UTF-8 -> 系统本地编码 GBK）解码文本，避免 .sql 等文件乱码
     static QString decodeText(const QByteArray &data);
