@@ -6,6 +6,9 @@
 
 QT       += core gui
 
+# 插件接口头放在仓库根 include/：主程序与插件都从那里取，接口单一来源
+INCLUDEPATH += $$PWD/../include
+
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 TARGET = FileWrapper
@@ -34,7 +37,8 @@ SOURCES += \
         filemanager.cpp \
         main.cpp \
         mainwindow.cpp \
-        pluginmanager.cpp
+        pluginmanager.cpp \
+        plugindiag.cpp
 
 HEADERS += \
         archiveformat.h \
@@ -46,8 +50,9 @@ HEADERS += \
         dlgsplitfile.h \
         filemanager.h \
         mainwindow.h \
-        plugininterface.h \
-        pluginmanager.h
+        $$PWD/../include/plugininterface.h \
+        pluginmanager.h \
+        plugindiag.h
 
 FORMS += \
         dlgabout.ui \
@@ -61,35 +66,16 @@ qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
-# 部署 ffmpeg 运行库到 exe 同级目录，使 PluginMedia 视频插件能被 QPluginLoader 正确加载
-# （PluginMedia.dll 链接 avcodec/avformat/avutil/swresample/swscale，这些 DLL 既不在 Qt 也不在 PATH 中，
-#   缺失时 QPluginLoader 加载失败 -> 取插件接口为 null -> 程序报"获取插件接口失败"）
-win32 {
-    FFMPEG_BIN = $$PWD/../../ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-shared-8.1/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-shared-8.1/bin
-    CONFIG(debug, debug|release) {
-        FFMPEG_DST = $$OUT_PWD/debug
-    } else {
-        FFMPEG_DST = $$OUT_PWD/release
-    }
-
-    # 部署这 5 个 DLL 有两条必须遵守的规则，任一出错都会让 PluginMedia.dll 加载失败
-    # （缺 avformat/swresample/swscale → QPluginLoader 报"找不到指定的模块" → 取不到插件接口）：
-    #
-    # 规则 1：路径必须是 Windows 反斜杠形式。
-    #   cmd.exe 的内置 copy 不认正斜杠路径，"copy /y "E:/a/b.dll" "E:/dst"" 会报
-    #   「系统找不到指定的文件。已复制 0 个文件。」并且静默不报错。
-    #   $$shell_path() 负责在 Windows 上把 / 归一化成 \（换机器/换盘符都不受影响）。
-    #
-    # 规则 2：每条 copy 必须独占一行。
-    #   不能用 ";" 串联：";" 在 sh 里是命令分隔符，在 cmd.exe 里不是 ——
-    #   用 ";" 会导致只有第 1 个 DLL 被拷贝，其余 4 个静默丢失。
-    #   $$escape_expand(\\n\\t) 让 qmake 为每条命令生成独立的一行 recipe。
-    FFMPEG_BIN = $$shell_path($$FFMPEG_BIN)
-    FFMPEG_DST = $$shell_path($$FFMPEG_DST)
-
-    QMAKE_POST_LINK = $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avcodec-62.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
-        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avformat-62.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
-        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/avutil-60.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
-        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/swresample-6.dll)\" \"$$FFMPEG_DST\" || echo skip$$escape_expand(\\n\\t) \
-        $$QMAKE_COPY \"$$shell_path($$FFMPEG_BIN/swscale-9.dll)\" \"$$FFMPEG_DST\" || echo skip
-}
+# ============================================================================
+# 插件运行时依赖部署（2026-11-17 统一）
+#
+# 以前这里单独复制 ffmpeg 的 5 个 DLL，PluginPdf.pro 复制 Qt6Pdf/Qt6Network，
+# PluginWord.pro 复制 Qt6Xml —— 三处零散、责任不清，而且 Qt6Multimedia.dll
+# （PluginMedia 的音频输出依赖）根本没人复制：开发机 PATH 里有 Qt bin 所以看不出来，
+# 换台机器就「插件加载失败」，程序还不给任何提示。
+#
+# 现在：依赖清单一律写在 deploy/plugin-deps.manifest（唯一来源），链接完成后由
+# deploy/deploy-deps.ps1 统一复制到 exe 目录，并生成 plugin-deploy-manifest.txt
+# 供程序自检（见 plugindiag.cpp）。新增插件依赖只改 manifest，不要再写 POST_LINK。
+# ============================================================================
+include(deploy.pri)

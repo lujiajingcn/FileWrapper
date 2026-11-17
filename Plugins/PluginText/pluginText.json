@@ -1,7 +1,15 @@
 {
     "Name":"pluginText",
-    "Version":"0.0.1",
+    "Version":"0.1.0",
     "Author" : "lujiajing",
     "Date":"2023-07-09",
-    "Description":"used by filewrapper, handling text"
+    "apiVersion":3,
+    "extensionPriority":10,
+    "extensions":[
+        "txt", "log", "md", "markdown", "csv", "ini", "cfg", "conf",
+        "json", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx",
+        "py", "java", "c", "cpp", "cc", "h", "hpp", "cs", "go", "rb",
+        "php", "sh", "bat", "ps1", "yml", "yaml", "toml", "sql", "tex", "rst"
+    ],
+    "Description":"纯文本查看插件（按 BOM/UTF-8/本地编码解码）。extensions 取代了原先写死在主程序 choosePlugin() 里的后缀表。"
 }

@@ -1,7 +1,14 @@
 {
     "Name":"pluginMedia",
-    "Version":"0.0.1",
+    "Version":"0.1.0",
     "Author" : "lujiajing",
     "Date":"2023-07-09",
-    "Description":"used by filewrapper, handling video and audio"
+    "apiVersion":3,
+    "extensions":[
+        "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm",
+        "mpg", "mpeg", "ts", "3gp", "3g2", "ogv", "vob", "asf", "rm", "rmvb",
+        "mp3", "wav", "wma", "aac", "m4a", "flac", "ogg", "opus",
+        "amr", "aiff", "ape", "ac3"
+    ],
+    "Description":"基于 FFmpeg 的音视频播放插件（含独立解码线程与音频输出）。extensions 取代了原先写死在主程序 choosePlugin() 里的后缀表。"
 }

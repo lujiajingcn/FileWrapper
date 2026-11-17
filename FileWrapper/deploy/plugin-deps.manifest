@@ -1,0 +1,49 @@
+// ============================================================================
+// 插件运行时依赖清单（唯一来源 / single source of truth）
+//
+// 痛点（2026-11-17 实测）：本工程几乎所有插件都依赖「主程序本身不链」的运行库，
+// 例如 PluginMedia 要 Qt6Multimedia + ffmpeg、PluginPdf 要 Qt6Pdf/Qt6Network、
+// PluginBook/PluginWord 要 Qt6Xml。此前这些依赖靠三处零散的 QMAKE_POST_LINK
+// 分别复制（FileWrapper.pro 里复制 ffmpeg、PluginPdf.pro 复制 Qt6Pdf、
+// PluginWord.pro 复制 Qt6Xml），而且 Qt6Multimedia 根本没人复制 —— 开发机上
+// 因为 PATH 里有 Qt bin 所以看不出问题，脱离 IDE 换台机器就会「插件加载失败」，
+// 程序又不给任何提示（双击文件毫无反应）。
+//
+// 现在：新增/调整插件依赖只改这个文件，构建末尾由 deploy/deploy-deps.ps1 统一复制，
+// 并写出一份「运行时清单」plugin-deploy-manifest.txt 到程序目录，
+// 供程序自检（Plugins 诊断）使用。
+//
+// 格式（UTF-8）：kind|源|目标相对路径|说明
+//   kind = qt-bin   Qt 安装目录 bin/ 下的文件
+//        = qt-plug  Qt 安装目录 plugins/ 下的文件（源路径含分类子目录）
+//        = ffmpeg   FFMPEG 发行包 bin/ 下的文件
+//        = repo     仓库根目录下的文件
+// 说明会原样写进运行时清单，缺依赖时显示给用户。
+// ============================================================================
+
+// ---- Qt 模块：只有插件用到，主程序本身不链 ----
+qt-bin|Qt6Xml.dll|Qt6Xml.dll|OOXML 解析：PluginWord（.docx）、PluginBook（.epub）
+qt-bin|Qt6Pdf.dll|Qt6Pdf.dll|PDF 渲染：PluginPdf（QPdfDocument）
+qt-bin|Qt6Network.dll|Qt6Network.dll|Qt6Pdf 的运行依赖（加载时自动链入）
+qt-bin|Qt6Multimedia.dll|Qt6Multimedia.dll|音频输出：PluginMedia（QAudioSink/QAudioOutput）
+
+// ---- Qt 插件：程序/插件运行期按需加载 ----
+qt-plug|platforms/qwindows.dll|platforms/qwindows.dll|Qt 平台插件：程序启动必需
+qt-plug|styles/qmodernwindowsstyle.dll|styles/qmodernwindowsstyle.dll|Windows 11 原生控件样式（缺省退回 Fusion 外观）
+qt-plug|imageformats/qjpeg.dll|imageformats/qjpeg.dll|JPEG 解码：图片插件 + docx/pptx 内嵌 jpg
+qt-plug|imageformats/qgif.dll|imageformats/qgif.dll|GIF 解码：图片插件 + 内嵌 gif
+qt-plug|imageformats/qwebp.dll|imageformats/qwebp.dll|WebP 解码：图片插件
+qt-plug|multimedia/windowsmediaplugin.dll|multimedia/windowsmediaplugin.dll|Windows 音频设备插件：PluginMedia 出声必需
+
+// ---- 第三方运行库：PluginMedia（FFmpeg 共享库）----
+ffmpeg|avcodec-62.dll|avcodec-62.dll|音视频解码：PluginMedia
+ffmpeg|avformat-62.dll|avformat-62.dll|音视频封装解析：PluginMedia
+ffmpeg|avutil-60.dll|avutil-60.dll|FFmpeg 公共工具库：PluginMedia
+ffmpeg|swresample-6.dll|swresample-6.dll|音频重采样：PluginMedia
+ffmpeg|swscale-9.dll|swscale-9.dll|视频像素格式转换：PluginMedia
+
+// ---- 备注 ----
+// 主程序自身的 Qt6Core/Qt6Gui/Qt6Widgets 与 MinGW 运行时不在此清单内：
+// 它们属于「程序本体能否启动」的前提，正式打包应先跑 windeployqt，再执行本清单。
+// Plugins/PluginPdf/lib/Qt5Pdfium.dll 是迁移到 Qt6 QtPdf 之前的遗留文件，
+// PluginPdf.pro 已不链接它，因此不进清单。

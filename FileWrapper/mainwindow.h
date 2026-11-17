@@ -58,6 +58,9 @@ private slots:
     void onFileManagerWarning(const QString &sMsg);
     void on_actionAbout_triggered();
     void on_actionPluginMap_triggered();
+    void onActionPluginDiagnosticsTriggered();
+    void onActionPluginManagerTriggered();
+    void onActionReloadPluginsTriggered();
     void on_actionUnloadFile_triggered();
 
     void onTabCloseRequested(int index);
@@ -92,7 +95,9 @@ protected:
     void endProgressOperation();
 
     // 大文件：流式抽取到临时文件后把路径交给插件，避免全量内存
-    bool extractToTempFile(const FILEINFO &info, QString &sOutPath, QString &sErr);
+    // pbNoSpace 输出"失败原因是磁盘空间不足"（此时不能退回内存通道）
+    bool extractToTempFile(const FILEINFO &info, QString &sOutPath, QString &sErr,
+                           bool *pbNoSpace = nullptr);
     void cleanupTempFiles();
     void discardTempCache();
 
@@ -128,6 +133,8 @@ private:
 
     QVector<TabDoc>          m_vTabDocs;
     QSet<QWidget*>           m_setPluginWidgets;
+    // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗
+    QSet<QString>            m_setWarnedPlugins;
     QSet<QString>            m_setTempFiles;
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用
     QStringList              m_listTempOrder;   // 创建顺序，用于上限淘汰
@@ -147,6 +154,18 @@ private:
     void closeAllTabs();
     void newEmptyTab();
     bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);
+
+    // 插件不可用时的提示与兜底：显示可读原因 + 部署自检结果，允许「重试加载」或
+    // 「以文本查看」。返回可用模板实例；nullptr 表示用户放弃（此时 *pbUseBuiltinText
+    // 为 true 表示应改用内置文本查看器）。
+    PluginInterface *promptPluginUnavailable(const QString &sPluginPath, const QString &sFileName,
+                                             bool *pbUseBuiltinText);
+    // 「插件设置 → 插件诊断」：列出已加载插件、加载失败原因与缺失的部署依赖
+    void showPluginDiagnostics();
+    // 「插件设置 → 插件管理」：勾选启用/禁用插件（C5）
+    void showPluginManagerDialog();
+    // 释放所有标签页后让 PluginManager 重新扫描 plugins/（C5）
+    void reloadAllPlugins();
 
     Ui::MainWindow *ui;
 };

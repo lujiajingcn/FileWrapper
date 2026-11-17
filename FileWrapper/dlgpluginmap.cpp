@@ -1,4 +1,5 @@
 #include "dlgpluginmap.h"
+#include "pluginmanager.h"
 
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -13,6 +14,7 @@
 #include <QSettings>
 #include <QDir>
 #include <QApplication>
+#include <QLibrary>
 #include <QMessageBox>
 #include <QFileInfo>
 
@@ -20,17 +22,27 @@ static const char *kGroup = "PluginMap";
 
 QStringList DlgPluginMap::availablePluginNames()
 {
-    QStringList names;
-    QDir dir(QApplication::applicationDirPath() + QStringLiteral("/plugins"));
-    if (dir.exists())
+    // 插件逻辑名以 PluginManager 的注册表为准（C1 起含 sidecar 里的信息）：
+    // 即使某个插件当前加载失败，"插件设置 → 插件映射" 里仍然能看到并指定它。
+    QStringList names = PluginManager::getInstance()->knownPluginIds();
+
+    if (names.isEmpty())
     {
-        const QStringList dlls = dir.entryList(QStringList() << QStringLiteral("*.dll"), QDir::Files);
-        for (const QString &d : dlls)
+        // 兜底：插件管理器尚未扫描过（异常启动路径）时退回目录扫描
+        QDir dir(QApplication::applicationDirPath() + QStringLiteral("/plugins"));
+        if (dir.exists())
         {
-            const QString base = QFileInfo(d).completeBaseName();
-            if (!base.startsWith(QStringLiteral("lib"), Qt::CaseInsensitive)) names << base;
+            const QStringList files = dir.entryList(QDir::Files);
+            for (const QString &f : files)
+            {
+                if (!QLibrary::isLibrary(f)) continue;
+                QString base = QFileInfo(f).completeBaseName();
+                if (base.startsWith(QStringLiteral("lib"), Qt::CaseInsensitive)) base.remove(0, 3);
+                names << base;
+            }
         }
     }
+
     names << QStringLiteral("builtin://text") << QStringLiteral("builtin://hex");
     names.removeDuplicates();
     names.sort(Qt::CaseInsensitive);

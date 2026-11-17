@@ -20,6 +20,10 @@ public:
     void sendFileData(char *szFileData, qint64 nFileLen) override;
     QWidget *getPluginWidget() override;
     void setSourceName(const QString &name) override;
+    // 内置查看器与主程序同版本：直接跟随 PLUGIN_API_VERSION（B1）
+    int apiVersion() const override { return PLUGIN_API_VERSION; }
+    // 主程序直接 new 它（不经过 createInstance），但接口要求实现（B2）
+    PluginInterface *createInstance() override { return new BuiltinViewer(m_mode); }
 
 private:
     // C++17：static constexpr 成员隐含 inline，被 qMin 按引用使用（ODR-use）时

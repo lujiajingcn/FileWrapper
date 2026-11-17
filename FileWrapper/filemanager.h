@@ -31,6 +31,10 @@ public:
     void QLoadMergedFile(QString sFilePath);
     void unLoadMergedFile();
     void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
+
+    // C2：直接读出条目内容（不经过 new char[] + delete[] 的中转）。
+    // 校验语义与 QGetFileContent 一致（大小、完整性、v2 内容 CRC）；失败时 psErr 给原因。
+    QByteArray entryContent(const QString &sFilePath, QString *psErr = nullptr);
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
@@ -57,6 +61,12 @@ public:
 
     // 读取任意归档的元数据（不做状态变更），供分割「按原路径」二次确认展示
     static bool inspectArchive(const QString &sPath, FwArc::Meta &meta, QString &sErr);
+
+    // 磁盘空间预检（B4）：判断 dirPath 所在磁盘能否放下 needBytes（调用方自行加预留余量）。
+    // 拿不到磁盘信息时返回 true（不拦；真写不下还有写入错误兜底）。
+    // pAvailable 输出可用字节数（拿不到时为 -1）。可单测：传入极大 needBytes 必为 false。
+    static bool hasFreeSpaceFor(const QString &dirPath, qint64 needBytes,
+                                qint64 *pAvailable = nullptr);
 
     // 大文件流式抽取到临时文件（P1-2）：不一次性占用全量内存
     bool extractEntryToTempFile(const QString &sDisplayName, const QString &sOutPath,

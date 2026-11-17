@@ -307,6 +307,25 @@ bool FileManager::validateMergedFile(QString sFilePath, QString *psErrMsg)
     return ok;
 }
 
+// B4：临时副本写入前的磁盘空间预检。
+// 大条目（几十 GB）复制到临时目录时，如果空间不够，以前要写到一半才失败，
+// 只留一句系统错误；这里先算清楚再把可读结论交给调用方。
+bool FileManager::hasFreeSpaceFor(const QString &dirPath, qint64 needBytes, qint64 *pAvailable)
+{
+    if (pAvailable) *pAvailable = -1;
+
+    const QString sPath = dirPath.isEmpty() ? QDir::tempPath() : dirPath;
+    const QStorageInfo si(sPath);
+    if (!si.isValid() || !si.isReady())
+        return true;                        // 拿不到磁盘信息：不拦，让写入错误兜底
+
+    const qint64 nAvail = si.bytesAvailable();
+    if (pAvailable) *pAvailable = nAvail;
+    if (needBytes <= 0)
+        return true;
+    return nAvail >= needBytes;
+}
+
 bool FileManager::inspectArchive(const QString &sPath, FwArc::Meta &meta, QString &sErr)
 {
     QFile f(sPath);
@@ -1310,6 +1329,101 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 // ============================================================
 // 读取与导出（P1-2 / P1-7 / P3-2）
 // ============================================================
+
+// C2：直接读出条目内容到 QByteArray，省掉"new char[] -> 插件再复制一份"的中转。
+// 与 QGetFileContent() 的校验语义保持一致（大小、完整性、v2 内容 CRC）；
+// 两者共用同一套归档/待保存文件解析逻辑，改动时请同步。
+QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
+{
+    if (psErr) psErr->clear();
+
+    auto it = m_mapFileInfos.find(sFilePath);
+    if (it == m_mapFileInfos.end())
+    {
+        if (psErr) *psErr = tr("归档内未找到文件：%1").arg(sFilePath);
+        return QByteArray();
+    }
+
+    const FILEINFO fi = it.value();
+    if (fi.nFileLen < 0)
+    {
+        if (psErr) *psErr = tr("文件大小异常：%1").arg(sFilePath);
+        return QByteArray();
+    }
+    if (fi.nFileLen == 0)
+        return QByteArray();                        // 0 字节是合法情况
+
+    QFile *pSrc = nullptr;
+    QFile  diskSrc;
+    qint64 srcPos = 0;
+    if (m_setPendingFiles.contains(sFilePath))
+    {
+        diskSrc.setFileName(sFilePath);
+        if (!diskSrc.open(QIODevice::ReadOnly))
+        {
+            if (psErr) *psErr = tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString());
+            return QByteArray();
+        }
+        pSrc = &diskSrc;
+        srcPos = 0;
+    }
+    else
+    {
+        if (!m_qFile.isOpen())
+        {
+            if (psErr) *psErr = tr("归档文件未打开");
+            return QByteArray();
+        }
+        pSrc = &m_qFile;
+        srcPos = fi.nContentPositon;
+    }
+
+    QByteArray out;
+    try
+    {
+        out.resize(qsizetype(fi.nFileLen));
+    }
+    catch (const std::bad_alloc &)
+    {
+        if (psErr) *psErr = tr("内存不足，无法一次性读取 %1（%2）。请改用导出或分割功能。")
+                                .arg(fi.sFileName, FwArc::formatSize(fi.nFileLen));
+        return QByteArray();
+    }
+
+    if (!pSrc->seek(srcPos))
+    {
+        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, pSrc->errorString());
+        return QByteArray();
+    }
+
+    qint64 done = 0;
+    while (done < fi.nFileLen)
+    {
+        const qint64 n = qMin<qint64>(fi.nFileLen - done, MAXBUFFERSIZE);
+        const qint64 got = pSrc->read(out.data() + done, n);
+        if (got <= 0)
+        {
+            if (psErr) *psErr = tr("读取文件内容不完整：%1（期望 %2 B，实际 %3 B）")
+                                    .arg(sFilePath).arg(fi.nFileLen).arg(done);
+            return QByteArray();
+        }
+        done += got;
+    }
+
+    if (m_mapContentCrc.contains(sFilePath))
+    {
+        FwArc::Crc32 c;
+        c.update(out.constData(), fi.nFileLen);
+        if (c.value() != m_mapContentCrc.value(sFilePath))
+        {
+            if (psErr) *psErr = tr("内容校验失败（CRC32 不匹配）：%1\n该文件可能已损坏。").arg(sFilePath);
+            return QByteArray();
+        }
+    }
+
+    if (psErr) psErr->clear();
+    return out;
+}
 
 void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen)
 {

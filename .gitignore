@@ -64,6 +64,9 @@ qrc_*.cpp
 /.workbuddy/FileWrapper/debug/
 /.workbuddy/FileWrapper/release/
 
+# --- 测试构建产物（tests/ 的源码与素材入库，构建与日志不入库）---
+/tests/build/
+
 # --- 日志与操作系统垃圾文件 ---
 *.log
 Thumbs.db

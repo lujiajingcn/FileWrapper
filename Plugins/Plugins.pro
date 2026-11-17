@@ -5,4 +5,5 @@ SUBDIRS += \
     PluginPicture \
     PluginText  \
     PluginMedia \
-    PluginPdf
+    PluginPdf \
+    PluginWord

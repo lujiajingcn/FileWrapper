@@ -39,8 +39,10 @@ LIBS += $$PWD/lib/libavcodec.dll.a \
         $$PWD/lib/libswscale.dll.a
 
 # 插件始终输出到主程序 exe 同级的 plugins/ 目录（自动适配 debug/release 与构建根目录）
-debug:   DESTDIR = $$OUT_PWD/../../FileWrapper/debug/plugins
-release: DESTDIR = $$OUT_PWD/../../FileWrapper/release/plugins  # 输出目录
+# 公共设置（输出目录 + 插件元数据 sidecar：plugins/<DLL基名>.json）
+PLUGIN_METADATA_JSON = $$PWD/pluginMedia.json
+PLUGIN_CLASS_HEADER  = $$PWD/pluginmedia.h
+include(../plugin_common.pri)
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

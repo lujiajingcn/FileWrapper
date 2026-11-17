@@ -9,6 +9,7 @@
 #include "dlgpluginmap.h"
 #include "builtinviewer.h"
 #include "pluginmanager.h"
+#include "plugindiag.h"
 #include <QDebug>
 #include "dlgabout.h"
 #include <QVariant>
@@ -16,6 +17,10 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QAbstractButton>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QProgressDialog>
 #include <QMenu>
 #include <QToolButton>
@@ -32,6 +37,7 @@
 #include <QDateTime>
 #include <QSettings>
 #include <QMouseEvent>
+#include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 
 // 超过该阈值的文件优先走「临时文件 + 路径」通道，避免整块载入内存（P1-2）
 static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
@@ -146,6 +152,31 @@ MainWindow::MainWindow(QWidget *parent) :
     actVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
     connect(actVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
     ui->menu->addAction(actVerify);
+
+    // 「插件诊断」加入插件设置菜单：插件加载失败时用户能自己看到原因与缺哪个依赖
+    QAction *actPluginDiag = new QAction(QStringLiteral("插件诊断"), ui->menu_2);
+    actPluginDiag->setToolTip(QStringLiteral("查看已加载插件、加载失败原因与缺失的运行依赖"));
+    connect(actPluginDiag, &QAction::triggered, this,
+            &MainWindow::onActionPluginDiagnosticsTriggered);
+    ui->menu_2->addAction(actPluginDiag);
+
+    // 「插件管理」勾选启用/禁用、「重新加载插件」让修改生效（C5）
+    QAction *actPluginMgr = new QAction(QStringLiteral("插件管理"), ui->menu_2);
+    actPluginMgr->setToolTip(QStringLiteral("勾选启用/禁用插件；禁用的插件不加载，也不接手它的文件后缀"));
+    connect(actPluginMgr, &QAction::triggered, this, &MainWindow::onActionPluginManagerTriggered);
+    ui->menu_2->addAction(actPluginMgr);
+
+    QAction *actReloadPlugins = new QAction(QStringLiteral("重新加载插件"), ui->menu_2);
+    actReloadPlugins->setToolTip(QStringLiteral("重新扫描 plugins/ 目录（会先关闭所有标签页）"));
+    connect(actReloadPlugins, &QAction::triggered, this, &MainWindow::onActionReloadPluginsTriggered);
+    ui->menu_2->addAction(actReloadPlugins);
+
+    // 启动时若已有插件加载失败，给一条用户可见的提示（以前只进 qDebug，双击文件毫无反应）
+    const int nFailedAtStartup = PluginManager::getInstance()->failures().size();
+    if (nFailedAtStartup > 0)
+        ui->statusBar->showMessage(
+            QStringLiteral("有 %1 个插件加载失败，见「插件设置 → 插件诊断」查看原因")
+                .arg(nFailedAtStartup), 20000);
 
     // 清理上一次会话遗留的临时抽取文件。只删 24 小时以前的陈旧文件，
     // 避免误删同一台机器上另一个正在运行的实例刚抽取出来的大文件。
@@ -345,8 +376,8 @@ void MainWindow::closeAllTabs()
 }
 
 // 根据文件后缀选择插件，并为标签页准备插件实例：
-// 优先调用插件的 createInstance() 创建**独占实例**（使同类型多标签页各自独立）；
-// 返回 nullptr 时回退到插件管理器中的共享实例（bOwned=false，关闭标签页时不 delete）。
+// 三级路由：用户自定义映射 -> 插件自描述的 extensions -> 内置兜底；
+// 实例一律由 createInstance() 独占创建（B2：不再回退到共享实例）。
 bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
                                PluginInterface* &pInterface, bool &bOwned)
 {
@@ -395,21 +426,338 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
     PluginInterface *pTemplate = PluginManager::getInstance()->getInterface(sPluginPath);
     if (!pTemplate)
     {
+        // 插件不可用：给出可读原因 + 部署自检结果，并支持「重试加载 / 以文本查看」。
+        // 以前这里只有一行 qDebug，用户双击文件后没有任何反应（2026-11-17 修复）。
         qDebug() << "获取插件接口失败:" << sPluginPath;
-        return false;
+
+        bool bUseBuiltinText = false;
+        pTemplate = promptPluginUnavailable(sPluginPath, info.sFileName, &bUseBuiltinText);
+        if (bUseBuiltinText)
+        {
+            // 退回到内置文本查看器（与「未找到插件」对话框里的兜底一致）
+            pInterface = new BuiltinViewer(BuiltinViewer::TextMode);
+            bOwned = true;
+            return true;
+        }
+        if (pTemplate == nullptr)
+            return false;
     }
 
-    pInterface = pTemplate->createInstance();
-    if (pInterface)
+    QString sCreateErr;
+    pInterface = PluginManager::createInstanceFor(pTemplate, &sCreateErr);
+    if (pInterface != nullptr)
     {
         bOwned = true;
         return true;
     }
 
-    // 降级：插件不支持多实例，改用共享实例（此时同类型多标签页会共用同一内容区）
-    qWarning() << "[Plugin] 不支持多实例, 回退为共享实例:" << sPluginPath;
-    pInterface = pTemplate;
-    return true;
+    // B2：以前这里会「降级为共享实例」—— 同类型多标签页会共用同一内容区，
+    // 打开 A 文件会把 B 标签页的内容顶掉，而且只留一行 qWarning。现在按打开失败处理，
+    // 并给用户可读原因 + 文本查看兜底（与插件加载失败的处理保持一致）。
+    qWarning() << "[Plugin] 无法创建插件实例:" << sPluginPath << sCreateErr;
+
+    QMessageBox box(this);
+    box.setWindowTitle(QStringLiteral("插件不可用"));
+    box.setIcon(QMessageBox::Warning);
+    box.setText(QStringLiteral("插件「%1」无法为「%2」创建查看实例。")
+                    .arg(PluginDiagnostics::pluginDisplayName(sPluginPath),
+                         info.sFileName.isEmpty() ? QStringLiteral("该文件") : info.sFileName));
+    box.setInformativeText(sCreateErr + QStringLiteral(
+        "\n\n每个插件都必须为每个标签页创建独立实例；退化成共享实例会让多个标签页互相覆盖内容，"
+        "所以这里直接拒绝打开。"));
+    QPushButton *bText = box.addButton(QStringLiteral("以文本查看"), QMessageBox::ActionRole);
+    QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    box.setDefaultButton(bText);
+    box.exec();
+
+    if (box.clickedButton() == bText)
+    {
+        pInterface = new BuiltinViewer(BuiltinViewer::TextMode);
+        bOwned = true;
+        return true;
+    }
+    Q_UNUSED(bCancel);
+    return false;
+}
+
+// 插件不可用时的提示：显示 Qt 的原始错误 + 部署自检（缺哪些依赖、做什么用的），
+// 并提供「重试加载 / 以文本查看 / 取消」三种处理。
+// 返回：可用模板实例（重试成功后）；nullptr + *pbUseBuiltinText=true 表示改用文本查看；
+//       nullptr + *pbUseBuiltinText=false 表示用户放弃。
+PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
+                                                     const QString &sFileName,
+                                                     bool *pbUseBuiltinText)
+{
+    if (pbUseBuiltinText) *pbUseBuiltinText = false;
+
+    // C5：插件被用户禁用时，给出「去启用」的指引 —— 既不是加载失败，也不是"没插件"
+    const QString sPluginId = PluginDiagnostics::pluginId(sPluginPath);
+    if (!PluginManager::isPluginEnabled(sPluginId))
+    {
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("插件已禁用"));
+        box.setIcon(QMessageBox::Information);
+        box.setText(QStringLiteral("插件「%1」已被禁用，所以「%2」无法用默认方式打开。")
+                        .arg(PluginDiagnostics::pluginDisplayName(sPluginPath),
+                             sFileName.isEmpty() ? QStringLiteral("该文件") : sFileName));
+        box.setInformativeText(QStringLiteral(
+            "可以在「插件设置 → 插件管理」里勾选启用，再点「重新加载插件」。"));
+        QPushButton *bText = box.addButton(QStringLiteral("以文本查看"), QMessageBox::ActionRole);
+        QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(bCancel);
+        box.exec();
+        if (box.clickedButton() == bText)
+        {
+            if (pbUseBuiltinText) *pbUseBuiltinText = true;
+            m_setWarnedPlugins.insert(sPluginPath);
+            return nullptr;
+        }
+        m_setWarnedPlugins.insert(sPluginPath);
+        return nullptr;
+    }
+
+    PluginManager *pMgr = PluginManager::getInstance();
+
+    // 同一插件在本会话已经提示过、且用户当时选择放弃：不再反复弹窗打扰
+    if (m_setWarnedPlugins.contains(sPluginPath))
+        return nullptr;
+
+    for (;;)   // 用户点「重试加载」后仍失败时重新展示，直到成功或放弃
+    {
+        // 同时失败的其它插件（帮助判断是不是整批依赖都缺了，例如缺 Qt6Xml 会同时影响两个插件）
+        QStringList sOtherFailed;
+        for (const PluginManager::Failure &f : pMgr->failures())
+            if (f.path != sPluginPath)
+                sOtherFailed << PluginDiagnostics::pluginDisplayName(f.path);
+
+        const QString sReport = PluginDiagnostics::buildReport(
+                    sPluginPath, pMgr->failureFor(sPluginPath),
+                    QCoreApplication::applicationDirPath(), sOtherFailed);
+
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("插件不可用"));
+        box.setIcon(QMessageBox::Warning);
+        box.setText(QStringLiteral("无法加载插件「%1」，所以「%2」暂时打不开。")
+                        .arg(PluginDiagnostics::pluginDisplayName(sPluginPath),
+                             sFileName.isEmpty() ? QStringLiteral("该文件") : sFileName));
+        box.setInformativeText(sReport);
+        QPushButton *bRetry  = box.addButton(QStringLiteral("重试加载"), QMessageBox::AcceptRole);
+        QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::ActionRole);
+        QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        box.setDefaultButton(bRetry);
+        box.exec();
+
+        if (box.clickedButton() == bRetry)
+        {
+            pMgr->retryFailedPlugins();
+            PluginInterface *pTemplate = pMgr->getInterface(sPluginPath);
+            if (pTemplate != nullptr)
+            {
+                m_setWarnedPlugins.remove(sPluginPath);   // 恢复正常，允许以后再提示
+                return pTemplate;
+            }
+            continue;                                      // 还是不行：带着新错误再显示一次
+        }
+        if (box.clickedButton() == bText)
+        {
+            if (pbUseBuiltinText) *pbUseBuiltinText = true;
+            m_setWarnedPlugins.insert(sPluginPath);
+            return nullptr;
+        }
+        Q_UNUSED(bCancel);
+        m_setWarnedPlugins.insert(sPluginPath);
+        return nullptr;
+    }
+}
+
+void MainWindow::onActionPluginDiagnosticsTriggered()
+{
+    showPluginDiagnostics();
+}
+
+// ================= C5: 插件管理 / 重新加载 =================
+
+void MainWindow::onActionPluginManagerTriggered()
+{
+    showPluginManagerDialog();
+}
+
+void MainWindow::onActionReloadPluginsTriggered()
+{
+    reloadAllPlugins();
+}
+
+void MainWindow::showPluginManagerDialog()
+{
+    PluginManager *pMgr = PluginManager::getInstance();
+    const QStringList listIds = pMgr->knownPluginIds();
+    if (listIds.isEmpty())
+    {
+        QMessageBox::information(this, QStringLiteral("插件管理"),
+                                 QStringLiteral("没有发现任何插件（plugins/ 目录为空或不可读）。"));
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("插件管理"));
+    dlg.resize(460, 380);
+    auto *pLayout = new QVBoxLayout(&dlg);
+    auto *pTip = new QLabel(QStringLiteral(
+        "勾选 = 启用。被禁用的插件不会加载，也不会接手它声明过的文件后缀；"
+        "保存后需要「重新加载插件」才会生效。"), &dlg);
+    pTip->setWordWrap(true);
+    pLayout->addWidget(pTip);
+
+    auto *pList = new QListWidget(&dlg);
+    for (const QString &sId : listIds)
+    {
+        auto *pItem = new QListWidgetItem(sId, pList);
+        pItem->setFlags(pItem->flags() | Qt::ItemIsUserCheckable);
+        pItem->setCheckState(PluginManager::isPluginEnabled(sId) ? Qt::Checked : Qt::Unchecked);
+        if (!PluginManager::isPluginEnabled(sId))
+            pItem->setToolTip(QStringLiteral("当前被禁用"));
+    }
+    pLayout->addWidget(pList, 1);
+
+    auto *pButtons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    pLayout->addWidget(pButtons);
+    connect(pButtons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(pButtons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    bool bChanged = false;
+    for (int i = 0; i < pList->count(); ++i)
+    {
+        QListWidgetItem *pItem = pList->item(i);
+        const bool bWant = (pItem->checkState() == Qt::Checked);
+        if (bWant != PluginManager::isPluginEnabled(pItem->text()))
+        {
+            PluginManager::setPluginEnabled(pItem->text(), bWant);
+            bChanged = true;
+        }
+    }
+    if (!bChanged)
+        return;
+
+    if (QMessageBox::question(this, QStringLiteral("插件管理"),
+                              QStringLiteral("设置已保存。现在重新加载插件让它生效吗？\n"
+                                             "（重新加载会关闭所有标签页）"),
+                              QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::Yes) == QMessageBox::Yes)
+        reloadAllPlugins();
+}
+
+void MainWindow::reloadAllPlugins()
+{
+    // 重新加载会卸载 DLL：必须先释放所有标签页里的插件实例，否则对象虚表悬空。
+    // 只在确实有"打开过文件"的标签页时才需要确认（空标签页没有插件实例）。
+    bool bAnyFileTab = false;
+    for (const TabDoc &doc : m_vTabDocs)
+        if (doc.hasFile) { bAnyFileTab = true; break; }
+
+    if (bAnyFileTab)
+    {
+        if (QMessageBox::question(this, QStringLiteral("重新加载插件"),
+                                  QStringLiteral("重新加载需要先关闭所有标签页（插件实例必须先释放）。\n是否继续？"),
+                                  QMessageBox::Yes | QMessageBox::No,
+                                  QMessageBox::No) != QMessageBox::Yes)
+            return;
+    }
+
+    if (m_pCurrentInterface != nullptr)
+    {
+        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface = nullptr;
+    }
+    closeAllTabs();                        // 销毁标签页持有的插件实例
+    m_setWarnedPlugins.clear();
+    m_setPluginWidgets.clear();
+
+    PluginManager *pMgr = PluginManager::getInstance();
+    pMgr->reloadPlugins();
+
+    // 重新收集插件 widget 指针（清理标签页时据此避免误删）
+    for (PluginInterface *pIface : pMgr->getAllInterfaces())
+        m_setPluginWidgets.insert(pIface->getPluginWidget());
+
+    QString sMsg = QStringLiteral("插件已重新加载：%1 个可用").arg(pMgr->getAllInterfaces().size());
+    if (!pMgr->disabledPluginIds().isEmpty())
+        sMsg += QStringLiteral("，%1 个被禁用").arg(pMgr->disabledPluginIds().size());
+    const int nFailed = pMgr->failures().size();
+    if (nFailed > 0)
+        sMsg += QStringLiteral("，%1 个加载失败（见「插件诊断」）").arg(nFailed);
+    statusBar()->showMessage(sMsg, 15000);
+}
+
+// 「插件设置 → 插件诊断」：一屏看清「已加载什么、谁没加载、缺哪些依赖」
+void MainWindow::showPluginDiagnostics()
+{
+    PluginManager *pMgr = PluginManager::getInstance();
+    const QString sAppDir = QCoreApplication::applicationDirPath();
+    const QList<PluginManager::Failure> listFailures = pMgr->failures();
+    const QList<PluginInterface *> listLoaded = pMgr->getAllInterfaces();
+
+    QStringList lines;
+    lines << QStringLiteral("程序目录：%1").arg(sAppDir);
+    lines << QStringLiteral("运行环境：%1")
+                 .arg(PluginDiagnostics::summaryLine(sAppDir, listFailures.size()));
+    lines << QStringLiteral("已加载插件：%1 个").arg(listLoaded.size());
+
+    // 加载失败的插件 + 原因
+    if (!listFailures.isEmpty())
+    {
+        lines << QString();
+        lines << QStringLiteral("加载失败的插件：");
+        for (const PluginManager::Failure &f : listFailures)
+        {
+            QString sErr = f.error.trimmed();
+            if (sErr.isEmpty()) sErr = QStringLiteral("（无错误信息）");
+            lines << QStringLiteral("  · %1 —— %2")
+                         .arg(PluginDiagnostics::pluginDisplayName(f.path), sErr);
+        }
+    }
+
+    // 被禁用的插件（C5）：它们不加载，但要让用户知道"为什么这个格式打不开"
+    const QStringList listDisabled = pMgr->disabledPluginIds();
+    if (!listDisabled.isEmpty())
+    {
+        lines << QString();
+        lines << QStringLiteral("已禁用（不会加载）：%1").arg(listDisabled.join(QStringLiteral("、")));
+    }
+
+    // 部署自检：缺哪些依赖、各自做什么用
+    lines << QString();
+    QString sCheckError;
+    const QList<PluginDiagnostics::MissingFile> listMissing =
+            PluginDiagnostics::missingFiles(sAppDir, &sCheckError);
+    if (!sCheckError.isEmpty())
+    {
+        lines << QStringLiteral("部署自检：%1").arg(sCheckError);
+    }
+    else if (listMissing.isEmpty())
+    {
+        lines << QStringLiteral("部署自检：依赖齐全（清单：%1）")
+                     .arg(PluginDiagnostics::manifestName());
+    }
+    else
+    {
+        lines << QStringLiteral("部署自检：缺少 %1 个依赖文件（清单：%2）")
+                     .arg(listMissing.size()).arg(PluginDiagnostics::manifestName());
+        for (const PluginDiagnostics::MissingFile &m : listMissing)
+            lines << (m.hint.isEmpty()
+                      ? QStringLiteral("  · %1").arg(m.path)
+                      : QStringLiteral("  · %1 —— %2").arg(m.path, m.hint));
+    }
+
+    QMessageBox box(this);
+    box.setWindowTitle(QStringLiteral("插件诊断"));
+    box.setIcon(listFailures.isEmpty() && listMissing.isEmpty()
+                ? QMessageBox::Information : QMessageBox::Warning);
+    box.setText(QStringLiteral("插件运行环境诊断"));
+    box.setInformativeText(lines.join(QLatin1Char('\n')));
+    box.exec();
 }
 
 // 新建标签页并打开选中的记录项文件（该页独占一个插件实例）
@@ -550,8 +898,10 @@ void MainWindow::stopCurrentPlaybackAndInvalidate()
 }
 
 // 大文件抽取到临时文件（流式，内存占用固定 1 MB）
-bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QString &sErr)
+bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QString &sErr,
+                                   bool *pbNoSpace)
 {
+    if (pbNoSpace) *pbNoSpace = false;
     // 同一条目重复打开时复用已抽取的副本，避免为 10 GB 条目反复复制几十 GB
     const QString key = QStringLiteral("%1|%2|%3")
             .arg(info.sFilePath).arg(info.nFileLen).arg(info.nContentPositon);
@@ -564,13 +914,28 @@ bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QStr
         return true;
     }
 
+    // B4：写临时副本前先看磁盘余量（预留 64 MiB 给其他临时文件与碎片）。
+    // 空间不够就明确失败 —— 绝不退化成"整条读进内存"，几 GB 的条目会直接打爆进程。
+    constexpr qint64 kSpaceMarginBytes = 64LL * 1024 * 1024;
+    const qint64 nNeedBytes = info.nFileLen + kSpaceMarginBytes;
+    qint64 nAvailableBytes = -1;
+    if (!FileManager::hasFreeSpaceFor(QDir::tempPath(), nNeedBytes, &nAvailableBytes))
+    {
+        if (pbNoSpace) *pbNoSpace = true;
+        sErr = QStringLiteral("临时目录所在磁盘空间不足：需要约 %1（含 64 MiB 预留），"
+                              "当前可用 %2。\n临时目录：%3")
+                   .arg(FwArc::formatSize(nNeedBytes),
+                        FwArc::formatSize(qMax<qint64>(0, nAvailableBytes)),
+                        QDir::tempPath());
+        return false;
+    }
+
     QDir dir(QDir::tempPath() + QStringLiteral("/FileWrapper"));
     if (!dir.exists() && !dir.mkpath(dir.absolutePath()))
     {
         sErr = QStringLiteral("无法创建临时目录: %1").arg(dir.absolutePath());
         return false;
     }
-
     // 上限淘汰：最多保留 8 个临时副本。删除失败说明仍被插件占用，
     // 保留在 m_setTempFiles 里等析构时再清，但不再计入缓存与顺序表。
     static const int kMaxTempFiles = 8;
@@ -614,11 +979,20 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     if (info.nFileLen >= kLargeFileThreshold && iface->prefersFileByPath())
     {
         QString sTemp, sErr;
-        if (extractToTempFile(info, sTemp, sErr))
+        bool bNoSpace = false;
+        if (extractToTempFile(info, sTemp, sErr, &bNoSpace))
         {
-            if (iface->sendFileByPath(sTemp, info.sFileName))
+            if (iface->sendFile(PluginFile::fromPath(sTemp, info.sFileName)))
                 return;
             // 插件拒绝该文件路径，回退到内存通道
+        }
+        else if (bNoSpace)
+        {
+            // B4：磁盘放不下时**不能**退回内存通道（几 GB 的条目会直接把进程打爆），
+            // 直接给用户一个能照做的提示，并清掉内容区。
+            QMessageBox::warning(this, QStringLiteral("打不开文件"), sErr);
+            iface->sendFileData(nullptr, 0);
+            return;
         }
         else
         {
@@ -626,13 +1000,16 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         }
     }
 
-    char *szBuf = nullptr;
-    qint64 nFileLen = 0;
-    m_fileManager->QGetFileContent(info.sFilePath, &szBuf, nFileLen);
-    if (szBuf == nullptr)
+    // C2：内存通道直接读进 QByteArray（不再经过 new char[] + delete[] 的中转），
+    // 通过 PluginFile 交给插件；迁移到 sendFile() 的插件可以零拷贝取用。
+    QString sReadErr;
+    QByteArray data = m_fileManager->entryContent(info.sFilePath, &sReadErr);
+    if (data.isEmpty())
     {
         // 区分「0 字节空文件」与「读取失败」，并给出可读提示（P3-2 / P1-2）
-        QString sErr = m_fileManager->lastError();
+        // 区分「0 字节空文件」与「读取失败」：entryContent 失败时会给 sReadErr，
+        // 为空就说明确实是 0 字节（不要再去看 lastError()，那是别的操作留下的陈旧信息）。
+        QString sErr = sReadErr;
         if (sErr.isEmpty())
             sErr = QStringLiteral("文件为空（0 字节），没有可显示的内容");
         onFileManagerWarning(QStringLiteral("打开 %1 失败：%2").arg(info.sFileName, sErr));
@@ -640,8 +1017,7 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         return;
     }
     // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放
-    iface->sendFileData(szBuf, nFileLen);
-    delete[] szBuf;
+    iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName));
 }
 
 // 激活某个标签页：挂载该页独占的插件窗口，并按需渲染其文件
@@ -1006,71 +1382,28 @@ bool MainWindow::CheckFileExt(QString sFileName, QStringList& arrFileExts)
 
 QString MainWindow::choosePlugin(QString sFileExt)
 {
-    // 用户自定义「后缀 → 插件」映射优先（P2-2）
-    const QString mapped = DlgPluginMap::mappingFor(sFileExt);
-    auto toPath = [](const QString &name) {
-        return QString("%1/plugins/%2.dll").arg(qApp->applicationDirPath()).arg(name);
-    };
-    if (!mapped.isEmpty())
+    PluginManager *pMgr = PluginManager::getInstance();
+
+    // 1) 用户自定义「后缀 → 插件」映射优先（P2-2）。
+    //    映射表里存的是插件逻辑名（DLL 基名），这里反查真实路径 —— 不再手工拼
+    //    "plugins/<name>.dll"：那样在非 Windows 平台是错的，改插件文件名也会静默失效。
+    const QString sMapped = DlgPluginMap::mappingFor(sFileExt);
+    if (!sMapped.isEmpty())
     {
-        if (mapped.startsWith(QStringLiteral("builtin://"))) return mapped;
-        if (mapped.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0) return QString();
-        return toPath(mapped);
+        if (sMapped.startsWith(QStringLiteral("builtin://"))) return sMapped;
+        if (sMapped.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0) return QString();
+        return pMgr->pluginPathForId(sMapped);
     }
 
-    QString sPluginName;
-    // PluginText 处理的纯文本格式（大小写不敏感），如需新增格式在此添加
-    static const QStringList arrTextExts = {
-        "txt", "log", "md", "markdown", "csv", "ini", "cfg", "conf",
-        "json", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx",
-        "py", "java", "c", "cpp", "cc", "h", "hpp", "cs", "go", "rb",
-        "php", "sh", "bat", "ps1", "yml", "yaml", "toml", "sql", "tex", "rst"
-    };
-    // PluginPicture 处理的图片格式（大小写不敏感），如需新增格式在此添加
-    static const QStringList arrPictureExts = {
-        "jpg", "jpeg", "png", "bmp", "gif", "xbm", "xpm", "pbm", "pgm", "ppm"
-    };
-    // PluginMedia 处理的音视频格式（基于 FFmpeg；大小写不敏感），如需新增格式在此添加
-    static const QStringList arrMediaExts = {
-        // 视频容器
-        "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm",
-        "mpg", "mpeg", "ts", "3gp", "3g2", "ogv", "vob", "asf", "rm", "rmvb",
-        // 音频
-        "mp3", "wav", "wma", "aac", "m4a", "flac", "ogg", "opus",
-        "amr", "aiff", "ape", "ac3"
-    };
-    // PluginPdf 处理的文档格式（QPdfium 仅支持 PDF，无可扩展项），大小写不敏感
-    static const QStringList arrPdfExts = { "pdf" };
-    // PluginBook 处理的电子书格式（EPUB/FB2 可解析显示；MOBI/AZW 等暂提示不支持），大小写不敏感
-    static const QStringList arrBookExts = {
-        "epub", "fb2", "mobi", "azw", "azw3", "prc", "lit"
-    };
+    // 2) 插件自描述：各插件元数据 JSON 里的 "extensions"（C1）。
+    //    这里以前有 6 张表、90 个后缀写死，新增格式必须改主程序并重编；
+    //    现在后缀由插件自己声明，加格式只改插件，主程序不用动。
+    const QString sDeclared = pMgr->pluginForExtension(sFileExt);
+    if (!sDeclared.isEmpty()) return sDeclared;
 
-    if(arrPictureExts.contains(sFileExt, Qt::CaseInsensitive))
-    {
-        sPluginName = "PluginPicture";
-    }
-    else if(arrTextExts.contains(sFileExt, Qt::CaseInsensitive))
-    {
-        sPluginName = "PluginText";
-    }
-    else if(arrMediaExts.contains(sFileExt, Qt::CaseInsensitive))
-    {
-        sPluginName = "PluginMedia";
-    }
-    else if(arrPdfExts.contains(sFileExt, Qt::CaseInsensitive))
-    {
-        sPluginName = "PluginPdf";
-    }
-    else if(arrBookExts.contains(sFileExt, Qt::CaseInsensitive))
-    {
-        sPluginName = "PluginBook";
-    }
-    else
-    {
-        return "";
-    }
-    return toPath(sPluginName);
+    // 3) 没有插件认领该后缀：返回空，由调用方弹「未找到插件」对话框
+    //    （可临时用内置文本 / 十六进制查看，或去「插件映射」里指定）。
+    return QString();
 }
 
 void MainWindow::on_actionSplitFile_triggered()

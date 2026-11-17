@@ -29,8 +29,10 @@ HEADERS += \
     pluginpicture.h
 
 # 插件始终输出到主程序 exe 同级的 plugins/ 目录（自动适配 debug/release 与构建根目录）
-debug:   DESTDIR = $$OUT_PWD/../../FileWrapper/debug/plugins
-release: DESTDIR = $$OUT_PWD/../../FileWrapper/release/plugins  # 输出目录
+# 公共设置（输出目录 + 插件元数据 sidecar：plugins/<DLL基名>.json）
+PLUGIN_METADATA_JSON = $$PWD/pluginPicture.json
+PLUGIN_CLASS_HEADER  = $$PWD/pluginpicture.h
+include(../plugin_common.pri)
 
 unix {
     target.path = /usr/lib
