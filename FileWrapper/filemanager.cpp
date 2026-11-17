@@ -37,6 +37,10 @@ bool    FileManager::isArchiveLoaded() const
 {
     return m_qFile.isOpen() && !m_qFile.fileName().isEmpty();
 }
+QString FileManager::archivePath() const
+{
+    return isArchiveLoaded() ? m_qFile.fileName() : QString();
+}
 bool FileManager::isDirty() const { return m_bDirty; }
 FwArc::Meta FileManager::archiveMeta() const { return m_meta; }
 QVector<FILEINFO> FileManager::getFileInfos() { return m_vtFileInfos; }

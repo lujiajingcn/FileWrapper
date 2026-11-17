@@ -34,6 +34,11 @@ QString DlgSplitFile::getSplitFileDir()
     return ui->leSplittedFileDir->text();
 }
 
+void DlgSplitFile::setMergedFilePath(const QString &sPath)
+{
+    ui->leMergedFilePath->setText(sPath);
+}
+
 void DlgSplitFile::on_btnMergedFilePath_clicked()
 {
     QString sFilePath = QFileDialog::getOpenFileName(this, tr("待分割的文件"), "", tr("Class Files (*.dat);;All Files (*.*)"));

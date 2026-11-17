@@ -19,6 +19,9 @@ public:
     bool getIsSaveAsOldPath();
     QString getSplitFileDir();
 
+    // 预填"待分割文件路径"（已加载归档时由主窗口传入，避免用户再手选一次）
+    void setMergedFilePath(const QString &sPath);
+
 private slots:
     void on_btnMergedFilePath_clicked();
 

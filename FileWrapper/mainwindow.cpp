@@ -1331,6 +1331,16 @@ void MainWindow::on_actionLoadFile_triggered()
     if(sFileName.isEmpty())
         return;
 
+    // 已加载归档且开着标签页时先确认：加载会关闭所有标签页（只影响查看，不影响归档内容）
+    if (m_fileManager->isArchiveLoaded() && ui->tabWidget->count() > 0)
+    {
+        const auto btn = QMessageBox::question(this, tr("加载文件"),
+            tr("加载新归档会关闭当前所有标签页。\n是否继续？"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (btn != QMessageBox::Yes)
+            return;
+    }
+
     // —— P1-6：先做完整解析校验，失败时完全不触碰当前归档 / 视图 / 脏状态 ——
     QString sErr;
     if (!m_fileManager->validateMergedFile(sFileName, &sErr))
@@ -1528,6 +1538,9 @@ QString MainWindow::choosePlugin(QString sFileExt)
 void MainWindow::on_actionSplitFile_triggered()
 {
     DlgSplitFile dlgSplitFile(this);
+    // 已加载归档时预填"待分割文件路径"，用户不必再手选一次
+    if (m_fileManager->isArchiveLoaded())
+        dlgSplitFile.setMergedFilePath(m_fileManager->archivePath());
     if(dlgSplitFile.exec() == QDialog::Accepted)
     {
         const QString sMergedFilePath = dlgSplitFile.getMergedFilePath();

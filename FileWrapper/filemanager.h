@@ -48,6 +48,9 @@ public:
 
     bool isArchiveLoaded() const;
 
+    // 当前已加载归档的完整路径（未加载时为空），供分割等对话框预填
+    QString archivePath() const;
+
     void addFiles(const QVector<QString> &vtNewFiles);
     bool deleteFile(const QString &sFilePath);
     bool save();
