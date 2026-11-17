@@ -20,6 +20,10 @@ public:
     QString getMergedFilePath();
 
 private slots:
+    void on_btnAddDir_clicked();
+
+    void on_btnAddFile_clicked();
+
     void on_btnDelete_clicked();
 
     void on_btnMergedFilePath_clicked();
@@ -32,10 +36,6 @@ protected:
     bool duplicatCheck(QString sFilePath);
 
 private:
-    void addFiles();                  // 添加文件…（可多选）
-    void addDirectory();              // 添加文件夹…（递归合并整个目录）
-    void addPathItem(const QString &sPath);   // 去重后追加一行
-
     QStandardItemModel      *m_hModelFilePath;
     Ui::DlgMergeFile *ui;
 };

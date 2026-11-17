@@ -40,18 +40,9 @@
          <item row="1" column="2">
           <layout class="QGridLayout" name="gridLayout_2">
            <item row="1" column="0">
-            <widget class="QToolButton" name="btnAdd">
+            <widget class="QPushButton" name="btnAddFile">
              <property name="text">
-              <string>添加</string>
-             </property>
-             <property name="toolTip">
-              <string>点击添加文件；点右侧箭头可选「添加文件夹」（整个目录递归合并）</string>
-             </property>
-             <property name="popupMode">
-              <enum>QToolButton::MenuButtonPopup</enum>
-             </property>
-             <property name="toolButtonStyle">
-              <enum>Qt::ToolButtonTextOnly</enum>
+              <string>添加文件</string>
              </property>
             </widget>
            </item>
@@ -59,9 +50,6 @@
             <widget class="QPushButton" name="btnDelete">
              <property name="text">
               <string>删除</string>
-             </property>
-             <property name="toolTip">
-              <string>删除当前选中的文件（可 Ctrl / Shift 多选；也可直接按 Delete）</string>
              </property>
             </widget>
            </item>
@@ -77,6 +65,13 @@
               </size>
              </property>
             </spacer>
+           </item>
+           <item row="0" column="0">
+            <widget class="QPushButton" name="btnAddDir">
+             <property name="text">
+              <string>添加文件夹</string>
+             </property>
+            </widget>
            </item>
            <item row="4" column="0">
             <spacer name="verticalSpacer_2">
