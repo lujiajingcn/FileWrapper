@@ -12,10 +12,15 @@
   pic.png        basic.docx 里内嵌的图片素材
   sample.txt     PluginText 冒烟素材（UTF-8 中文 + 原样保留的符号）
   sample.epub    最小合法 EPUB（PluginBook 冒烟素材，同时覆盖共享 ZipReader 的 inflate）
+  sample.html    带标题/粗体/列表的 HTML（PluginText 走富文本渲染的冒烟素材）
+  sample.odt     最小合法 ODT（PluginWord 的 OpenDocument 分支冒烟素材）
+  sample.svg     简单矢量图（PluginPicture 的 SVG 解码冒烟素材）
+  sample.webp    WebP 位图（PluginPicture 的 WebP 解码冒烟素材）
 
 依赖：python-docx、Pillow。素材已经入库，只有想改排版时才需要重新生成：
   python tests/fixtures/make_fixtures.py
 """
+import io
 import os
 import zipfile
 
@@ -301,6 +306,133 @@ def make_epub():
     return path
 
 
+HTML_SAMPLE = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HTML 冒烟素材</title>
+  <style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+  <h1>HTML 标题</h1>
+  <p>普通段落，含 <b>粗体</b> 与 <i>斜体</i>。</p>
+  <ul><li>列表项一</li><li>列表项二</li></ul>
+  <table border="1"><tr><td>表格 A1</td><td>表格 B1</td></tr></table>
+</body>
+</html>
+"""
+
+ODT_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ office:version="1.3">
+ <office:automatic-styles>
+  <style:style style:name="P1" style:family="paragraph">
+   <style:paragraph-properties fo:text-align="center"/>
+  </style:style>
+  <style:style style:name="T1" style:family="text">
+   <style:text-properties fo:font-weight="bold" fo:color="#cc0000"/>
+  </style:style>
+  <style:style style:name="T2" style:family="text">
+   <style:text-properties fo:font-style="italic"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body>
+  <office:text>
+   <text:h text:outline-level="1">第一章 ODT 冒烟</text:h>
+   <text:p>普通段落，含<text:span text:style-name="T1">红色粗体</text:span>与<text:span text:style-name="T2">斜体</text:span>。</text:p>
+   <text:p text:style-name="P1">居中段落</text:p>
+   <text:list text:style-name="L1">
+    <text:list-item><text:p>有序项一</text:p></text:list-item>
+    <text:list-item><text:p>有序项二</text:p></text:list-item>
+   </text:list>
+   <table:table>
+    <table:table-row>
+     <table:table-cell><text:p>单元格 A1</text:p></table:table-cell>
+     <table:table-cell><text:p>单元格 B1</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell><text:p>单元格 A2</text:p></table:table-cell>
+     <table:table-cell><text:p>单元格 B2</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:text>
+ </office:body>
+</office:document-content>
+"""
+
+ODT_STYLES = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.3">
+ <office:styles>
+  <text:list-style style:name="L1">
+   <text:list-level-style-number text:level="1" style:num-format="1"/>
+  </text:list-style>
+ </office:styles>
+</office:document-styles>
+"""
+
+ODT_MANIFEST = """<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3">
+ <manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
+ <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+ <manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>
+"""
+
+SVG_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80" viewBox="0 0 120 80">
+  <rect x="4" y="4" width="112" height="72" rx="8" fill="#2b6cb0"/>
+  <circle cx="40" cy="40" r="20" fill="#f6ad55"/>
+  <text x="70" y="46" font-size="14" fill="#ffffff">SVG</text>
+</svg>
+"""
+
+
+def make_html():
+    path = os.path.join(WORK, "sample.html")
+    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(HTML_SAMPLE)
+    return path
+
+
+def make_odt():
+    """最小合法 ODT：mimetype 第一个条目且不压缩；含标题/字符格式/列表/表格。"""
+    path = os.path.join(WORK, "sample.odt")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), b"application/vnd.oasis.opendocument.text",
+                   zipfile.ZIP_STORED)
+        z.writestr("META-INF/manifest.xml", ODT_MANIFEST, zipfile.ZIP_DEFLATED)
+        z.writestr("content.xml", ODT_CONTENT, zipfile.ZIP_DEFLATED)
+        z.writestr("styles.xml", ODT_STYLES, zipfile.ZIP_DEFLATED)
+    return path
+
+
+def make_svg():
+    path = os.path.join(WORK, "sample.svg")
+    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(SVG_SAMPLE)
+    return path
+
+
+def make_webp():
+    path = os.path.join(WORK, "sample.webp")
+    img = Image.new("RGB", (64, 48), (43, 108, 176))
+    img.save(path, "WEBP")
+    return path
+
+
 def make_broken_files():
     with open(os.path.join(WORK, "legacy.doc"), "wb") as f:
         f.write(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 5000)
@@ -323,6 +455,9 @@ if __name__ == "__main__":
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     for fn in (make_text, make_epub):
+        path = fn()
+        print("wrote", path, os.path.getsize(path), "bytes")
+    for fn in (make_html, make_odt, make_svg, make_webp):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()

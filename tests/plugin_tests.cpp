@@ -48,6 +48,7 @@
 #include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTextBlock>
+#include <QTextBlockFormat>
 #include <QTextBrowser>
 #include <QTextEdit>
 #include <QLabel>
@@ -223,9 +224,14 @@ static void checkExtensionMapping()
     static const Case kCases[] = {
         { "docx", "PluginWord" }, { "docm", "PluginWord" }, { "dotx", "PluginWord" },
         { "dotm", "PluginWord" }, { "doc",  "PluginWord" }, { "DOCX", "PluginWord" },
+        { "odt",  "PluginWord" }, { "ott",  "PluginWord" },
         { "txt",  "PluginText" },    { "md",   "PluginText" },
+        { "vtt",  "PluginText" },    { "srt",  "PluginText" },
         { "jpg",  "PluginPicture" }, { "png",  "PluginPicture" },
+        { "svg",  "PluginPicture" }, { "webp", "PluginPicture" },
+        { "tiff", "PluginPicture" },
         { "mp4",  "PluginMedia" },   { "mp3",  "PluginMedia" },
+        { "m2ts", "PluginMedia" },
         { "pdf",  "PluginPdf" },
         { "epub", "PluginBook" },    { "fb2",  "PluginBook" },
         { "qzx",  nullptr },
@@ -657,9 +663,9 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
 
     // ---- W4: 原硬编码表共 90 项，全部由插件 JSON 接管 ----
     // 90 项声明里有 1 个跨插件重名（".ts" = MPEG-TS 视频 vs TypeScript 文本），
-    // 因此唯一路由数是 89，冲突按 extensionPriority 决出（PluginText 声明 10）。
-    report(pm->registeredExtensionCount() >= 89,
-           QStringLiteral("W4: %1 unique extensions registered (90 declared; .ts is shared)")
+    // 因此唯一路由数是 106，冲突按 extensionPriority 决出（PluginText 声明 10）。
+    report(pm->registeredExtensionCount() >= 106,
+           QStringLiteral("W4: %1 unique extensions registered (107 declared; .ts is shared)")
                .arg(pm->registeredExtensionCount()));
     report(QFileInfo(pm->pluginForExtension(QStringLiteral("ts"))).fileName()
                .compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0,
@@ -947,6 +953,94 @@ static void verifyOtherViewers(const QString &work)
         }
         delete p;
         report(bOk, QStringLiteral("V3: PluginBook renders .epub (shared ZipReader)"));
+    }
+
+    // V4: PluginText 对 .html/.htm 走富文本渲染（不是把标签当源码显示）
+    if (want("V4"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginText.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.html"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.html"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            QTextEdit *pEdit = w ? w->findChild<QTextEdit *>() : nullptr;
+            // 标题被渲染成 heading 块，说明走的是 setHtml 而不是 setPlainText
+            bOk = pEdit != nullptr
+                  && pEdit->toPlainText().contains(QString::fromUtf8("HTML 标题"))
+                  && pEdit->document()->firstBlock().blockFormat().headingLevel() > 0;
+        }
+        delete p;
+        report(bOk, QStringLiteral("V4: PluginText renders .html as rich text"));
+    }
+
+    // V5: PluginPicture 借 Qt 的 qsvg 插件解码矢量图
+    if (want("V5"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginPicture.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.svg"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.svg"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            bOk = w != nullptr && countLabelsWithPixmap(w) > 0;
+        }
+        delete p;
+        report(bOk, QStringLiteral("V5: PluginPicture renders .svg (qsvg)"));
+    }
+
+    // V6: PluginWord 的 ODT（OpenDocument Text）分支：段落/标题 + 表格
+    if (want("V6"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bText = false;
+        bool bTable = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.odt"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.odt"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bText = plain.contains(QString::fromUtf8("第一章 ODT 冒烟"))
+                        && plain.contains(QString::fromUtf8("单元格 B2"));
+                bTable = doc->toHtml().contains(QStringLiteral("<table"));
+            }
+        }
+        delete p;
+        report(bText, QStringLiteral("V6a: PluginWord renders .odt text (ODF)"));
+        report(bTable, QStringLiteral("V6b: PluginWord renders .odt table"));
+    }
+
+    // V7: PluginPicture 解码 WebP（qwebp 已在部署清单里）
+    if (want("V7"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginPicture.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.webp"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.webp"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            bOk = w != nullptr && countLabelsWithPixmap(w) > 0;
+        }
+        delete p;
+        report(bOk, QStringLiteral("V7: PluginPicture renders .webp (qwebp)"));
     }
 }
 
