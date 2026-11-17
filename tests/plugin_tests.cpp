@@ -1387,9 +1387,21 @@ static void verifyPluginToggleAndReload()
 // ---------------------------------------------------------------------------
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
 {
+    auto hasSuffix = [](const QStringList &paths, const QString &suffix) {
+        for (const QString &p : paths)
+            if (p.endsWith(suffix)) return true;
+        return false;
+    };
+    auto listPaths = [](const FwArc::Meta &m) {
+        QStringList l;
+        for (const FwArc::Entry &e : m.entries) l << e.relPath;
+        return l;
+    };
+
     const QString sArcInner = scratchDir + QStringLiteral("/merge_inner.dat");
     const QString sArcOuter = scratchDir + QStringLiteral("/merge_outer.dat");
     const QString sArcDup   = scratchDir + QStringLiteral("/merge_dup.dat");
+    const QString sArcRoot  = scratchDir + QStringLiteral("/merge_rooted.dat");
     const QString sNote     = scratchDir + QStringLiteral("/merge_note.txt");
     {
         QFile f(sNote);
@@ -1397,47 +1409,64 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
             f.write("merge note");
     }
 
-    // G1: 普通合并（docx + png）得到第一个归档
+    // G1: 同一目录下普通合并 -> 存储路径是短相对名（root = 素材目录）
     FileManager fm1;
     fm1.QMergeFiles(QVector<QString>{ work + QStringLiteral("/basic.docx"),
                                       work + QStringLiteral("/pic.png") }, sArcInner);
     FwArc::Meta inner;
     QString err1;
-    const bool bG1 = QFile::exists(sArcInner)
-                     && FileManager::inspectArchive(sArcInner, inner, err1)
-                     && inner.entries.size() == 2;
-    report(bG1, QStringLiteral("G1: inner archive built with 2 entries (%1)").arg(inner.entries.size()));
+    const bool bMeta1 = FileManager::inspectArchive(sArcInner, inner, err1);
+    const QStringList innerPaths = listPaths(inner);
+    const bool bG1 = bMeta1
+                     && innerPaths.size() == 2
+                     && innerPaths.contains(QStringLiteral("basic.docx"))
+                     && innerPaths.contains(QStringLiteral("pic.png"));
+    report(bG1, QStringLiteral("G1: same-dir merge keeps short relative names (%1)")
+                    .arg(innerPaths.join(QStringLiteral(", "))));
 
-    // G2: 把"已有归档 + 普通文件"再合并 -> 归档被拆开，条目数 = 2 + 1，且没有嵌套 .dat
+    // G2: "已有归档 + 普通文件"再合并 -> 归档被拆开，两个来源都不丢，且没有嵌套 .dat
+    //     （临时目录与素材目录可能不同盘，走扁平模式；这里只断言"来源路径结尾"）
     FileManager fm2;
     fm2.QMergeFiles(QVector<QString>{ sArcInner, sNote }, sArcOuter);
     FwArc::Meta outer;
     QString err2;
-    QStringList paths;
-    const bool bMeta = FileManager::inspectArchive(sArcOuter, outer, err2);
-    for (const FwArc::Entry &e : outer.entries) paths << e.relPath;
-    bool bNoNested = true;
-    for (const QString &p : paths)
-        if (p.endsWith(QStringLiteral(".dat"), Qt::CaseInsensitive)) bNoNested = false;
-    report(bMeta && paths.size() == 3 && bNoNested
-               && paths.contains(QStringLiteral("merge_note.txt")),
-           QStringLiteral("G2: nested archive flattened (%1 entries: %2)")
-               .arg(paths.size()).arg(paths.join(QStringLiteral(", "))));
+    const bool bG2 = FileManager::inspectArchive(sArcOuter, outer, err2);
+    const QStringList outerPaths = listPaths(outer);
+    const bool bNoNested = !hasSuffix(outerPaths, QStringLiteral(".dat"));
+    report(bG2 && outerPaths.size() == 3 && bNoNested
+               && hasSuffix(outerPaths, QStringLiteral("basic.docx"))
+               && hasSuffix(outerPaths, QStringLiteral("pic.png"))
+               && hasSuffix(outerPaths, QStringLiteral("merge_note.txt")),
+           QStringLiteral("G2: nested archive flattened, both origins kept (%1)")
+               .arg(outerPaths.join(QStringLiteral(", "))));
 
     // G3: 路径撞名自动改名（归档里已有 pic.png，同时又选了 pic.png）
     FileManager fm3;
     fm3.QMergeFiles(QVector<QString>{ sArcInner, work + QStringLiteral("/pic.png") }, sArcDup);
     FwArc::Meta dup;
     QString err3;
-    QStringList dupPaths;
-    const bool bMeta3 = FileManager::inspectArchive(sArcDup, dup, err3);
-    for (const FwArc::Entry &e : dup.entries) dupPaths << e.relPath;
-    int nPic = 0;
-    for (const QString &p : dupPaths)
-        if (p.contains(QStringLiteral("pic"))) ++nPic;
-    report(bMeta3 && dupPaths.size() == 3 && nPic >= 2,
+    const bool bG3 = FileManager::inspectArchive(sArcDup, dup, err3);
+    const QStringList dupPaths = listPaths(dup);
+    report(bG3 && dupPaths.size() == 3
+               && hasSuffix(dupPaths, QStringLiteral("pic.png"))
+               && hasSuffix(dupPaths, QStringLiteral("pic (2).png")),
            QStringLiteral("G3: duplicate path auto-renamed (%1)")
                .arg(dupPaths.join(QStringLiteral(", "))));
+
+    // G4: 来源归档的 root 与当前盘符不同（rooted.dat 的 root = D:/testfiles_copy）：
+    //     展开后必须保留它原来的归属，不能被改挂到另一个盘下（用户实际报过的问题）
+    FileManager fm4;
+    fm4.QMergeFiles(QVector<QString>{ work + QStringLiteral("/rooted.dat"),
+                                      work + QStringLiteral("/basic.docx") }, sArcRoot);
+    FwArc::Meta rooted;
+    QString err4;
+    const bool bG4 = FileManager::inspectArchive(sArcRoot, rooted, err4);
+    const QStringList rootedPaths = listPaths(rooted);
+    report(bG4 && rooted.root.isEmpty()
+               && rootedPaths.contains(QStringLiteral("D/testfiles_copy/a/file1.txt"))
+               && hasSuffix(rootedPaths, QStringLiteral("basic.docx")),
+           QStringLiteral("G4: archived origin preserved cross-drive (%1)")
+               .arg(rootedPaths.join(QStringLiteral(", "))));
 }
 
 static void verifyAppIntegration(const QString &work, const QString &scratchDir)

@@ -22,7 +22,9 @@
 """
 import io
 import os
+import struct
 import zipfile
+import zlib
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -583,6 +585,64 @@ def make_pptx():
     return path
 
 
+FWDA_MAGIC = b"FWDA"
+
+
+def crc32_bytes(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def build_fwda(entries, root=""):
+    """按 FWDA v2 布局生成归档字节（entries: [(相对路径, 内容 bytes)]）。
+
+    布局与 FileWrapper/archiveformat.h、filemanager.cpp 的 parseFromDevice 一致：
+      全局头 24B: magic | version=2 | headerSize | fileCount | headerChecksum | reserved
+      头部区    : rootLen + root(UTF-8)；每条 pathLen|size|contentPos|contentCrc32|path
+      headerChecksum = CRC32(全局头[0..15] + 全局头[20..23] + 头部区)
+    """
+    root_b = root.encode("utf-8")
+    entry_fixed = 4 + 8 + 8 + 4
+    hsize = (24 + 4 + len(root_b)
+             + sum(entry_fixed + len(p.encode("utf-8")) for p, _ in entries))
+
+    out = bytearray(FWDA_MAGIC)
+    out += struct.pack("<III", 2, hsize, len(entries))
+    out += b"\x00\x00\x00\x00"      # headerChecksum 占位
+    out += b"\x00\x00\x00\x00"      # reserved
+    out += struct.pack("<I", len(root_b))
+    out += root_b
+
+    pos = hsize
+    for path, data in entries:
+        path_b = path.encode("utf-8")
+        out += struct.pack("<I", len(path_b))
+        out += struct.pack("<Q", len(data))
+        out += struct.pack("<Q", pos)
+        out += struct.pack("<I", crc32_bytes(data))
+        out += path_b
+        pos += len(data)
+
+    header = bytes(out)
+    out[16:20] = struct.pack("<I",
+                             crc32_bytes(header[0:16] + header[20:24] + header[24:hsize]))
+    for _, data in entries:
+        out += data
+    return bytes(out)
+
+
+def make_rooted_dat():
+    """一个 root 不是当前盘符的归档：用来验证合并展开后路径归属不会被改挂。
+
+    root 故意写成 D:/testfiles_copy（与测试素材所在的 E: 不同盘），
+    条目 a/file1.txt 合并后应仍保留 D/testfiles_copy/... 的来源信息。
+    """
+    path = os.path.join(WORK, "rooted.dat")
+    with open(path, "wb") as f:
+        f.write(build_fwda([("a/file1.txt", b"rooted archive entry")],
+                           root="D:/testfiles_copy"))
+    return path
+
+
 def make_broken_files():
     with open(os.path.join(WORK, "legacy.doc"), "wb") as f:
         f.write(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 5000)
@@ -605,7 +665,7 @@ if __name__ == "__main__":
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     for fn in (make_html, make_odt, make_svg, make_webp, make_rtf,
-               make_ods, make_odp, make_xlsx, make_pptx):
+               make_ods, make_odp, make_xlsx, make_pptx, make_rooted_dat):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()
