@@ -51,7 +51,7 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下有 138 项断言的插件测试套件，
+- **回归测试在仓库里（C4）**：`tests/` 下有 151 项断言的插件测试套件，
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
@@ -68,6 +68,16 @@
 - 大文件抽临时副本前有磁盘预检（B4）：磁盘满时不再回退内存通道（会打爆进程）。
 - 插件可被用户禁用（C5）：`[PluginEnabled]` 段（ini），禁用的插件不加载但保留后缀
   路由，打开时会提示"已被禁用"；`reloadPlugins()` 会卸载 DLL，调用前必须关闭标签页。
+- **支持的格式要"接线"而不是"重写"**（P0）：Qt 自带 qwebp/qsvg/qico/qtiff/qtga/qicns/qwbmp
+  解码器、FFmpeg 支持大量封装——但它们只在插件 JSON 声明了后缀、且部署清单
+  复制了 imageformats 插件时才会被用到。新增格式优先检查这条链路：
+  `pluginX.json 的 extensions` + `FileWrapper/deploy/plugin-deps.manifest`。
+  注意 **qsvg 还要部署 Qt6Svg.dll**（它是 qsvg 的运行库依赖）。
+- **PluginText 会按后缀分流**：`.html/.htm` 走 `QTextEdit::setHtml`（富文本渲染），
+  其余（源码/日志/JSON/字幕 srt/vtt/ass）仍用 `setPlainText`；文件名未知时按内容嗅探。
+- **PluginWord 同时是 ODF 解析器**：ZIP 里的 `mimetype` 含 `opendocument.text` 即按
+  ODT 解析（content.xml/styles.xml → 同一套 HTML 子集，支持标题/字符格式/列表/表格/
+  内嵌图片/超链接），`.odt/.ott` 已在 pluginWord.json 里声明。
 - **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
   - `pluginbase.h`：`PluginBase<Derived, WindowT>`（CRTP）收口构造/析构、`apiVersion`、
     `getPluginWidget`、`createInstance`、`sendFile`/`sendFileData` 适配；
