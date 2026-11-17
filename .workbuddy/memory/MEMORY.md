@@ -51,10 +51,15 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下有 135 项断言的插件测试套件，
+- **回归测试在仓库里（C4）**：`tests/` 下有 138 项断言的插件测试套件，
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
+- **测试里加载插件只从 `<exe>/plugins`**（PluginManager 用的那一份），用
+  `QPluginLoader` 取模板 + `createInstance()` 渲染 + 显式 `delete`；
+  **绝不能从另一个路径再加载同一个 DLL** —— Windows 会当成两个模块，
+  卸载其中一份会让插件侧遗留对象（如 QTextBrowser 子类）虚表悬空，
+  表现为"测试全 PASS 但进程退出码 0xC0000005"（V 组踩过）。
 - **插件接口头在 `include/plugininterface.h`（C6）**：主程序与插件都从那里取，
   插件通过 `Plugins/plugin_common.pri` 拿到 `INCLUDEPATH`；不要再写
   `#include "../../FileWrapper/plugininterface.h"` 这种相对路径。
@@ -63,6 +68,13 @@
 - 大文件抽临时副本前有磁盘预检（B4）：磁盘满时不再回退内存通道（会打爆进程）。
 - 插件可被用户禁用（C5）：`[PluginEnabled]` 段（ini），禁用的插件不加载但保留后缀
   路由，打开时会提示"已被禁用"；`reloadPlugins()` 会卸载 DLL，调用前必须关闭标签页。
+- **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
+  - `pluginbase.h`：`PluginBase<Derived, WindowT>`（CRTP）收口构造/析构、`apiVersion`、
+    `getPluginWidget`、`createInstance`、`sendFile`/`sendFileData` 适配；
+    插件只实现 `bool showFile(const PluginFile &)`。**新插件不要再抄代理层样板。**
+  - `zipreader.{h,cpp}`：PluginBook 与 PluginWord 共用；在插件 `.pro` 里写
+    `PLUGIN_SHARED_SOURCES = zipreader` 即编进自己的 DLL。改它要同时验证 epub + docx。
+  - 每个插件仍独立编译/部署/启停，没有跨插件运行时依赖。
 - **数据通道（C2，接口版本 3）**：主程序优先调 `PluginInterface::sendFile(const PluginFile&)`，
   `PluginFile` 是"内存块 / 文件路径"二选一。老插件不用改（默认实现转调 `sendFileData`，
   行为与旧版一致，会复制一次）；想省掉复制的插件重写 `sendFile()` 直接吃
