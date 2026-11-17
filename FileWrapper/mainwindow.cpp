@@ -39,6 +39,7 @@
 #include <QSettings>
 #include <QMouseEvent>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
+#include <cstring>          // std::memcmp（合并前探测已合并归档）
 
 // 超过该阈值的文件优先走「临时文件 + 路径」通道，避免整块载入内存（P1-2）
 static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
@@ -1398,6 +1399,22 @@ void MainWindow::on_actionMergeFile_triggered()
         dlgProgress.setAutoClose(false);
         dlgProgress.setAutoReset(false);
         dlgProgress.setValue(0);
+
+        // 选中的文件里如果有已合并的 .dat：合并时会把它们拆分成条目，而不是当成普通文件
+        int nArchivedInputs = 0;
+        for (const QString &sP : vtFilesPaths)
+        {
+            QFile fProbe(sP);
+            if (!fProbe.open(QIODevice::ReadOnly)) continue;
+            char magic[4] = { 0, 0, 0, 0 };
+            if (fProbe.read(magic, 4) == 4
+                && std::memcmp(magic, FwArc::MAGIC, 4) == 0)
+                ++nArchivedInputs;
+        }
+        if (nArchivedInputs > 0)
+            dlgProgress.setLabelText(QStringLiteral(
+                "正在合并文件（其中 %1 个是已合并归档，将先拆分再合并）...")
+                    .arg(nArchivedInputs));
 
         bool bOk = false;
         QString sResultMsg;

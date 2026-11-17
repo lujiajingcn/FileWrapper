@@ -550,7 +550,8 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
                                 const QString &sRoot,
                                 QVector<qint64> &outCrcFieldPos,
                                 QVector<qint64> &outContentPos,
-                                qint64 &outHeaderSize, QString &sErr)
+                                qint64 &outHeaderSize, QString &sErr,
+                                const QStringList *pStoredPaths)
 {
     auto fail = [&sErr](const QString &m) { sErr = m; return false; };
 
@@ -561,9 +562,13 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
     QVector<QByteArray> rels;
     rels.reserve(infos.size());
     qint64 hs = FwArc::GLOBAL_HDR + 4 + rootBytes.size();
-    for (const FILEINFO &fi : infos)
+    for (int i = 0; i < infos.size(); ++i)
     {
-        QString rel = FwArc::makeRelative(fi.sFilePath, sRoot);
+        const FILEINFO &fi = infos.at(i);
+        // 正常合并：按"绝对路径相对公共根"生成；展开已有归档时调用方直接给存储路径
+        QString rel = (pStoredPaths != nullptr && pStoredPaths->size() == infos.size())
+                          ? pStoredPaths->at(i)
+                          : FwArc::makeRelative(fi.sFilePath, sRoot);
         rel = FwArc::sanitizeRelativePath(rel);
         const QByteArray rb = rel.toUtf8();
         if (rb.size() > int(FwArc::MAX_PATH_LEN))
@@ -736,10 +741,23 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
-    // 收集输入信息（FILEINFO 复用为写入结构）
-    QVector<FILEINFO> infos;
-    qint64 totalBytes = 0;
-    QStringList allPaths;
+    // ---- 收集输入：已合并的 .dat（FWDA）先拆分成条目，再一起合并 ----
+    // 把 .dat 当成普通文件嵌进输出会变成"归档套归档"，用户还要再拆一层；
+    // 这里直接读它的索引，把每个条目作为独立输入展开（保留归档内的相对路径）。
+    struct MergeSource {
+        QString sSourcePath;      // 实际读取的文件（普通文件或 FWDA 归档）
+        qint64  nOffset   = 0;    // 内容在源文件里的偏移
+        qint64  nLength   = 0;
+        QString sStoredPath;      // 写入输出归档的相对路径
+        QString sDisplayName;     // 进度与错误提示
+        bool    bFromArchive = false;
+    };
+
+    QVector<MergeSource> sources;
+    QStringList plainAbsPaths;    // 普通文件（用来算公共根）
+    int nArchiveInputs = 0;       // 被拆分的归档个数
+    int nArchiveEntries = 0;      // 展开出来的条目数
+
     for (const QString &fp : vtInputFiles)
     {
         QFileInfo fi(fp);
@@ -748,23 +766,117 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             finish(false, tr("输入文件不存在或不是普通文件：%1").arg(fp));
             return;
         }
-        FILEINFO info;
-        info.sFilePath       = fi.absoluteFilePath();
-        info.sFileName       = fi.fileName();
-        info.nFileLen        = fi.size();
-        info.nContentPositon = 0;
-        info.nState          = 0;
-        infos.append(info);
-        totalBytes += info.nFileLen;
-        allPaths << info.sFilePath;
+
+        // 已经是 FWDA 归档：读索引并展开条目
+        bool bFwda = false;
+        {
+            QFile probe(fp);
+            if (probe.open(QIODevice::ReadOnly))
+            {
+                char magic[4] = { 0, 0, 0, 0 };
+                bFwda = probe.read(magic, 4) == 4
+                        && std::memcmp(magic, FwArc::MAGIC, 4) == 0;
+            }
+        }
+        if (bFwda)
+        {
+            FwArc::Meta meta;
+            QString sArcErr;
+            if (!inspectArchive(fp, meta, sArcErr))
+            {
+                finish(false, tr("无法读取已合并归档：%1\n%2").arg(fp, sArcErr));
+                return;
+            }
+            for (const FwArc::Entry &e : meta.entries)
+            {
+                MergeSource s;
+                s.sSourcePath  = fp;
+                s.nOffset      = qint64(e.contentPos);
+                s.nLength      = qint64(e.size);
+                s.sStoredPath  = FwArc::sanitizeRelativePath(e.relPath);
+                s.sDisplayName = QFileInfo(e.relPath).fileName();
+                s.bFromArchive = true;
+                sources.append(s);
+                ++nArchiveEntries;
+            }
+            ++nArchiveInputs;
+            continue;
+        }
+
+        MergeSource s;
+        s.sSourcePath  = fi.absoluteFilePath();
+        s.nLength      = fi.size();
+        s.sDisplayName = fi.fileName();
+        sources.append(s);
+        plainAbsPaths << fi.absoluteFilePath();
     }
 
-    const QString sRoot = FwArc::commonRoot(allPaths);
+    if (sources.isEmpty())
+    {
+        finish(false, tr("没有可合并的内容（选中的归档都是空的）"));
+        return;
+    }
+
+    // 普通文件的存储路径按"相对公共根"生成；归档条目保持归档内的相对路径
+    const QString sRoot = FwArc::commonRoot(plainAbsPaths);
+    for (MergeSource &s : sources)
+    {
+        if (s.bFromArchive) continue;
+        s.sStoredPath = FwArc::sanitizeRelativePath(
+            FwArc::makeRelative(s.sSourcePath, sRoot));
+    }
+
+    // 路径去重：展开归档后很容易撞名（归档里已有 photo.png，同时又选中了 photo.png）。
+    // 撞名时在扩展名前加 " (2)"、" (3)"…，与原有条目区分开。
+    {
+        QSet<QString> used;
+        int nRenamed = 0;
+        for (MergeSource &s : sources)
+        {
+            const QString base = s.sStoredPath;
+            QString candidate = base;
+            int n = 1;
+            while (used.contains(candidate.toLower()))
+            {
+                ++n;
+                const int slash = base.lastIndexOf(QLatin1Char('/'));
+                const QString dir  = slash >= 0 ? base.left(slash + 1) : QString();
+                const QString name = slash >= 0 ? base.mid(slash + 1) : base;
+                const int dot = name.lastIndexOf(QLatin1Char('.'));
+                const QString stem = dot > 0 ? name.left(dot) : name;
+                const QString ext  = dot > 0 ? name.mid(dot) : QString();
+                candidate = dir + stem + QStringLiteral(" (%1)").arg(n) + ext;
+            }
+            if (candidate != base) ++nRenamed;
+            s.sStoredPath = candidate;
+            used.insert(candidate.toLower());
+        }
+        if (nRenamed > 0)
+            qWarning() << "[Merge] 有" << nRenamed << "个条目路径重复，已自动改名";
+    }
+
+    // FILEINFO 仍作为写入结构（内容偏移由 sources 决定）
+    QVector<FILEINFO> infos;
+    QStringList storedPaths;
+    qint64 totalBytes = 0;
+    for (const MergeSource &s : sources)
+    {
+        FILEINFO info;
+        info.sFilePath       = s.sStoredPath;
+        info.sFileName       = s.sDisplayName;
+        info.nFileLen        = s.nLength;
+        info.nContentPositon = s.nOffset;
+        info.nState          = 0;
+        infos.append(info);
+        storedPaths << s.sStoredPath;
+        totalBytes += s.nLength;
+    }
+
     const qint64 rootBytes = qint64(sRoot.toUtf8().size());
     qint64 needBytes = FwArc::GLOBAL_HDR + 4 + rootBytes
                      + FwArc::ENTRY_FIXED_V2 * infos.size() + totalBytes;
-    for (const FILEINFO &fi : infos)
-        needBytes += FwArc::makeRelative(fi.sFilePath, sRoot).toUtf8().size();
+    for (const QString &s : storedPaths)
+        needBytes += s.toUtf8().size();
 
     // 磁盘空间预检（P3-2）
     const qint64 freeBytes = FwArc::availableBytes(sOutputFile);
@@ -789,7 +901,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     QVector<qint64> crcFieldPos, contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err))
+    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
+                       &storedPaths))
     {
         fTmp.close(); QFile::remove(sTmp);
         finish(false, tr("写入归档头部失败：%1").arg(err));
@@ -800,18 +913,19 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     contentCrcs.reserve(infos.size());
     qint64 copiedTotal = 0;
     bool bOk = true;
-    for (int i = 0; i < infos.size() && bOk; ++i)
+    for (int i = 0; i < sources.size() && bOk; ++i)
     {
-        QFile src(infos.at(i).sFilePath);
+        const MergeSource &s = sources.at(i);
+        QFile src(s.sSourcePath);
         if (!src.open(QIODevice::ReadOnly))
         {
-            err = tr("打开输入文件失败：%1 (%2)").arg(infos.at(i).sFilePath, src.errorString());
+            err = tr("打开输入文件失败：%1 (%2)").arg(s.sSourcePath, src.errorString());
             bOk = false; break;
         }
         FwArc::Crc32 eCrc;
-        bOk = streamCopy(src, 0, infos.at(i).nFileLen, fTmp, eCrc,
+        bOk = streamCopy(src, s.nOffset, s.nLength, fTmp, eCrc,
                          copiedTotal, totalBytes,
-                         tr("正在合并: %1").arg(infos.at(i).sFileName), err);
+                         tr("正在合并: %1").arg(s.sDisplayName), err);
         contentCrcs.append(eCrc.value());
         src.close();
     }
@@ -852,8 +966,13 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
     QFile::remove(sBak);
-    finish(true, tr("文件合并成功：共 %1 个文件，%2")
-           .arg(infos.size()).arg(FwArc::formatSize(totalBytes)));
+
+    QString sDone = tr("文件合并成功：共 %1 个文件，%2")
+                        .arg(sources.size()).arg(FwArc::formatSize(totalBytes));
+    if (nArchiveEntries > 0)
+        sDone += tr("\n其中 %1 个条目来自 %2 个已合并归档（已先拆分再合并，不是嵌套归档）。")
+                     .arg(nArchiveEntries).arg(nArchiveInputs);
+    finish(true, sDone);
 }
 
 // ============================================================

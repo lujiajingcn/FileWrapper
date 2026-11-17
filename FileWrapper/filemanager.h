@@ -96,11 +96,12 @@ private:
     bool parseFile(const QString &sPath, FwArc::Meta &meta, QString &sErr) const;
     void setError(const QString &sMsg);
 
-    // 写 v2 头部（CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移
+    // 写 v2 头部（CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
+    // pStoredPaths 非空时直接用它作为每条目的存储路径（合并时展开已有归档用）。
     bool writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
                        const QString &sRoot, QVector<qint64> &outCrcFieldPos,
                        QVector<qint64> &outContentPos, qint64 &outHeaderSize,
-                       QString &sErr);
+                       QString &sErr, const QStringList *pStoredPaths = nullptr);
     // 回填内容 CRC + 头部 CRC
     bool finalizeV2Header(QFile &fOut, qint64 headerSize,
                           const QVector<qint64> &crcFieldPos,
