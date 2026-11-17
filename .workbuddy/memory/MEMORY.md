@@ -72,8 +72,9 @@
   OOXML → HTML → QTextBrowser（无第三方库）。两个必须记住的点：
   - Qt 6.9.3 富文本的 `margin-*` / `text-indent` **只认 px，不认 pt**（pt 被静默忽略，
     缩进会全丢）；`font-size` 用 pt 正常。见 2026-11-17 日志。
-  - 它链接了 `Qt6Xml.dll`，主程序自身不用 QtXml，必须由 `PluginWord.pro` 的
-    `QMAKE_POST_LINK` 复制到 exe 同级目录（否则 QPluginLoader 加载失败）。
+  - 它链接了 `Qt6Xml.dll`（主程序自身不用 QtXml）。**运行时依赖统一由
+    `FileWrapper/deploy/plugin-deps.manifest` 声明、构建末尾部署**，不要再往插件
+    的 `.pro` 里写 `QMAKE_POST_LINK`（会漏、会重复，Qt6Multimedia 当年就是这么漏的）。
   - 旧版 `.doc`（OLE2）与 `.rtf` 不解析，识别后提示另存为 .docx。
 - **PluginBook 依赖 vendored 的 libmobi**（`Plugins/PluginBook/thirdparty/libmobi`，
   上游 `bfabiszewski/libmobi` @ `9062742`）。它**曾以嵌套 Git 仓库形式存在**，
@@ -117,3 +118,13 @@
 
 覆盖远端 ref 前必须先校验**远端与本地文件路径集合一致**（`git ls-tree -r --name-only`），
 否则有覆盖他人提交的风险。
+
+> **2026-11-17 晚更新（重要）**：`github.com:443` 是**不稳定而非完全不可达** ——
+> 当晚 `git push origin main` 成功一次（`f2fb7dd..a37a1b2`），但同一时段的
+> `git ls-remote` / `git fetch` 仍然 21s 超时；`api.github.com` 始终可达。
+> 所以现在的推送策略应当是：
+> 1. 先直接 `git push`（可能成功，别提前假定不行）；
+> 2. 失败就重试 1–2 次（网络是抖动型）；
+> 3. 仍失败再走上面的 Git Data API 脚本；
+> 4. **无论哪条路，最后都用 `api.github.com/repos/<owner>/<repo>/git/ref/heads/main`
+>    核对远端 SHA == 本地 HEAD**（`ls-remote` 不可靠，会因超时误判成"没推上去"）。
