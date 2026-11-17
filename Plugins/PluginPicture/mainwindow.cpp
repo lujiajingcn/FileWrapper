@@ -10,6 +10,16 @@ MainWindow::MainWindow(QWidget *parent) :
     ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
+
+    // 两个常用视图动作：适应窗口 / 实际大小（不改 .ui，直接追加到工具栏）
+    QAction *pFit = new QAction(tr("适应窗口"), this);
+    pFit->setToolTip(tr("按窗口大小显示整张图片"));
+    QAction *pActual = new QAction(tr("实际大小"), this);
+    pActual->setToolTip(tr("按 100% 原始像素显示"));
+    ui->toolBar->addAction(pFit);
+    ui->toolBar->addAction(pActual);
+    connect(pFit, &QAction::triggered, this, &MainWindow::on_actFit_triggered);
+    connect(pActual, &QAction::triggered, this, &MainWindow::on_actActualSize_triggered);
 }
 
 MainWindow::~MainWindow()
@@ -105,6 +115,34 @@ void MainWindow::applyTransform()
                                     Qt::KeepAspectRatio, Qt::SmoothTransformation);
     ui->labelPicture->setPixmap(scaled);
     ui->labelPicture->adjustSize();
+}
+
+void MainWindow::on_actFit_triggered()
+{
+    if (m_originalPix.isNull())
+        return;
+
+    // 旋转 90/270 时宽高互换后再算适应比例
+    QSize orig = m_originalPix.size();
+    if (m_rotateDeg == 90 || m_rotateDeg == 270)
+        orig.transpose();
+
+    const QSize avail = ui->labelPicture->contentsRect().size();
+    if (avail.width() <= 0 || avail.height() <= 0 || orig.isEmpty())
+        return;
+
+    m_scale = qMin(qreal(avail.width()) / orig.width(),
+                   qreal(avail.height()) / orig.height());
+    m_scale = qBound(0.1, m_scale, 8.0);
+    applyTransform();
+}
+
+void MainWindow::on_actActualSize_triggered()
+{
+    if (m_originalPix.isNull())
+        return;
+    m_scale = 1.0;
+    applyTransform();
 }
 
 void MainWindow::on_actZoomIn_triggered()

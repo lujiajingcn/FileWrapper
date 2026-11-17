@@ -23,6 +23,8 @@ private slots:
     void on_actZoomIn_triggered();
     void on_actZoomOut_triggered();
     void on_actRotate_triggered();
+    void on_actFit_triggered();          // 适应窗口
+    void on_actActualSize_triggered();   // 实际大小 100%
 
 private:
     void applyTransform();  // 根据当前缩放/旋转重新绘制

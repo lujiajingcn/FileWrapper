@@ -10,6 +10,12 @@ DlgAbout::DlgAbout(QWidget *parent) :
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 }
 
+void DlgAbout::setExtraInfo(const QString &sHtml)
+{
+    if (!sHtml.isEmpty())
+        ui->textEdit->append(sHtml);
+}
+
 DlgAbout::~DlgAbout()
 {
     delete ui;

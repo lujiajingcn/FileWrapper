@@ -931,6 +931,14 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
 
     TabDoc doc = m_vTabDocs.at(cur);   // 用副本，避免下方摘除/插入元素后引用失效
 
+    // 当前标签页已打开别的文件时提示一下（双击默认替换当前页，新标签页需右键）
+    if (doc.hasFile)
+    {
+        statusBar()->showMessage(
+            tr("已在当前标签页替换为「%1」；如需另开，请右键选择「打开新标签页」")
+                .arg(info.sFileName), 5000);
+    }
+
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
     bool bOwned = false;
@@ -1117,7 +1125,23 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     {
         QString sTemp, sErr;
         bool bNoSpace = false;
-        if (extractToTempFile(info, sTemp, sErr, &bNoSpace))
+        // 大文件抽取可能持续数秒：显示可取消的进度（复用 FileManager 的 progressChanged）
+        QProgressDialog dlgProgress(tr("正在准备大文件..."), tr("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(tr("准备文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        dlgProgress.setValue(0);
+        bool bDummy = false;
+        QString sDummy;
+        beginProgressOperation(&dlgProgress, &bDummy, &sDummy);
+        dlgProgress.show();
+        QApplication::processEvents();
+        const bool bExtracted = extractToTempFile(info, sTemp, sErr, &bNoSpace);
+        dlgProgress.close();
+        endProgressOperation();
+        if (bExtracted)
         {
             if (iface->sendFile(PluginFile::fromPath(sTemp, info.sFileName)))
                 return;
@@ -1129,6 +1153,13 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             // 直接给用户一个能照做的提示，并清掉内容区。
             QMessageBox::warning(this, QStringLiteral("打不开文件"), sErr);
             iface->sendFileData(nullptr, 0);
+            return;
+        }
+        else if (sErr.contains(tr("取消")))
+        {
+            // 用户取消：清空内容区并退出，不要退回内存通道把大文件读进内存
+            iface->sendFileData(nullptr, 0);
+            syncActionStates();
             return;
         }
         else
@@ -1867,6 +1898,7 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
 {
     endProgressOperation();
     m_pActiveProgress = dlg;
+    m_progressTimer.start();
     *pbOk = false;
     psResultMsg->clear();
 
@@ -1882,7 +1914,23 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
     m_connProgress = connect(m_fileManager, &FileManager::progressChanged, this,
         [this](qint64 cur, qint64 total, const QString &status) {
             if (m_pActiveProgress == nullptr) return;
-            if (total > 0) m_pActiveProgress->setValue(int(100 * cur / total));
+            if (total > 0)
+            {
+                const int nPct = int(100 * cur / total);
+                m_pActiveProgress->setValue(nPct);
+                // 进度 ETA：进度稳定后按"已用时间 / 完成比例"估算剩余时间
+                if (nPct >= 3 && nPct < 100)
+                {
+                    const qint64 nElapsed = m_progressTimer.elapsed();
+                    const qint64 nRemainMs = nElapsed * (100 - nPct) / nPct;
+                    if (nRemainMs >= 1000)
+                    {
+                        m_pActiveProgress->setLabelText(
+                            status + tr(" · 剩余约 %1 秒").arg(nRemainMs / 1000));
+                        return;
+                    }
+                }
+            }
             m_pActiveProgress->setLabelText(status);
         });
     m_connFinished = connect(m_fileManager, &FileManager::operationFinished, this,
@@ -2219,6 +2267,13 @@ void MainWindow::saveUiState()
 void MainWindow::on_actionAbout_triggered()
 {
     DlgAbout dlgAbout;
+    dlgAbout.setExtraInfo(tr(
+        "<hr><p><b>版本</b>：1.0（%1 构建）<br>"
+        "<b>已加载插件</b>：%2 个<br>"
+        "<b>Qt</b>：%3</p>")
+        .arg(QStringLiteral(__DATE__))
+        .arg(PluginManager::getInstance()->getAllInterfaces().size())
+        .arg(QString::fromLatin1(qVersion())));
     dlgAbout.exec();
 }
 

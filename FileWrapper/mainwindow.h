@@ -18,6 +18,7 @@
 #include <QStringList>
 #include <QVector>
 #include <QMetaObject>
+#include <QElapsedTimer>
 
 class QProgressDialog;
 class QCloseEvent;
@@ -158,6 +159,7 @@ private:
     QMetaObject::Connection  m_connFinished;
     QMetaObject::Connection  m_connCancel;
     QProgressDialog         *m_pActiveProgress = nullptr;
+    QElapsedTimer            m_progressTimer;
 
     void openFileInNewTab(const FILEINFO& info);
     void openFileInCurrentTab(const FILEINFO& info);

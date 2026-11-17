@@ -15,6 +15,9 @@ public:
     explicit DlgAbout(QWidget *parent = nullptr);
     ~DlgAbout();
 
+    // 追加运行信息（版本、构建时间、已加载插件数等）
+    void setExtraInfo(const QString &sHtml);
+
 private:
     Ui::DlgAbout *ui;
 };
