@@ -743,18 +743,23 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     // ---- 收集输入：已合并的 .dat（FWDA）先拆分成条目，再一起合并 ----
     // 把 .dat 当成普通文件嵌进输出会变成"归档套归档"，用户还要再拆一层；
-    // 这里直接读它的索引，把每个条目作为独立输入展开（保留归档内的相对路径）。
+    // 这里直接读它的索引，把每个条目作为独立输入展开。
+    //
+    // 关键点：每个条目都要记住**它原本的完整路径**（归档 = 该归档的 root + 归档内相对路径；
+    // 普通文件 = 绝对路径），最后再统一决定外层归档的 root。否则会出现
+    // "E:/testfiles_copy 里的文件合并进来后被挂到 D: 下"这种归属错乱。
     struct MergeSource {
         QString sSourcePath;      // 实际读取的文件（普通文件或 FWDA 归档）
         qint64  nOffset   = 0;    // 内容在源文件里的偏移
         qint64  nLength   = 0;
-        QString sStoredPath;      // 写入输出归档的相对路径
+        QString sOriginPath;      // 原本的完整展示路径（决定它归到哪个目录）
+        QString sStoredPath;      // 写入输出归档的路径（由 sOriginPath 推导）
         QString sDisplayName;     // 进度与错误提示
         bool    bFromArchive = false;
     };
 
     QVector<MergeSource> sources;
-    QStringList plainAbsPaths;    // 普通文件（用来算公共根）
+    QStringList allOrigins;       // 所有条目的原始完整路径
     int nArchiveInputs = 0;       // 被拆分的归档个数
     int nArchiveEntries = 0;      // 展开出来的条目数
 
@@ -793,10 +798,14 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.sSourcePath  = fp;
                 s.nOffset      = qint64(e.contentPos);
                 s.nLength      = qint64(e.size);
-                s.sStoredPath  = FwArc::sanitizeRelativePath(e.relPath);
+                // 用来源归档的 root 还原它原本的完整路径；手工构造的归档可能没有 root
+                s.sOriginPath  = meta.root.isEmpty()
+                                     ? e.relPath
+                                     : meta.root + QLatin1Char('/') + e.relPath;
                 s.sDisplayName = QFileInfo(e.relPath).fileName();
                 s.bFromArchive = true;
                 sources.append(s);
+                allOrigins << s.sOriginPath;
                 ++nArchiveEntries;
             }
             ++nArchiveInputs;
@@ -806,9 +815,10 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         MergeSource s;
         s.sSourcePath  = fi.absoluteFilePath();
         s.nLength      = fi.size();
+        s.sOriginPath  = fi.absoluteFilePath();
         s.sDisplayName = fi.fileName();
         sources.append(s);
-        plainAbsPaths << fi.absoluteFilePath();
+        allOrigins << s.sOriginPath;
     }
 
     if (sources.isEmpty())
@@ -817,13 +827,42 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
-    // 普通文件的存储路径按"相对公共根"生成；归档条目保持归档内的相对路径
-    const QString sRoot = FwArc::commonRoot(plainAbsPaths);
+    // ---- 决定外层归档的 root ----
+    // 理想情况：所有条目都在同一个公共目录下（常见于普通合并），storePath 取相对路径，
+    // 显示时 root + 相对路径，既短又能保留目录结构。
+    // 跨盘符 / 无公共根时（如 E: 的归档 + D: 的文件）：root 只能为空，此时把盘符
+    // 当成首段（"E:/x" → "E/x"）写进路径，保证来源目录不会丢。
+    QString sRoot = FwArc::commonRoot(allOrigins);
+    bool bFlatOrigin = sRoot.isEmpty();
+    if (!bFlatOrigin)
+    {
+        for (const MergeSource &s : sources)
+        {
+            const QString o = FwArc::normalizePath(s.sOriginPath);
+            if (!(o.compare(sRoot, Qt::CaseInsensitive) == 0
+                  || o.startsWith(sRoot + QLatin1Char('/'), Qt::CaseInsensitive)))
+            {
+                bFlatOrigin = true;      // 公共根其实覆盖不到该条目，退回扁平模式
+                break;
+            }
+        }
+    }
+    if (bFlatOrigin) sRoot.clear();
+
     for (MergeSource &s : sources)
     {
-        if (s.bFromArchive) continue;
-        s.sStoredPath = FwArc::sanitizeRelativePath(
-            FwArc::makeRelative(s.sSourcePath, sRoot));
+        if (!bFlatOrigin)
+        {
+            s.sStoredPath = FwArc::sanitizeRelativePath(
+                FwArc::makeRelative(s.sOriginPath, sRoot));
+        }
+        else
+        {
+            QString o = FwArc::normalizePath(s.sOriginPath);
+            if (o.size() >= 2 && o.at(1) == QLatin1Char(':') && o.at(0).isLetter())
+                o = o.left(1) + o.mid(2);        // "E:/x" -> "E/x"（冒号不能进路径段）
+            s.sStoredPath = FwArc::sanitizeRelativePath(o);
+        }
     }
 
     // 路径去重：展开归档后很容易撞名（归档里已有 photo.png，同时又选中了 photo.png）。
