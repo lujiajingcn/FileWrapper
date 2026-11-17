@@ -51,7 +51,7 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下有 168 项断言的插件测试套件，
+- **回归测试在仓库里（C4）**：`tests/` 下有 171 项断言的插件测试套件，
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
@@ -87,8 +87,7 @@
   单元格、合并单元格；不计算公式/样式）与 PluginSlides（`.pptx/.odp` 逐页标题+正文+图片；
   不还原版式坐标/主题/动画）。两者都用 `Plugins/common/zipreader` + QDomDocument，
   依赖 Qt6Xml（已在部署清单）。新增同族格式时优先往这两个插件里加分支，而不是再开插件。
-- **"打不开的文件"要先按内容识别**（`FileWrapper/formatresolver.{h,cpp}`）：
-  `resolvePlugin()` 在选择不到插件时用 `FileManager::entryHead(256KB)` 取文件头，
+- **"打不开的文件"要先按内容识别**（`FileWrapper/formatresolver.{h,cpp}`）：  `resolvePlugin()` 在选择不到插件时用 `FileManager::entryHead(256KB)` 取文件头，
   按魔数/包内标志判断真实格式（PDF/PNG/JPEG/OLE2/ZIP→docx/xlsx/pptx/odt/ods/odp/epub/
   音视频/压缩包…）；能交给现有插件就直接路由并提示"按内容识别为 X"。
   识别不出来才弹「无法打开该文件」对话框：给出**识别结果 + 判断依据 + 可照做的建议**，
@@ -96,6 +95,13 @@
   **插件映射只在用户明确知道该选哪个插件时才有用**，不要再把它当主入口。
   「插件设置 → 支持的格式…」会列出每个已装插件的后缀，以及常见不支持格式的处理建议。
   注意扩展名不可信（下载改名、.dat/.bin、无后缀），内容判断优先于扩展名。
+- **合并时"已有归档"先拆分**（`FileManager::QMergeFiles`）：选中的文件如果首 4 字节是
+  `FWDA` 魔数，就读它的索引（`inspectArchive`）把条目作为独立输入展开，保留归档内
+  相对路径；不会把 `.dat` 当普通文件嵌成"归档套归档"。撞名（归档里已有 photo.png
+  又选了 photo.png）自动在扩展名前加 ` (2)`。`writeV2Header` 因此多了一个可选参数
+  `pStoredPaths`：给了就直接用它当存储路径，不给仍按"绝对路径相对公共根"生成。
+  合并对话框在检测到归档输入时会提示"其中 N 个是已合并归档，将先拆分再合并"。
+  测试见 `tests/plugin_tests.cpp` 的 G 组（普通合并→再合并→撞名改名）。
 - **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
   - `pluginbase.h`：`PluginBase<Derived, WindowT>`（CRTP）收口构造/析构、`apiVersion`、
     `getPluginWidget`、`createInstance`、`sendFile`/`sendFileData` 适配；
