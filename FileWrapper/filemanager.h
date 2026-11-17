@@ -88,6 +88,14 @@ public slots:
 private:
     QString getFileName(QString sFilePath);
     bool rewriteArchive();
+
+    // 计算写归档用的 root 与每个条目的存储路径（与合并逻辑保持一致）：
+    // - 所有条目在同一公共根下：root = 公共根，条目存相对路径（保留目录结构）
+    // - 跨盘 / 无公共根：root 为空，盘符当首段（"E:/x" -> "E/x"）
+    // 同时拒绝会撞成同一路径的条目（否则保存后无法区分）。
+    static bool computeStoredPaths(const QVector<FILEINFO> &infos,
+                                   QString &sRoot, QStringList &storedPaths,
+                                   QString &sErr);
     // v2 快速删除：只把被删条目的 PathLength 置为 0（墓碑）并重算头部 CRC，
     // 不触碰内容区，避免为一个小删除重写整个 10 GB 归档（P1-3）
     bool markDeletedOnly(QString &sErr);

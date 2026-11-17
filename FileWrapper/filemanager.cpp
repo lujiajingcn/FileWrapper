@@ -1162,6 +1162,82 @@ bool FileManager::markDeletedOnly(QString &sErr)
     return true;
 }
 
+// 写归档时的路径规划：与合并（QMergeFiles）用同一套规则，避免"保存后目录结构被拍平"。
+// 之前 rewriteArchive 直接用 commonRoot + makeRelative：跨盘时 commonRoot 为空，
+// makeRelative 退化成文件名，导致所有条目路径丢失、同名条目变成重复路径。
+bool FileManager::computeStoredPaths(const QVector<FILEINFO> &infos,
+                                     QString &sRoot, QStringList &storedPaths,
+                                     QString &sErr)
+{
+    sRoot.clear();
+    storedPaths.clear();
+
+    if (infos.isEmpty())
+    {
+        sErr = tr("没有可写入的条目");
+        return false;
+    }
+
+    QStringList allPaths;
+    allPaths.reserve(infos.size());
+    for (const FILEINFO &fi : infos)
+        allPaths << fi.sFilePath;
+
+    QString root = FwArc::commonRoot(allPaths);
+    bool bFlat = root.isEmpty();
+    if (!bFlat)
+    {
+        for (const FILEINFO &fi : infos)
+        {
+            const QString p = FwArc::normalizePath(fi.sFilePath);
+            if (!(p.compare(root, Qt::CaseInsensitive) == 0
+                  || p.startsWith(root + QLatin1Char('/'), Qt::CaseInsensitive)))
+            {
+                bFlat = true;     // 公共根覆盖不到该条目，退回扁平模式
+                break;
+            }
+        }
+    }
+    if (bFlat) root.clear();
+
+    QHash<QString, QString> seen;   // 小写路径 -> 原始路径
+    for (const FILEINFO &fi : infos)
+    {
+        QString rel;
+        if (!bFlat)
+        {
+            rel = FwArc::makeRelative(fi.sFilePath, root);
+        }
+        else
+        {
+            QString p = FwArc::normalizePath(fi.sFilePath);
+            if (p.size() >= 2 && p.at(1) == QLatin1Char(':') && p.at(0).isLetter())
+                p = p.left(1) + p.mid(2);          // "E:/x" -> "E/x"
+            rel = p;
+        }
+        rel = FwArc::sanitizeRelativePath(rel);
+        if (rel.isEmpty())
+        {
+            sErr = tr("无法为条目生成归档内路径：%1").arg(fi.sFilePath);
+            return false;
+        }
+
+        const QString key = rel.toLower();
+        if (seen.contains(key))
+        {
+            sErr = tr("归档内出现重复路径，保存后无法区分条目：%1\n"
+                      "请先删除同名条目（或调整其所在目录）后重试。")
+                       .arg(rel);
+            return false;
+        }
+        seen.insert(key, rel);
+        storedPaths.append(rel);
+    }
+
+    sRoot = root;
+    return true;
+}
+
 bool FileManager::rewriteArchive()
 {
     if (!isArchiveLoaded()) { setError(tr("没有已加载的归档")); return false; }
@@ -1180,16 +1256,24 @@ bool FileManager::rewriteArchive()
         qWarning() << "[FileManager] 快速删除不可用，回退完整重写:" << fastErr;
     }
 
-    QStringList allPaths;
+    QString sRoot;
+    QStringList storedPaths;
+    QString pathErr;
+    if (!computeStoredPaths(infos, sRoot, storedPaths, pathErr))
+    {
+        setError(pathErr);
+        return false;
+    }
+
     qint64 totalBytes = 0;
     for (const FILEINFO &fi : infos)
-    {
-        allPaths << fi.sFilePath;
         totalBytes += fi.nFileLen;
-    }
-    const QString sRoot = FwArc::commonRoot(allPaths);
-    const qint64 needBytes = FwArc::GLOBAL_HDR + 4 + qint64(sRoot.toUtf8().size())
-                           + FwArc::ENTRY_FIXED_V2 * infos.size() + totalBytes;
+
+    // 头部按实际存储路径精确计算（含每条路径字节），避免空间预检偏小
+    qint64 headerBytes = FwArc::GLOBAL_HDR + 4 + qint64(sRoot.toUtf8().size());
+    for (const QString &rel : storedPaths)
+        headerBytes += FwArc::ENTRY_FIXED_V2 + rel.toUtf8().size();
+    const qint64 needBytes = headerBytes + totalBytes;
     const qint64 freeBytes = FwArc::availableBytes(sArchivePath);
     if (freeBytes >= 0 && freeBytes < needBytes)
     {
@@ -1211,7 +1295,8 @@ bool FileManager::rewriteArchive()
     QVector<qint64> crcFieldPos, contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err))
+    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
+                       &storedPaths))
     {
         fTmp.close(); QFile::remove(sTmp);
         setError(tr("写入归档头部失败：%1").arg(err));
