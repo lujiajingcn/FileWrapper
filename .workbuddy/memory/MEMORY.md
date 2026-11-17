@@ -128,3 +128,13 @@
 > 3. 仍失败再走上面的 Git Data API 脚本；
 > 4. **无论哪条路，最后都用 `api.github.com/repos/<owner>/<repo>/git/ref/heads/main`
 >    核对远端 SHA == 本地 HEAD**（`ls-remote` 不可靠，会因超时误判成"没推上去"）。
+>
+> 当晚实际过程：前 3 个提交（`83a465e`/`63544ac`/`a37a1b2`）是用**普通 `git push`
+> 一次成功**的；随后 `github.com` 再次不可达（DNS 仍解析到 20.6.7.17，
+> `http.curloptResolve` 指到真实 IP 也 SSL reset / timeout），最后一个提交
+> `d2d2361` 改走上面的 Git Data API 脚本才推上去。
+>
+> **API 脚本的编码坑**：脚本里 `say()` 输出 `✔` 这类字符在 GBK 控制台会抛
+> `UnicodeEncodeError`，而且是在 `PATCH ref` **之前**崩 —— 表现为"commit 建好了但
+> ref 没动"。运行前必须设 `$env:PYTHONIOENCODING='utf-8'`
+> （必要时再加 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`）。
