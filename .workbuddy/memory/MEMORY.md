@@ -196,3 +196,8 @@
 > `UnicodeEncodeError`，而且是在 `PATCH ref` **之前**崩 —— 表现为"commit 建好了但
 > ref 没动"。运行前必须设 `$env:PYTHONIOENCODING='utf-8'`
 > （必要时再加 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`）。
+- **文本查看器查找**：PluginText 工具栏搜索框 + Ctrl+F/F3；`findText()` 循环查找。
+- **分割预填 / 加载确认**：`FileManager::archivePath()` + `DlgSplitFile::setMergedFilePath()`；
+  已加载归档时加载新归档会先确认"关闭所有标签页"。
+- **可运行打包**：`FileWrapper/deploy/package.ps1`（复制依赖后跑 windeployqt，
+  产出可直接双击的目录；构建目录本身不可双击运行）。
