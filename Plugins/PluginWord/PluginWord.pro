@@ -20,11 +20,13 @@ CONFIG += c++17
 SOURCES += \
         mainwindow.cpp \
         pluginword.cpp \
+        rtfdocument.cpp \
         worddocument.cpp
 
 HEADERS += \
         mainwindow.h \
         pluginword.h \
+        rtfdocument.h \
         worddocument.h
 
 FORMS += \

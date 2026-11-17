@@ -11,6 +11,7 @@
 #include <QVector>
 
 #include "zipreader.h"
+#include "rtfdocument.h"
 
 // ============================================================================
 // WordDocument：把 .docx（OOXML / WordprocessingML）转换成 QTextBrowser 能渲染的 HTML。
@@ -184,6 +185,8 @@ private:
     static double odtLenToPt(const QString &value);
 
     bool         m_isOdt = false;
+    bool         m_isRtf = false;
+    RtfDocument  m_rtf;                         // .rtf 子集解析（段落/字符/对齐/缩进）
     QDomDocument m_odtContent;                  // content.xml
     QDomElement  m_odtText;                     // office:text
     QDomDocument m_odtStyleDoc;                 // styles.xml（可选）

@@ -524,6 +524,15 @@ void WordDocument::reset()
     m_imageSeq = 0;
     m_targetToUrl.clear();
     m_imageCache.clear();
+    m_rtf.reset();
+    m_isRtf = false;
+    m_isOdt = false;
+    m_odtContent = QDomDocument();
+    m_odtText = QDomElement();
+    m_odtStyleDoc = QDomDocument();
+    m_odtStyles.clear();
+    m_odtFontFaces.clear();
+    m_odtListOrdered.clear();
     m_ok = false;
 }
 
@@ -562,10 +571,15 @@ bool WordDocument::open(const QByteArray &data, QString *error)
     {
         const QByteArray head = data.left(5);
         if (head == QByteArrayLiteral("{\\rtf"))
-            return fail(QStringLiteral(
-                "这是 RTF 富文本格式（.rtf），不是 .docx。\n\n"
-                "RTF 是另一套控制字格式，本插件不做支持。\n\n"
-                "请用 Word / WPS 另存为 .docx 后重新打开。"));
+        {
+            if (!m_rtf.open(data, &m_error))
+                return fail(m_error.isEmpty()
+                                ? QStringLiteral("无法解析该 RTF 文档。") : m_error);
+            m_isRtf = true;
+            m_ok = true;
+            m_title = QStringLiteral("RTF 文档");
+            return true;
+        }
     }
 
     if (!m_zip.open(data))
@@ -950,6 +964,18 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     m_numCounters.clear();
     m_truncated = false;
     m_blockBudget = 0;
+
+    // RTF 走自己的轻量解析器：直接产出 HTML，不需要 ZipReader / 样式表
+    if (m_isRtf)
+    {
+        RenderResult rtfRes;
+        rtfRes.html = m_rtf.render(fontScale);
+        m_stats.paragraphs = m_rtf.paragraphs().size();
+        m_stats.chars      = m_rtf.charCount();
+        m_stats.images     = 0;
+        rtfRes.truncated   = false;
+        return rtfRes;
+    }
 
     QStringList out;
     if (m_isOdt)
