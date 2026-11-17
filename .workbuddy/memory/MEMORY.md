@@ -17,6 +17,17 @@
   `pb->seekable=0`、`avio_size()` 失败，使 FLV/TS/AVI 无法 seek、MP3/TS 时长错。
   详见 2026-11-13 日志与 `.workbuddy/tmp/seek_probe/` 探针。
 - seek 后目标前的包必须照常送解码器（不能丢包，否则 P/B 帧无参考帧），只跳过显示/音频输出。
+- **PluginMedia 的视频缩放上下文（sws）与 RGB 输出缓冲归解码线程所有**
+  （`VideoWorker::m_sws/m_outBuf/m_outData`），主线程只发尺寸请求
+  （`requestOutputSize()` → 打包进 `std::atomic<quint64>`）。
+  原因：窗口缩放要换输出尺寸就必须释放旧缓冲再重建，若缓冲归主线程，
+  主线程释放时解码线程可能正在 `sws_scale` → use-after-free。
+  释放只能走 `releaseVideoResources()`，且**必须在解码线程已停止后**调用。
+  详见 2026-11-17 日志。
+- 窗口尺寸变化不能只靠 `resizeEvent` 里读控件尺寸：resize 到达时布局可能还没
+  按新尺寸算完，必须 `ui->mainLayout->activate()` 后再读；
+  `QTimer::singleShot(0)` 在 Unix 事件派发器里**先于 posted 事件**执行，
+  不能指望「延后一轮」就自动拿到新布局。
 - 各插件 widget 是唯一共享实例，多标签页在页间迁移（见 2026-09-07 日志）。
 - **PluginBook 依赖 vendored 的 libmobi**（`Plugins/PluginBook/thirdparty/libmobi`，
   上游 `bfabiszewski/libmobi` @ `9062742`）。它**曾以嵌套 Git 仓库形式存在**，
