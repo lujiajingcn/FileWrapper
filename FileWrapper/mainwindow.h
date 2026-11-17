@@ -90,7 +90,15 @@ protected:
 
     void collectExpandedItems(const QModelIndex &index, const QString &sKeyPrefix, QSet<QString> &setExpanded);
     void restoreExpandedItems(const QModelIndex &index, const QString &sKeyPrefix, const QSet<QString> &setExpanded);
+    // 取消 / 保存
     bool confirmDiscardOrSaveIfDirty();
+    // 校验并加载归档（加载文件与"打开合并结果"共用；失败时保持当前归档不变）
+    void loadArchiveFile(const QString &sFileName);
+    // 文件列表筛选（按路径/文件名，大小写不敏感）
+    bool matchesFilter(const FILEINFO &info) const;
+    static QString typeLabel(const QString &sFileName);
+    void saveUiState();
+    void restoreUiState();
     // 文件列表双击的统一处理（目录 -> 展开/收起，文件 -> 打开）
     void handleFileListDoubleClick(const QModelIndex &index);
 
@@ -116,6 +124,8 @@ private:
     };
 
     QStandardItemModel      *m_hModelFilePath;
+    QLineEdit               *m_leFilter = nullptr;
+    QString                  m_sFilter;
     FileManager             *m_fileManager;
 
     QStackedWidget          *m_swShowArea;

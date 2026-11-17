@@ -39,6 +39,7 @@
 #include <QSettings>
 #include <QMouseEvent>
 #include <QCloseEvent>
+#include <QLineEdit>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
@@ -137,6 +138,7 @@ MainWindow::MainWindow(QWidget *parent) :
 
     initWidgetFilePath();
     initWidgetFileContent();
+    restoreUiState();
 
     // 启动时一次性加载所有插件（避免每次双击重复 reload）
     PluginManager::getInstance()->loadAllPlugins();
@@ -264,9 +266,16 @@ void MainWindow::onFileManagerWarning(const QString &sMsg)
 void MainWindow::initWidgetFilePath()
 {
     m_hModelFilePath = new QStandardItemModel;
-    m_hModelFilePath->setColumnCount(1);
+    m_hModelFilePath->setColumnCount(3);
+    m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
+    m_hModelFilePath->setHeaderData(1, Qt::Horizontal, tr("大小"));
+    m_hModelFilePath->setHeaderData(2, Qt::Horizontal, tr("类型"));
     m_tvFilePath = ui->treeView;
     m_tvFilePath->setModel(m_hModelFilePath);
+    m_tvFilePath->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_tvFilePath->setSortingEnabled(false);
 
     // 添加工具栏
     m_tbFilePath = new QToolBar(ui->dwFilePath);
@@ -293,6 +302,17 @@ void MainWindow::initWidgetFilePath()
     m_tbFilePath->addAction(m_acDelFile);
     m_tbFilePath->addAction(m_acOutputFile);
     m_tbFilePath->addAction(m_acSaveFile);
+
+    // 筛选框：按路径/文件名过滤列表（树形与平铺模式都生效）
+    m_leFilter = new QLineEdit(m_tbFilePath);
+    m_leFilter->setPlaceholderText(tr("筛选文件名/路径…"));
+    m_leFilter->setClearButtonEnabled(true);
+    m_leFilter->setMaximumWidth(200);
+    m_tbFilePath->addWidget(m_leFilter);
+    connect(m_leFilter, &QLineEdit::textChanged, this, [this](const QString &sText) {
+        m_sFilter = sText.trimmed();
+        refreshFilePathView();
+    });
 
     connect(m_acViewTree, &QAction::triggered, this, &MainWindow::onActionViewTreeTriggered);
     connect(m_acViewFlat, &QAction::triggered, this, &MainWindow::onActionViewFlatTriggered);
@@ -1356,6 +1376,11 @@ void MainWindow::on_actionLoadFile_triggered()
     }
 
     // —— P1-6：先做完整解析校验，失败时完全不触碰当前归档 / 视图 / 脏状态 ——
+    loadArchiveFile(sFileName);
+}
+
+void MainWindow::loadArchiveFile(const QString &sFileName)
+{
     QString sErr;
     if (!m_fileManager->validateMergedFile(sFileName, &sErr))
     {
@@ -1457,10 +1482,22 @@ void MainWindow::on_actionMergeFile_triggered()
         setOperationsEnabled(true);
         syncActionStates();
 
-        if (bOk)
-            QMessageBox::information(this, QStringLiteral("合并文件"), sResultMsg);
-        else
+        if (!bOk)
+        {
             QMessageBox::critical(this, QStringLiteral("合并文件"), sResultMsg);
+        }
+        else
+        {
+            // 合并成功：提供「打开合并结果」，省掉再走一次「加载文件」并重新选路径
+            QMessageBox box(QMessageBox::Information, QStringLiteral("合并文件"),
+                            sResultMsg, QMessageBox::NoButton, this);
+            QPushButton *pOpen = box.addButton(tr("打开合并结果"), QMessageBox::AcceptRole);
+            box.addButton(tr("关闭"), QMessageBox::RejectRole);
+            box.setDefaultButton(pOpen);
+            box.exec();
+            if (box.clickedButton() == pOpen && confirmDiscardOrSaveIfDirty())
+                loadArchiveFile(sMergedFilePath);
+        }
     }
 }
 
@@ -1643,15 +1680,37 @@ void MainWindow::populateFilePathList(bool bShowPath)
     QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
     int nRow = 0;
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
-    for(QVector<FILEINFO>::const_iterator cIt = vtFileInfos.begin(); cIt != vtFileInfos.end(); cIt++, nRow++)
+    for (const FILEINFO &info : vtFileInfos)
     {
-        QStandardItem* hItemName = new QStandardItem(bShowPath ? (*cIt).sFilePath : (*cIt).sFileName);
-        hItemName->setToolTip(normalizePath((*cIt).sFilePath));
+        if (!matchesFilter(info))
+            continue;
+        QStandardItem* hItemName = new QStandardItem(bShowPath ? info.sFilePath : info.sFileName);
+        hItemName->setToolTip(normalizePath(info.sFilePath));
         QVariant var;
-        var.setValue(*cIt);
+        var.setValue(info);
         hItemName->setData(var);
+        QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
+        pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
         m_hModelFilePath->setItem(nRow, 0, hItemName);
+        m_hModelFilePath->setItem(nRow, 1, pSize);
+        m_hModelFilePath->setItem(nRow, 2, pType);
+        ++nRow;
     }
+}
+
+bool MainWindow::matchesFilter(const FILEINFO &info) const
+{
+    if (m_sFilter.isEmpty())
+        return true;
+    return info.sFilePath.contains(m_sFilter, Qt::CaseInsensitive)
+        || info.sFileName.contains(m_sFilter, Qt::CaseInsensitive);
+}
+
+QString MainWindow::typeLabel(const QString &sFileName)
+{
+    const QString sSuffix = QFileInfo(sFileName).suffix();
+    return sSuffix.isEmpty() ? tr("文件") : sSuffix.toUpper();
 }
 
 // 树形模式：把条目里保存的原始路径还原成目录层级
@@ -1667,7 +1726,13 @@ void MainWindow::populateFilePathTree()
 
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
 
-    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
+    // 按筛选词过滤（树形模式只保留匹配的文件，目录层级随匹配文件重建）
+    QVector<FILEINFO> vtFileInfos;
+    for (const FILEINFO &info : m_fileManager->getFileInfos())
+        if (matchesFilter(info))
+            vtFileInfos << info;
+    if (vtFileInfos.isEmpty())
+        return;
     QStringList prefixSegs = commonDirPrefix(vtFileInfos);
     const QString sRootText = prefixSegs.join('/');
 
@@ -1715,11 +1780,19 @@ void MainWindow::populateFilePathTree()
         QVariant var;
         var.setValue(info);
         hFile->setData(var);
+        QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
+        pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
 
         if (pParent != nullptr)
-            pParent->appendRow(hFile);
+            pParent->appendRow(QList<QStandardItem *>() << hFile << pSize << pType);
         else
-            m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hFile);
+        {
+            const int nRow = m_hModelFilePath->rowCount();
+            m_hModelFilePath->setItem(nRow, 0, hFile);
+            m_hModelFilePath->setItem(nRow, 1, pSize);
+            m_hModelFilePath->setItem(nRow, 2, pType);
+        }
     }
 
     // 单链目录压缩
@@ -1913,6 +1986,7 @@ void MainWindow::onActionViewTreeTriggered()
     if (m_bTreeMode)
         return;
     m_bTreeMode = true;
+    m_tvFilePath->setSortingEnabled(false);
     populateFilePathView(m_bShowPath);
 }
 
@@ -1922,6 +1996,9 @@ void MainWindow::onActionViewFlatTriggered()
         return;
     m_bTreeMode = false;
     populateFilePathView(m_bShowPath);
+    // 平铺模式支持点列头排序（树形模式的层级不应被排序打散）
+    m_tvFilePath->setSortingEnabled(true);
+    m_tvFilePath->sortByColumn(0, Qt::AscendingOrder);
 }
 
 void MainWindow::onActionShowFilePathTriggered()
@@ -2106,9 +2183,37 @@ void MainWindow::closeEvent(QCloseEvent *event)
         event->ignore();
         return;
     }
+    saveUiState();
     // 先释放插件实例（停止音视频播放、清理临时副本），再真正退出
     closeAllTabs();
     event->accept();
+}
+
+void MainWindow::restoreUiState()
+{
+    QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                 QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
+    st.beginGroup(QStringLiteral("MainWindow"));
+    const QByteArray geo = st.value(QStringLiteral("geometry")).toByteArray();
+    if (!geo.isEmpty()) restoreGeometry(geo);
+    const QByteArray state = st.value(QStringLiteral("state")).toByteArray();
+    if (!state.isEmpty()) restoreState(state);
+    m_bTreeMode = st.value(QStringLiteral("treeMode"), true).toBool();
+    m_bShowPath = st.value(QStringLiteral("showPath"), false).toBool();
+    st.endGroup();
+    updateViewActionState();
+}
+
+void MainWindow::saveUiState()
+{
+    QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                 QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
+    st.beginGroup(QStringLiteral("MainWindow"));
+    st.setValue(QStringLiteral("geometry"), saveGeometry());
+    st.setValue(QStringLiteral("state"), saveState());
+    st.setValue(QStringLiteral("treeMode"), m_bTreeMode);
+    st.setValue(QStringLiteral("showPath"), m_bShowPath);
+    st.endGroup();
 }
 
 void MainWindow::on_actionAbout_triggered()

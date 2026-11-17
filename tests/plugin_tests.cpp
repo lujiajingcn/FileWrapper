@@ -1443,6 +1443,18 @@ static void verifyMergeDialog()
     splitDlg.setMergedFilePath(QStringLiteral("E:/tmp/prefilled.dat"));
     report(splitDlg.getMergedFilePath() == QStringLiteral("E:/tmp/prefilled.dat"),
            QStringLiteral("H5: split dialog accepts prefilled archive path"));
+
+    // H6: 主窗口注册了常用快捷键（加载/合并/保存）
+    MainWindow mw;
+    bool bHasOpen = false, bHasMerge = false, bHasSave = false;
+    for (QAction *pAct : mw.findChildren<QAction *>())
+    {
+        if (pAct->shortcut() == QKeySequence(QKeySequence::Open)) bHasOpen = true;
+        if (pAct->shortcut() == QKeySequence(Qt::CTRL | Qt::Key_M)) bHasMerge = true;
+        if (pAct->shortcut() == QKeySequence(QKeySequence::Save)) bHasSave = true;
+    }
+    report(bHasOpen && bHasMerge && bHasSave,
+           QStringLiteral("H6: window shortcuts registered (Ctrl+O/M/S)"));
 }
 
 // ---------------------------------------------------------------------------

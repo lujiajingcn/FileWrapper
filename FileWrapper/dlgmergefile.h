@@ -3,6 +3,10 @@
 
 #include <QDialog>
 #include <QStandardItemModel>
+#include <QList>
+#include <QUrl>
+
+class QEvent;
 
 namespace Ui {
 class DlgMergeFile;
@@ -34,8 +38,14 @@ private slots:
 
 protected:
     bool duplicatCheck(QString sFilePath);
+    // 支持把文件/文件夹直接拖进列表
+    bool eventFilter(QObject *obj, QEvent *ev) override;
 
 private:
+    void addPathItem(const QString &sPath);
+    void updateSummary();                        // 刷新"共 N 个文件 / X MB"摘要
+    void addDroppedUrls(const QList<QUrl> &urls);
+
     QStandardItemModel      *m_hModelFilePath;
     Ui::DlgMergeFile *ui;
 };

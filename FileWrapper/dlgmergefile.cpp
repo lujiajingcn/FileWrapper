@@ -7,6 +7,13 @@
 #include <QShortcut>
 #include <QTreeView>
 #include <QScreen>
+#include <QDir>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QMimeData>
+#include <QUrl>
+#include "archiveformat.h"
 
 #include <algorithm>
 #include <functional>
@@ -34,6 +41,13 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
     auto *hDeleteShortcut = new QShortcut(QKeySequence::Delete, ui->treeView);
     connect(hDeleteShortcut, &QShortcut::activated, this, &DlgMergeFile::on_btnDelete_clicked);
+
+    // 拖放：文件/文件夹直接拖进列表即可加入（比点两次按钮快）
+    ui->treeView->setAcceptDrops(true);
+    ui->treeView->viewport()->setAcceptDrops(true);
+    ui->treeView->viewport()->installEventFilter(this);
+    ui->treeView->setToolTip(tr("可直接把文件或文件夹拖到这里"));
+    updateSummary();
 }
 
 DlgMergeFile::~DlgMergeFile()
@@ -57,28 +71,116 @@ QString DlgMergeFile::getMergedFilePath()
     return ui->leMergedFilePath->text();
 }
 
+void DlgMergeFile::addPathItem(const QString &sPath)
+{
+    if (sPath.isEmpty() || !duplicatCheck(sPath))
+        return;
+    m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0,
+                              new QStandardItem(sPath));
+    updateSummary();
+}
+
+// 摘要：输入项数、展开后的文件数/总大小、其中多少个是已合并的 .dat
+void DlgMergeFile::updateSummary()
+{
+    int nInputs = 0, nFiles = 0, nArchives = 0;
+    qint64 nBytes = 0;
+    const int nCap = 200000;   // 超大目录防止统计本身卡住界面
+    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+    {
+        const QString sPath = m_hModelFilePath->item(i, 0)->text();
+        const QFileInfo fi(sPath);
+        ++nInputs;
+        if (fi.isDir())
+        {
+            QDirIterator it(sPath, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext() && nFiles < nCap)
+            {
+                it.next();
+                ++nFiles;
+                nBytes += it.fileInfo().size();
+            }
+        }
+        else if (fi.isFile())
+        {
+            ++nFiles;
+            nBytes += fi.size();
+            if (sPath.endsWith(QStringLiteral(".dat"), Qt::CaseInsensitive))
+                ++nArchives;
+        }
+    }
+
+    QString sText = tr("待合并的文件路径");
+    if (nInputs > 0)
+    {
+        sText += tr("（%1 个输入，约 %2 个文件，%3%4）")
+                     .arg(nInputs)
+                     .arg(nFiles >= nCap ? QStringLiteral(">") + QString::number(nCap)
+                                         : QString::number(nFiles))
+                     .arg(FwArc::formatSize(nBytes))
+                     .arg(nArchives > 0
+                              ? tr("，其中 %1 个已合并归档").arg(nArchives)
+                              : QString());
+    }
+    ui->label->setText(sText);
+}
+
+void DlgMergeFile::addDroppedUrls(const QList<QUrl> &urls)
+{
+    for (const QUrl &u : urls)
+    {
+        if (!u.isLocalFile())
+            continue;
+        addPathItem(QFileInfo(u.toLocalFile()).absoluteFilePath());
+    }
+}
+
+bool DlgMergeFile::eventFilter(QObject *obj, QEvent *ev)
+{
+    if (obj != ui->treeView->viewport() && obj != ui->treeView)
+        return QDialog::eventFilter(obj, ev);
+
+    switch (ev->type())
+    {
+    case QEvent::DragEnter:
+    case QEvent::DragMove:
+    {
+        auto *pDrag = static_cast<QDragMoveEvent *>(ev);
+        if (pDrag->mimeData() && pDrag->mimeData()->hasUrls())
+        {
+            pDrag->acceptProposedAction();
+            return true;
+        }
+        break;
+    }
+    case QEvent::Drop:
+    {
+        auto *pDrop = static_cast<QDropEvent *>(ev);
+        if (pDrop->mimeData() && pDrop->mimeData()->hasUrls())
+        {
+            addDroppedUrls(pDrop->mimeData()->urls());
+            pDrop->acceptProposedAction();
+            return true;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return QDialog::eventFilter(obj, ev);
+}
+
 void DlgMergeFile::on_btnAddDir_clicked()
 {
     QString sDir = QFileDialog::getExistingDirectory(this, tr("选择待合并的文件"), "", QFileDialog::DontResolveSymlinks);
-    if(sDir.isEmpty() || !duplicatCheck(sDir))
-        return;
-
-    QStandardItem* hItem = new QStandardItem(sDir);
-    m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
+    addPathItem(sDir);
 }
 
 void DlgMergeFile::on_btnAddFile_clicked()
 {
     QStringList qLFilePaths = QFileDialog::getOpenFileNames(this, tr("选择待合并的文件"), "", tr("All Files (*.*)"));
-
-    foreach(QString sFilePath, qLFilePaths)
-    {
-        if(!duplicatCheck(sFilePath))
-            continue;
-
-        QStandardItem* hItem = new QStandardItem(sFilePath);
-        m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
-    }
+    for (const QString &sFilePath : qLFilePaths)
+        addPathItem(sFilePath);
 }
 
 void DlgMergeFile::on_btnDelete_clicked()
@@ -106,6 +208,7 @@ void DlgMergeFile::on_btnDelete_clicked()
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
     for (int row : rows)
         m_hModelFilePath->removeRow(row);
+    updateSummary();
 }
 
 void DlgMergeFile::on_btnMergedFilePath_clicked()
