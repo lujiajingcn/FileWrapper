@@ -95,6 +95,12 @@
   **插件映射只在用户明确知道该选哪个插件时才有用**，不要再把它当主入口。
   「插件设置 → 支持的格式…」会列出每个已装插件的后缀，以及常见不支持格式的处理建议。
   注意扩展名不可信（下载改名、.dat/.bin、无后缀），内容判断优先于扩展名。
+- **保存时的路径规划（P0，2026-11-17 修）**：`rewriteArchive` 以前用
+  `commonRoot + makeRelative`，跨盘时 root 为空、`makeRelative` 退化成文件名，
+  添加外部文件再保存会把整个归档的目录结构拍平，同名条目变成重复路径。
+  现改为 `computeStoredPaths()`：与合并同一套规则（无公共根时盘符当首段
+  `E:/x -> E/x`），并在写盘前拒绝重复 relPath（`save()` 返回 false + 可读原因）。
+  关闭窗口也已补 `closeEvent` 调用 `confirmDiscardOrSaveIfDirty()`，避免脏归档静默丢失。
 - **合并对话框的列表语义**（`DlgMergeFile`）：`QTreeView` 多选 + 整行选择
   （`ExtendedSelection` / `SelectRows`），**不再用复选框标记删除**；
   「删除」按钮只删除当前选中项（Delete 键等价），未选中时提示先选择。
