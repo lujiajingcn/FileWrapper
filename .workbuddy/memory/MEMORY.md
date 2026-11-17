@@ -51,7 +51,7 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下有 151 项断言的插件测试套件，
+- **回归测试在仓库里（C4）**：`tests/` 下有 161 项断言的插件测试套件，
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
@@ -78,6 +78,15 @@
 - **PluginWord 同时是 ODF 解析器**：ZIP 里的 `mimetype` 含 `opendocument.text` 即按
   ODT 解析（content.xml/styles.xml → 同一套 HTML 子集，支持标题/字符格式/列表/表格/
   内嵌图片/超链接），`.odt/.ott` 已在 pluginWord.json 里声明。
+- **PluginWord 还带 RTF 子集解析器**（`rtfdocument.{h,cpp}`）：RTF 不是 ZIP/XML，是
+  控制字 + 嵌套分组，单独解析成段落/字符模型再生成 HTML；支持 \par/\line/\tab、
+  对齐与缩进、粗/斜/下划线/删除线/上下标/字号/颜色/字体、\'hh（本地编码）与 \uN；
+  不显示的分组（fonttbl/colortbl/stylesheet/info/pict/页眉页脚）整组跳过。
+  表格只做 `\cell`→" | "、`\row`→换行的文本化，不做真表格。
+- **表格/演示各有一个插件**：PluginSheet（`.xlsx/.xlsm/.ods` 只读首层数据：共享字符串、
+  单元格、合并单元格；不计算公式/样式）与 PluginSlides（`.pptx/.odp` 逐页标题+正文+图片；
+  不还原版式坐标/主题/动画）。两者都用 `Plugins/common/zipreader` + QDomDocument，
+  依赖 Qt6Xml（已在部署清单）。新增同族格式时优先往这两个插件里加分支，而不是再开插件。
 - **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
   - `pluginbase.h`：`PluginBase<Derived, WindowT>`（CRTP）收口构造/析构、`apiVersion`、
     `getPluginWidget`、`createInstance`、`sendFile`/`sendFileData` 适配；
