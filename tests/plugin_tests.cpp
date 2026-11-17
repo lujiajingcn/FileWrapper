@@ -1382,6 +1382,64 @@ static void verifyPluginToggleAndReload()
     QFile::remove(sBadJson);
 }
 
+// ---------------------------------------------------------------------------
+// G: 合并时"已合并的 .dat"先拆分成条目，而不是当普通文件嵌套进去
+// ---------------------------------------------------------------------------
+static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
+{
+    const QString sArcInner = scratchDir + QStringLiteral("/merge_inner.dat");
+    const QString sArcOuter = scratchDir + QStringLiteral("/merge_outer.dat");
+    const QString sArcDup   = scratchDir + QStringLiteral("/merge_dup.dat");
+    const QString sNote     = scratchDir + QStringLiteral("/merge_note.txt");
+    {
+        QFile f(sNote);
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write("merge note");
+    }
+
+    // G1: 普通合并（docx + png）得到第一个归档
+    FileManager fm1;
+    fm1.QMergeFiles(QVector<QString>{ work + QStringLiteral("/basic.docx"),
+                                      work + QStringLiteral("/pic.png") }, sArcInner);
+    FwArc::Meta inner;
+    QString err1;
+    const bool bG1 = QFile::exists(sArcInner)
+                     && FileManager::inspectArchive(sArcInner, inner, err1)
+                     && inner.entries.size() == 2;
+    report(bG1, QStringLiteral("G1: inner archive built with 2 entries (%1)").arg(inner.entries.size()));
+
+    // G2: 把"已有归档 + 普通文件"再合并 -> 归档被拆开，条目数 = 2 + 1，且没有嵌套 .dat
+    FileManager fm2;
+    fm2.QMergeFiles(QVector<QString>{ sArcInner, sNote }, sArcOuter);
+    FwArc::Meta outer;
+    QString err2;
+    QStringList paths;
+    const bool bMeta = FileManager::inspectArchive(sArcOuter, outer, err2);
+    for (const FwArc::Entry &e : outer.entries) paths << e.relPath;
+    bool bNoNested = true;
+    for (const QString &p : paths)
+        if (p.endsWith(QStringLiteral(".dat"), Qt::CaseInsensitive)) bNoNested = false;
+    report(bMeta && paths.size() == 3 && bNoNested
+               && paths.contains(QStringLiteral("merge_note.txt")),
+           QStringLiteral("G2: nested archive flattened (%1 entries: %2)")
+               .arg(paths.size()).arg(paths.join(QStringLiteral(", "))));
+
+    // G3: 路径撞名自动改名（归档里已有 pic.png，同时又选了 pic.png）
+    FileManager fm3;
+    fm3.QMergeFiles(QVector<QString>{ sArcInner, work + QStringLiteral("/pic.png") }, sArcDup);
+    FwArc::Meta dup;
+    QString err3;
+    QStringList dupPaths;
+    const bool bMeta3 = FileManager::inspectArchive(sArcDup, dup, err3);
+    for (const FwArc::Entry &e : dup.entries) dupPaths << e.relPath;
+    int nPic = 0;
+    for (const QString &p : dupPaths)
+        if (p.contains(QStringLiteral("pic"))) ++nPic;
+    report(bMeta3 && dupPaths.size() == 3 && nPic >= 2,
+           QStringLiteral("G3: duplicate path auto-renamed (%1)")
+               .arg(dupPaths.join(QStringLiteral(", "))));
+}
+
 static void verifyAppIntegration(const QString &work, const QString &scratchDir)
 {
     IntegrationWindow mw;
@@ -1645,6 +1703,9 @@ int main(int argc, char **argv)
     // ---------- A: 主程序链路（可选） ----------
     if (integrateMode)
         verifyAppIntegration(work, scratchDir);
+
+    // ---------- G: 合并时展开已合并的归档 ----------
+    verifyMergeFlattening(work, scratchDir);
 
     // ---------- D: 部署自检 + 插件失败可见性 ----------
     // 放在 A 之后：D6「补文件后重试恢复」会额外加载一份插件副本，从而在
