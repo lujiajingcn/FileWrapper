@@ -4,6 +4,11 @@
 #include <QMessageBox>
 #include <QFileInfo>
 #include <QDirIterator>
+#include <QShortcut>
+#include <QTreeView>
+
+#include <algorithm>
+#include <functional>
 
 DlgMergeFile::DlgMergeFile(QWidget *parent) :
     QDialog(parent),
@@ -19,6 +24,12 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     m_hModelFilePath->setColumnCount(1);
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     ui->treeView->setModel(m_hModelFilePath);
+    // 多选 + 整行选中；按 Delete 键等同于点「删除」
+    ui->treeView->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    ui->treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
+
+    auto *hDeleteShortcut = new QShortcut(QKeySequence::Delete, ui->treeView);
+    connect(hDeleteShortcut, &QShortcut::activated, this, &DlgMergeFile::on_btnDelete_clicked);
 }
 
 DlgMergeFile::~DlgMergeFile()
@@ -49,7 +60,6 @@ void DlgMergeFile::on_btnAddDir_clicked()
         return;
 
     QStandardItem* hItem = new QStandardItem(sDir);
-    hItem->setCheckable(true);
     m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
 }
 
@@ -63,22 +73,35 @@ void DlgMergeFile::on_btnAddFile_clicked()
             continue;
 
         QStandardItem* hItem = new QStandardItem(sFilePath);
-        hItem->setCheckable(true);
         m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
     }
 }
 
 void DlgMergeFile::on_btnDelete_clicked()
 {
-    int nRowCount = m_hModelFilePath->rowCount();
-    for(int i = nRowCount - 1; i >= 0; i--)
+    // 删除当前选中的项（支持 Ctrl/Shift 多选）。先收集行号，再倒序删除，
+    // 避免删前面的行导致后面的行号错位。
+    QModelIndexList selected = ui->treeView->selectionModel()->selectedRows();
+    if (selected.isEmpty())
     {
-        Qt::CheckState checkState = m_hModelFilePath->item(i, 0)->checkState();
-        if(checkState == Qt::Checked)
-        {
-            m_hModelFilePath->removeRow(i);
-        }
+        // 有些平台/交互下 selectedRows() 为空但 selectedIndexes() 不为空（单元格选择）
+        selected = ui->treeView->selectionModel()->selectedIndexes();
     }
+    if (selected.isEmpty())
+    {
+        QMessageBox::information(this, tr("提示"), tr("请先在列表中选择要删除的文件（可多选）。"));
+        return;
+    }
+
+    QList<int> rows;
+    for (const QModelIndex &idx : selected)
+    {
+        if (idx.isValid()) rows << idx.row();
+    }
+    std::sort(rows.begin(), rows.end(), std::greater<int>());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    for (int row : rows)
+        m_hModelFilePath->removeRow(row);
 }
 
 void DlgMergeFile::on_btnMergedFilePath_clicked()
