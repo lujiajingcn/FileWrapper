@@ -1438,6 +1438,108 @@ static void verifyMergeDialog()
     report(bHasDeleteShortcut, QStringLiteral("H4: Delete key shortcut wired to delete"));
 }
 
+// ---------------------------------------------------------------------------
+// K: 保存时的路径规划（添加文件后保存不得拍平目录 / 不得产生重复路径）
+// ---------------------------------------------------------------------------
+static void verifySavePathPreservation(const QString &work, const QString &scratchDir)
+{
+    auto listPaths = [](const FwArc::Meta &m) {
+        QStringList l;
+        for (const FwArc::Entry &e : m.entries) l << e.relPath;
+        return l;
+    };
+    auto hasDup = [](const QStringList &paths) {
+        QSet<QString> seen;
+        for (const QString &p : paths) {
+            const QString k = p.toLower();
+            if (seen.contains(k)) return true;
+            seen.insert(k);
+        }
+        return false;
+    };
+    auto writeNote = [](const QString &path, const QByteArray &body) {
+        QFile f(path);
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write(body);
+    };
+
+    // K1: 跨盘合并（E: 素材 + C: 临时文件）后，再添加一个 C: 文件并保存：
+    //     必须保持"盘符当首段"的扁平路径，绝不能退化成裸文件名。
+    const QString sCross = scratchDir + QStringLiteral("/save_cross.dat");
+    const QString sNote  = scratchDir + QStringLiteral("/save_note.txt");
+    const QString sAdded = scratchDir + QStringLiteral("/save_added.txt");
+    writeNote(sNote, "note");
+    writeNote(sAdded, "added");
+
+    FileManager fm1;
+    fm1.QMergeFiles(QVector<QString>{ work + QStringLiteral("/basic.docx"), sNote }, sCross);
+    FileManager fm2;
+    fm2.QLoadMergedFile(sCross);
+    fm2.addFiles(QVector<QString>{ sAdded });
+    const bool bSaved1 = fm2.save();
+    FwArc::Meta crossMeta;
+    QString err1;
+    const bool bMeta1 = FileManager::inspectArchive(sCross, crossMeta, err1);
+    const QStringList crossPaths = listPaths(crossMeta);
+    bool bHasSlash = !crossPaths.isEmpty();
+    for (const QString &p : crossPaths)
+        if (!p.contains(QLatin1Char('/'))) bHasSlash = false;
+    report(bSaved1 && bMeta1 && crossMeta.root.isEmpty() && crossPaths.size() == 3
+               && bHasSlash && !hasDup(crossPaths)
+               && !crossPaths.contains(QStringLiteral("basic.docx")),
+           QStringLiteral("K1: cross-drive save keeps drive-prefixed paths (%1)")
+               .arg(crossPaths.join(QStringLiteral(", "))));
+
+    // K2: 同一盘内添加"归档公共根之外"的文件后保存：
+    //     公共根应上移且各条目保留子目录层级（fixtures/...），不能拍平成文件名。
+    const QString sSame = scratchDir + QStringLiteral("/save_same.dat");
+    // 用规范化的真实路径（QFileDialog 返回的就是这种），避免 ".." 影响路径规划
+    const QString sUp   = QFileInfo(work + QStringLiteral("/../run-plugin-tests.ps1"))
+                              .canonicalFilePath();
+    if (!QFileInfo::exists(sUp))
+    {
+        report(false, QStringLiteral("K2: skipped (missing %1)").arg(sUp));
+    }
+    else
+    {
+        FileManager fm3;
+        fm3.QMergeFiles(QVector<QString>{ work + QStringLiteral("/basic.docx"),
+                                          work + QStringLiteral("/pic.png") }, sSame);
+        FileManager fm4;
+        fm4.QLoadMergedFile(sSame);
+        fm4.addFiles(QVector<QString>{ sUp });
+        const bool bSaved2 = fm4.save();
+        FwArc::Meta sameMeta;
+        QString err2;
+        const bool bMeta2 = FileManager::inspectArchive(sSame, sameMeta, err2);
+        const QStringList samePaths = listPaths(sameMeta);
+        bool bKeptDirs = samePaths.size() == 3;
+        for (const QString &p : samePaths)
+        {
+            if (p == QStringLiteral("basic.docx") || p == QStringLiteral("pic.png"))
+                bKeptDirs = false;   // 出现了裸文件名 -> 被拍平
+        }
+        report(bSaved2 && bMeta2 && !sameMeta.root.isEmpty() && bKeptDirs
+                   && !hasDup(samePaths),
+               QStringLiteral("K2: same-drive save keeps subdirectories (%1)")
+                   .arg(samePaths.join(QStringLiteral(", "))));
+    }
+
+    // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
+    const QString sDup = work + QStringLiteral("/dup_paths.dat");
+    if (QFileInfo::exists(sDup))
+    {
+        FileManager fm5;
+        fm5.QLoadMergedFile(sDup);
+        fm5.addFiles(QVector<QString>{ sAdded });   // 变脏，同时保留两条同名条目
+        const bool bSave3 = fm5.save();
+        const QString sErr3 = fm5.lastError();
+        report(!bSave3 && sErr3.contains(QStringLiteral("重复路径"))
+                   && !fm5.isCancelRequested(),
+               QStringLiteral("K3: duplicate stored paths reject save (%1)").arg(sErr3));
+    }
+}
+
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
 {
     auto hasSuffix = [](const QStringList &paths, const QString &suffix) {
@@ -1791,6 +1893,9 @@ int main(int argc, char **argv)
 
     // ---------- H: 合并对话框交互 ----------
     verifyMergeDialog();
+
+    // ---------- K: 保存路径规划（P0：添加文件后不得拍平目录） ----------
+    verifySavePathPreservation(work, scratchDir);
 
     // ---------- D: 部署自检 + 插件失败可见性 ----------
     // 放在 A 之后：D6「补文件后重试恢复」会额外加载一份插件副本，从而在

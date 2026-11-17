@@ -643,6 +643,18 @@ def make_rooted_dat():
     return path
 
 
+def make_dup_paths_dat():
+    """两条相对路径完全相同的归档：用于验证保存时的重复路径拦截。
+
+    真实场景来自旧版"添加外部文件后保存"：root 为空时条目被拍平成文件名，
+    不同目录的同名文件会撞成同一路径，保存后无法区分。
+    """
+    path = os.path.join(WORK, "dup_paths.dat")
+    with open(path, "wb") as f:
+        f.write(build_fwda([("same.bin", b"first copy"), ("same.bin", b"second copy")]))
+    return path
+
+
 def make_broken_files():
     with open(os.path.join(WORK, "legacy.doc"), "wb") as f:
         f.write(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 5000)
@@ -665,7 +677,8 @@ if __name__ == "__main__":
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     for fn in (make_html, make_odt, make_svg, make_webp, make_rtf,
-               make_ods, make_odp, make_xlsx, make_pptx, make_rooted_dat):
+               make_ods, make_odp, make_xlsx, make_pptx, make_rooted_dat,
+               make_dup_paths_dat):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()
