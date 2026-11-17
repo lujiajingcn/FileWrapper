@@ -70,6 +70,7 @@
 #include "dlgpluginmap.h"
 #include "filemanager.h"
 #include "dlgmergefile.h"
+#include "dlgsplitfile.h"
 #include "formatresolver.h"
 #include "mainwindow.h"
 #include "plugininterface.h"
@@ -1436,6 +1437,12 @@ static void verifyMergeDialog()
     for (QShortcut *pSc : dlg.findChildren<QShortcut *>())
         if (pSc->key() == QKeySequence(QKeySequence::Delete)) bHasDeleteShortcut = true;
     report(bHasDeleteShortcut, QStringLiteral("H4: Delete key shortcut wired to delete"));
+
+    // H5: 分割对话框支持预填"待分割文件路径"（已加载归档时主窗口会传入）
+    DlgSplitFile splitDlg;
+    splitDlg.setMergedFilePath(QStringLiteral("E:/tmp/prefilled.dat"));
+    report(splitDlg.getMergedFilePath() == QStringLiteral("E:/tmp/prefilled.dat"),
+           QStringLiteral("H5: split dialog accepts prefilled archive path"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,6 +1497,10 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
            QStringLiteral("K1: cross-drive save keeps drive-prefixed paths (%1)")
                .arg(crossPaths.join(QStringLiteral(", "))));
 
+    // K4: archivePath 返回当前加载的归档路径（供分割对话框预填）
+    report(fm2.archivePath().endsWith(QStringLiteral("save_cross.dat")),
+           QStringLiteral("K4: archivePath returns loaded archive (%1)").arg(fm2.archivePath()));
+
     // K2: 同一盘内添加"归档公共根之外"的文件后保存：
     //     公共根应上移且各条目保留子目录层级（fixtures/...），不能拍平成文件名。
     const QString sSame = scratchDir + QStringLiteral("/save_same.dat");
@@ -1526,8 +1537,7 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     }
 
     // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
-    const QString sDup = work + QStringLiteral("/dup_paths.dat");
-    if (QFileInfo::exists(sDup))
+    const QString sDup = work + QStringLiteral("/dup_paths.dat");    if (QFileInfo::exists(sDup))
     {
         FileManager fm5;
         fm5.QLoadMergedFile(sDup);
