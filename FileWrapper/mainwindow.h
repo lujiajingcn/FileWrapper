@@ -61,6 +61,7 @@ private slots:
     void onActionPluginDiagnosticsTriggered();
     void onActionPluginManagerTriggered();
     void onActionReloadPluginsTriggered();
+    void onActionSupportedFormatsTriggered();
     void on_actionUnloadFile_triggered();
 
     void onTabCloseRequested(int index);
@@ -162,6 +163,8 @@ private:
                                              bool *pbUseBuiltinText);
     // 「插件设置 → 插件诊断」：列出已加载插件、加载失败原因与缺失的部署依赖
     void showPluginDiagnostics();
+    // 「插件设置 → 支持的格式」：已安装插件覆盖的后缀 + 常见不支持格式的建议
+    void showSupportedFormats();
     // 「插件设置 → 插件管理」：勾选启用/禁用插件（C5）
     void showPluginManagerDialog();
     // 释放所有标签页后让 PluginManager 重新扫描 plugins/（C5）

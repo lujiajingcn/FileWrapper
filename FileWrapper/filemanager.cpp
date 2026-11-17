@@ -1330,6 +1330,67 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 // 读取与导出（P1-2 / P1-7 / P3-2）
 // ============================================================
 
+// 只读条目开头若干字节：格式嗅探只需要文件头，不必把整块内容读进内存。
+QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr)
+{
+    if (psErr) psErr->clear();
+    if (nMaxBytes <= 0) return QByteArray();
+
+    auto it = m_mapFileInfos.find(sFilePath);
+    if (it == m_mapFileInfos.end())
+    {
+        if (psErr) *psErr = tr("归档内未找到文件：%1").arg(sFilePath);
+        return QByteArray();
+    }
+
+    const FILEINFO fi = it.value();
+    if (fi.nFileLen <= 0) return QByteArray();
+
+    QFile *pSrc = nullptr;
+    QFile  diskSrc;
+    qint64 srcPos = 0;
+    if (m_setPendingFiles.contains(sFilePath))
+    {
+        diskSrc.setFileName(sFilePath);
+        if (!diskSrc.open(QIODevice::ReadOnly))
+        {
+            if (psErr) *psErr = tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString());
+            return QByteArray();
+        }
+        pSrc = &diskSrc;
+    }
+    else
+    {
+        if (!m_qFile.isOpen())
+        {
+            if (psErr) *psErr = tr("归档文件未打开");
+            return QByteArray();
+        }
+        pSrc = &m_qFile;
+        srcPos = fi.nContentPositon;
+    }
+
+    const qint64 nWant = qMin<qint64>(fi.nFileLen, nMaxBytes);
+    if (!pSrc->seek(srcPos))
+    {
+        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, pSrc->errorString());
+        return QByteArray();
+    }
+
+    QByteArray out;
+    out.resize(qsizetype(nWant));
+    qint64 done = 0;
+    while (done < nWant)
+    {
+        const qint64 n = qMin<qint64>(nWant - done, MAXBUFFERSIZE);
+        const qint64 got = pSrc->read(out.data() + done, n);
+        if (got <= 0) break;
+        done += got;
+    }
+    out.resize(qsizetype(done));
+    return out;
+}
+
 // C2：直接读出条目内容到 QByteArray，省掉"new char[] -> 插件再复制一份"的中转。
 // 与 QGetFileContent() 的校验语义保持一致（大小、完整性、v2 内容 CRC）；
 // 两者共用同一套归档/待保存文件解析逻辑，改动时请同步。

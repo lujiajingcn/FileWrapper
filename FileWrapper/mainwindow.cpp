@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
+#include "formatresolver.h"
 
 #include <QLabel>
 #include <QApplication>
@@ -170,6 +171,12 @@ MainWindow::MainWindow(QWidget *parent) :
     actReloadPlugins->setToolTip(QStringLiteral("重新扫描 plugins/ 目录（会先关闭所有标签页）"));
     connect(actReloadPlugins, &QAction::triggered, this, &MainWindow::onActionReloadPluginsTriggered);
     ui->menu_2->addAction(actReloadPlugins);
+
+    // 「支持的格式」：告诉用户能打开什么、遇到不支持的格式该怎么办（比"插件映射"更直接）
+    QAction *actFormats = new QAction(QStringLiteral("支持的格式…"), ui->menu_2);
+    actFormats->setToolTip(QStringLiteral("查看已安装插件能打开哪些格式，以及常见不支持格式的处理建议"));
+    connect(actFormats, &QAction::triggered, this, &MainWindow::onActionSupportedFormatsTriggered);
+    ui->menu_2->addAction(actFormats);
 
     // 启动时若已有插件加载失败，给一条用户可见的提示（以前只进 qDebug，双击文件毫无反应）
     const int nFailedAtStartup = PluginManager::getInstance()->failures().size();
@@ -389,29 +396,76 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
     sPluginPath = choosePlugin(sExt);
     if (sPluginPath.isEmpty())
     {
-        // P2-2：不再把用户指向一个「功能开发中」的空菜单，而是给出可用的兜底入口
-        QMessageBox box(this);
-        box.setWindowTitle(QStringLiteral("未找到插件"));
-        box.setIcon(QMessageBox::Information);
-        box.setText(QStringLiteral("没有插件来处理 .%1 类型的文件：%2\n\n"
-                                   "可以临时用内置查看器打开，或在「插件映射」里为该后缀指定默认插件。")
-                    .arg(sExt.isEmpty() ? QStringLiteral("(无后缀)") : sExt, info.sFileName));
-        QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::AcceptRole);
-        QPushButton *bHex    = box.addButton(QStringLiteral("以十六进制查看"), QMessageBox::AcceptRole);
-        QPushButton *bMap    = box.addButton(QStringLiteral("设置插件映射"), QMessageBox::ActionRole);
-        QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
-        box.setDefaultButton(bCancel);
-        box.exec();
-        QAbstractButton *clicked = box.clickedButton();
-        if (clicked == bMap)
+        // 扩展名不可靠（下载改名、无后缀、.dat/.bin）时，先按**文件内容**识别真实格式：
+        // 这是对普通用户最有用的兜底 —— 不需要知道该选哪个插件。
+        const QByteArray head = m_fileManager->entryHead(info.sFilePath, 256 * 1024);
+        const FormatResolver::Detection det = FormatResolver::detect(info.sFileName, head);
+
+        if (!det.pluginExt.isEmpty())
         {
-            DlgPluginMap dlg(this);
-            dlg.exec();
-            return false;
+            const QString sByContent =
+                PluginManager::getInstance()->pluginForExtension(det.pluginExt);
+            if (!sByContent.isEmpty())
+            {
+                sPluginPath = sByContent;
+                statusBar()->showMessage(
+                    QStringLiteral("扩展名无法识别，但文件内容判断为「%1」，已用对应插件打开。")
+                        .arg(det.displayName), 12000);
+            }
         }
-        if (clicked == bText)       sPluginPath = QStringLiteral("builtin://text");
-        else if (clicked == bHex)   sPluginPath = QStringLiteral("builtin://hex");
-        else return false;
+
+        if (sPluginPath.isEmpty())
+        {
+            // 仍无法处理：告诉用户"这是什么 + 该怎么办"，而不是只让他去猜该映射哪个插件。
+            QMessageBox box(this);
+            box.setWindowTitle(QStringLiteral("无法打开该文件"));
+            box.setIcon(QMessageBox::Information);
+
+            const QString sType = sExt.isEmpty() ? QStringLiteral("(无扩展名)")
+                                                 : QStringLiteral(".") + sExt;
+            box.setText(QStringLiteral("「%1」的格式无法直接显示：%2")
+                            .arg(info.sFileName, sType));
+
+            QStringList infoLines;
+            if (!det.displayName.isEmpty())
+                infoLines << QStringLiteral("识别结果：%1").arg(det.displayName);
+            if (!det.detail.isEmpty())
+                infoLines << QStringLiteral("判断依据：%1").arg(det.detail);
+            if (!det.advice.isEmpty())
+                infoLines << QStringLiteral("\n建议：%1").arg(det.advice);
+            if (!det.pluginExt.isEmpty())
+                infoLines << QStringLiteral("\n识别为「%1」，但对应插件当前不可用（可能未部署或被禁用）。"
+                                            "可在「插件设置 → 插件诊断 / 插件管理」里检查。")
+                                 .arg(det.pluginExt);
+            infoLines << QStringLiteral("\n本程序支持：docx/odt/rtf、xlsx/ods、pptx/odp、pdf、"
+                                        "epub/fb2/mobi、文本/代码、图片、音视频。");
+            box.setInformativeText(infoLines.join(QStringLiteral("\n")));
+
+            QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::AcceptRole);
+            QPushButton *bHex    = box.addButton(QStringLiteral("以十六进制查看"), QMessageBox::AcceptRole);
+            QPushButton *bList   = box.addButton(QStringLiteral("查看支持的格式…"), QMessageBox::ActionRole);
+            QPushButton *bMap    = box.addButton(QStringLiteral("设置插件映射…"), QMessageBox::ActionRole);
+            QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+            box.setDefaultButton(bText);
+            box.exec();
+
+            QAbstractButton *clicked = box.clickedButton();
+            Q_UNUSED(bCancel);   // 只是用于布局/默认按钮，点击判断不需要它
+            if (clicked == bList)
+            {
+                showSupportedFormats();
+                return false;
+            }
+            if (clicked == bMap)
+            {
+                DlgPluginMap dlg(this);
+                dlg.exec();
+                return false;
+            }
+            if (clicked == bText)      sPluginPath = QStringLiteral("builtin://text");
+            else if (clicked == bHex)  sPluginPath = QStringLiteral("builtin://hex");
+            else return false;
+        }
     }
 
     if (sPluginPath.startsWith(QStringLiteral("builtin://")))
@@ -568,6 +622,53 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
         m_setWarnedPlugins.insert(sPluginPath);
         return nullptr;
     }
+}
+
+// 「插件设置 → 支持的格式」：一屏告诉用户"本程序能打开什么、常见不支持格式该怎么办"
+// 也解释了插件映射什么时候才用得上（只在明确知道该选哪个插件时）。
+void MainWindow::showSupportedFormats()
+{
+    PluginManager *pMgr = PluginManager::getInstance();
+
+    QStringList lines;
+    lines << QStringLiteral("已安装插件及可打开的后缀：");
+    for (const QString &sId : pMgr->knownPluginIds())
+    {
+        const QString sPath = pMgr->pluginPathForId(sId);
+        if (sPath.isEmpty()) continue;
+        QStringList exts = pMgr->extensionsOf(sPath);
+        exts.sort();
+        QStringList dotted;
+        for (const QString &e : exts) dotted << (QStringLiteral(".") + e);
+        lines << QStringLiteral("  · %1：%2")
+                     .arg(PluginDiagnostics::pluginDisplayName(sPath),
+                          dotted.isEmpty() ? QStringLiteral("（未声明后缀）")
+                                           : dotted.join(QStringLiteral(" ")));
+    }
+
+    lines << QString();
+    lines << QStringLiteral("后缀不认识的文件会先按**文件内容**自动识别；仍无法显示时，可以：");
+    lines << QStringLiteral("  · 以文本查看 / 以十六进制查看（不会改动文件）");
+    lines << QStringLiteral("  · 把它转换成受支持的格式（最省事）");
+    lines << QStringLiteral("  · 设置插件映射：只有明确知道该用哪个插件时才需要");
+
+    lines << QString();
+    lines << QStringLiteral("常见但本程序暂不支持的格式：");
+    for (const auto &pair : FormatResolver::knownUnsupported())
+        lines << QStringLiteral("  · %1：%2").arg(pair.first, pair.second);
+
+    QMessageBox box(this);
+    box.setWindowTitle(QStringLiteral("支持的格式"));
+    box.setIcon(QMessageBox::Information);
+    box.setText(QStringLiteral("本程序能直接显示的格式"));
+    box.setInformativeText(lines.join(QStringLiteral("\n")));
+    box.setStandardButtons(QMessageBox::Ok);
+    box.exec();
+}
+
+void MainWindow::onActionSupportedFormatsTriggered()
+{
+    showSupportedFormats();
 }
 
 void MainWindow::onActionPluginDiagnosticsTriggered()

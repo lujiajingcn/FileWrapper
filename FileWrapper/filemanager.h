@@ -35,6 +35,9 @@ public:
     // C2：直接读出条目内容（不经过 new char[] + delete[] 的中转）。
     // 校验语义与 QGetFileContent 一致（大小、完整性、v2 内容 CRC）；失败时 psErr 给原因。
     QByteArray entryContent(const QString &sFilePath, QString *psErr = nullptr);
+
+    // 只读取条目开头至多 nMaxBytes 字节（格式嗅探用；不会为了"看文件头"把整块载入内存）
+    QByteArray entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr = nullptr);
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
