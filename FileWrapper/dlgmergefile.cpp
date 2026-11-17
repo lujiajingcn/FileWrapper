@@ -6,6 +6,8 @@
 #include <QDirIterator>
 #include <QShortcut>
 #include <QTreeView>
+#include <QMenu>
+#include <QToolButton>
 
 #include <algorithm>
 #include <functional>
@@ -30,6 +32,17 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
     auto *hDeleteShortcut = new QShortcut(QKeySequence::Delete, ui->treeView);
     connect(hDeleteShortcut, &QShortcut::activated, this, &DlgMergeFile::on_btnDelete_clicked);
+
+    // 「添加」一个入口，两种粒度：点击按钮 = 添加文件；点右侧箭头 = 也可以添加文件夹。
+    // 两者并不重复：文件是"挑几个具体文件"（可跨目录多选），文件夹是"整个目录递归合并"。
+    auto *hAddMenu = new QMenu(this);
+    QAction *hActFiles = hAddMenu->addAction(tr("添加文件…"));
+    QAction *hActDir   = hAddMenu->addAction(tr("添加文件夹…"));
+    ui->btnAdd->setMenu(hAddMenu);
+    ui->btnAdd->setPopupMode(QToolButton::MenuButtonPopup);
+    connect(hActFiles, &QAction::triggered, this, &DlgMergeFile::addFiles);
+    connect(hActDir,   &QAction::triggered, this, &DlgMergeFile::addDirectory);
+    connect(ui->btnAdd, &QToolButton::clicked, this, &DlgMergeFile::addFiles);
 }
 
 DlgMergeFile::~DlgMergeFile()
@@ -53,28 +66,28 @@ QString DlgMergeFile::getMergedFilePath()
     return ui->leMergedFilePath->text();
 }
 
-void DlgMergeFile::on_btnAddDir_clicked()
+void DlgMergeFile::addPathItem(const QString &sPath)
 {
-    QString sDir = QFileDialog::getExistingDirectory(this, tr("选择待合并的文件"), "", QFileDialog::DontResolveSymlinks);
-    if(sDir.isEmpty() || !duplicatCheck(sDir))
+    if (sPath.isEmpty() || !duplicatCheck(sPath))
         return;
-
-    QStandardItem* hItem = new QStandardItem(sDir);
-    m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
+    m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0,
+                              new QStandardItem(sPath));
 }
 
-void DlgMergeFile::on_btnAddFile_clicked()
+void DlgMergeFile::addFiles()
 {
-    QStringList qLFilePaths = QFileDialog::getOpenFileNames(this, tr("选择待合并的文件"), "", tr("All Files (*.*)"));
+    const QStringList qLFilePaths =
+        QFileDialog::getOpenFileNames(this, tr("选择待合并的文件"), "",
+                                      tr("All Files (*.*)"));
+    for (const QString &sFilePath : qLFilePaths)
+        addPathItem(sFilePath);
+}
 
-    foreach(QString sFilePath, qLFilePaths)
-    {
-        if(!duplicatCheck(sFilePath))
-            continue;
-
-        QStandardItem* hItem = new QStandardItem(sFilePath);
-        m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0, hItem);
-    }
+void DlgMergeFile::addDirectory()
+{
+    const QString sDir = QFileDialog::getExistingDirectory(
+        this, tr("选择待合并的文件夹"), "", QFileDialog::DontResolveSymlinks);
+    addPathItem(sDir);
 }
 
 void DlgMergeFile::on_btnDelete_clicked()
