@@ -45,6 +45,11 @@
 #include <QPluginLoader>
 #include <QSettings>
 #include <QStatusBar>
+#include <QTreeView>
+#include <QPushButton>
+#include <QShortcut>
+#include <QStandardItemModel>
+#include <QItemSelectionModel>
 #include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTextBlock>
@@ -64,6 +69,7 @@
 
 #include "dlgpluginmap.h"
 #include "filemanager.h"
+#include "dlgmergefile.h"
 #include "formatresolver.h"
 #include "mainwindow.h"
 #include "plugininterface.h"
@@ -1385,6 +1391,53 @@ static void verifyPluginToggleAndReload()
 // ---------------------------------------------------------------------------
 // G: 合并时"已合并的 .dat"先拆分成条目，而不是当普通文件嵌套进去
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// H: 合并对话框的交互契约（多选 + 删除选中项）
+// ---------------------------------------------------------------------------
+static void verifyMergeDialog()
+{
+    DlgMergeFile dlg;
+
+    QTreeView *pTree = dlg.findChild<QTreeView *>();
+    report(pTree != nullptr
+               && pTree->selectionMode() == QAbstractItemView::ExtendedSelection
+               && pTree->selectionBehavior() == QAbstractItemView::SelectRows,
+           QStringLiteral("H1: merge dialog list supports multi-select rows"));
+
+    QStandardItemModel *pModel =
+        pTree ? qobject_cast<QStandardItemModel *>(pTree->model()) : nullptr;
+    report(pModel != nullptr, QStringLiteral("H2: path list uses a standard item model"));
+
+    if (pModel != nullptr && pTree != nullptr)
+    {
+        // 模拟「添加文件」后的列表：3 项
+        for (const QString &sName : { QStringLiteral("a.txt"), QStringLiteral("b.txt"),
+                                      QStringLiteral("c.txt") })
+            pModel->setItem(pModel->rowCount(), 0, new QStandardItem(sName));
+
+        // 选中第 0、2 行，点「删除」→ 只剩 b.txt
+        QItemSelectionModel *pSel = pTree->selectionModel();
+        pSel->select(pModel->index(0, 0),
+                     QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        pSel->select(pModel->index(2, 0),
+                     QItemSelectionModel::Select | QItemSelectionModel::Rows);
+
+        QPushButton *pDelete = dlg.findChild<QPushButton *>(QStringLiteral("btnDelete"));
+        if (pDelete) pDelete->click();
+
+        report(pModel->rowCount() == 1
+                   && pModel->item(0, 0) && pModel->item(0, 0)->text() == QStringLiteral("b.txt"),
+               QStringLiteral("H3: delete removes only the selected rows (%1 left)")
+                   .arg(pModel->rowCount()));
+    }
+
+    // 复选框去掉后，Delete 键作为等价快捷方式应存在
+    bool bHasDeleteShortcut = false;
+    for (QShortcut *pSc : dlg.findChildren<QShortcut *>())
+        if (pSc->key() == QKeySequence(QKeySequence::Delete)) bHasDeleteShortcut = true;
+    report(bHasDeleteShortcut, QStringLiteral("H4: Delete key shortcut wired to delete"));
+}
+
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
 {
     auto hasSuffix = [](const QStringList &paths, const QString &suffix) {
@@ -1735,6 +1788,9 @@ int main(int argc, char **argv)
 
     // ---------- G: 合并时展开已合并的归档 ----------
     verifyMergeFlattening(work, scratchDir);
+
+    // ---------- H: 合并对话框交互 ----------
+    verifyMergeDialog();
 
     // ---------- D: 部署自检 + 插件失败可见性 ----------
     // 放在 A 之后：D6「补文件后重试恢复」会额外加载一份插件副本，从而在
