@@ -29,6 +29,52 @@
   `QTimer::singleShot(0)` 在 Unix 事件派发器里**先于 posted 事件**执行，
   不能指望「延后一轮」就自动拿到新布局。
 - 各插件 widget 是唯一共享实例，多标签页在页间迁移（见 2026-09-07 日志）。
+- **插件运行时依赖只有一个来源**：`FileWrapper/deploy/plugin-deps.manifest`
+  （`kind|源|目标|用途`），由 `deploy.pri` 在链接后调用 `deploy/deploy-deps.ps1` 统一复制，
+  并写出 `plugin-deploy-manifest.txt` 供程序自检。**新增插件依赖只改 manifest，
+  不要再往各插件 .pro 写 QMAKE_POST_LINK**（此前正是因此漏了 Qt6Multimedia.dll：
+  干净部署下 Media 加载失败，而开发机 PATH 有 Qt bin 一直掩盖着）。
+- 补部署：`mingw32-make deploydeps`（顶层与 `FileWrapper/` 子工程都可以）。
+- **插件是自描述的（C1）**：文件后缀、API 版本都写在插件自己的 JSON 里
+  （`extensions` / `apiVersion` / 可选 `extensionPriority`），主程序不再维护后缀表。
+  **新增文件格式 = 只改插件 JSON + 重编该插件**（实证过：给 PluginText 加 `textile`
+  只重编插件，主程序未动即生效）。
+  - 已知冲突：`.ts` 既是 MPEG-TS 又是 TypeScript，历史行为是文本优先，故
+    PluginText 声明 `extensionPriority: 10`（默认 0，大者优先）。
+  - 构建时必须同时产出 `plugins/<DLL基名>.json` sidecar：DLL 加载失败时主程序
+    靠它才知道该插件声明了哪些后缀（否则会退化成「未找到插件」）。
+  - `Plugins/plugin_common.pri` 负责 DESTDIR + sidecar + JSON 依赖，插件 .pro 只留 3 行配置。
+- **改插件接口必须升版本（B1）**：`plugininterface.h` 的 `PLUGIN_API_VERSION` 一旦
+  虚函数表变化就要 +1，并同步所有插件 JSON 的 `apiVersion`；加载器在**实例化前**
+  用元数据里的版本做门禁，避免跨版本调用虚函数崩溃。
+- 插件加载失败现在有用户可见路径：状态栏提示 + 双击时「插件不可用」对话框
+  （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
+  `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
+  标签页里持有插件实例，卸载 DLL 会让指针悬空。
+- **回归测试在仓库里（C4）**：`tests/` 下有 135 项断言的插件测试套件，
+  一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
+  改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
+  不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
+- **插件接口头在 `include/plugininterface.h`（C6）**：主程序与插件都从那里取，
+  插件通过 `Plugins/plugin_common.pri` 拿到 `INCLUDEPATH`；不要再写
+  `#include "../../FileWrapper/plugininterface.h"` 这种相对路径。
+- 插件实例必须能独立创建（B2）：`PluginManager::createInstanceFor()` 返回空即视为
+  打开失败，**不允许退化成共享实例**（多标签页会互相覆盖内容）。
+- 大文件抽临时副本前有磁盘预检（B4）：磁盘满时不再回退内存通道（会打爆进程）。
+- 插件可被用户禁用（C5）：`[PluginEnabled]` 段（ini），禁用的插件不加载但保留后缀
+  路由，打开时会提示"已被禁用"；`reloadPlugins()` 会卸载 DLL，调用前必须关闭标签页。
+- **数据通道（C2，接口版本 3）**：主程序优先调 `PluginInterface::sendFile(const PluginFile&)`，
+  `PluginFile` 是"内存块 / 文件路径"二选一。老插件不用改（默认实现转调 `sendFileData`，
+  行为与旧版一致，会复制一次）；想省掉复制的插件重写 `sendFile()` 直接吃
+  `file.memory()`（PluginWord 已迁移示范）。主程序侧用 `FileManager::entryContent()`
+  把条目直接读进 QByteArray，不再经过 `new char[]`/`delete[]` 中转。
+- **PluginWord 显示 Word（.docx/.docm/.dotx/.dotm）**：自包含 ZIP + QDomDocument 解析
+  OOXML → HTML → QTextBrowser（无第三方库）。两个必须记住的点：
+  - Qt 6.9.3 富文本的 `margin-*` / `text-indent` **只认 px，不认 pt**（pt 被静默忽略，
+    缩进会全丢）；`font-size` 用 pt 正常。见 2026-11-17 日志。
+  - 它链接了 `Qt6Xml.dll`，主程序自身不用 QtXml，必须由 `PluginWord.pro` 的
+    `QMAKE_POST_LINK` 复制到 exe 同级目录（否则 QPluginLoader 加载失败）。
+  - 旧版 `.doc`（OLE2）与 `.rtf` 不解析，识别后提示另存为 .docx。
 - **PluginBook 依赖 vendored 的 libmobi**（`Plugins/PluginBook/thirdparty/libmobi`，
   上游 `bfabiszewski/libmobi` @ `9062742`）。它**曾以嵌套 Git 仓库形式存在**，
   会导致 `git add` 只产生 gitlink（克隆后拿不到源码）；现已改为普通 vendored 目录，
