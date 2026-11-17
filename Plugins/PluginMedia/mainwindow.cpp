@@ -11,6 +11,7 @@
 #include <QElapsedTimer>
 #include <QSize>
 #include <QStatusBar>
+#include <QPixmap>
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
@@ -68,18 +69,21 @@ VideoWorker::VideoWorker(QObject *parent)
 {
 }
 
+VideoWorker::~VideoWorker()
+{
+    // 兜底释放：正常路径由 releaseVideoResources() 在解码线程停止后调用，
+    // 这里防止异常路径（线程未退出、worker 直接被删）导致资源泄漏。
+    releaseVideoResources();
+}
+
 void VideoWorker::setContexts(AVFormatContext *fmtCtx,
                               AVCodecContext *vCodecCtx, int videoIdx,
                               AVCodecContext *aCodecCtx, int audioIdx,
                               int width, int height,
-                              int outWidth, int outHeight,
-                              SwsContext *swsCtx,
-                              AVFrame *frame, AVFrame *frameRGB, AVFrame *audioFrame,
-                              uint8_t *outBuf,
-                              SwrContext *swr,
-                              uint8_t *aOutBuf,
-                              QMutex *aMutex,
-                              QByteArray *aByteBuf,
+                              AVPixelFormat srcPixFmt,
+                              AVFrame *frame, AVFrame *audioFrame,
+                              SwrContext *swr, uint8_t *aOutBuf,
+                              QMutex *aMutex, QByteArray *aByteBuf,
                               int outSampleRate, int genId,
                               int audioOutBufCapacity)
 {
@@ -91,13 +95,9 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
     audioindex = audioIdx;
     srcW = width;
     srcH = height;
-    outW = outWidth;
-    outH = outHeight;
-    imgCtx = swsCtx;
+    m_srcPixFmt = srcPixFmt;
     pFrame = frame;
-    pFrameRGB = frameRGB;
     pAudioFrame = audioFrame;
-    out_buffer = outBuf;
     swr_ctx = swr;
     audio_out_buffer = aOutBuf;
     m_audioMutex = aMutex;
@@ -105,11 +105,101 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
     m_outSampleRate = outSampleRate;
     m_audioOutBufCapacity = audioOutBufCapacity;
     m_genId = genId;
+    // 新文件从零开始：输出尺寸请求清空，缩放上下文与缓冲也一并作废，
+    // 由主线程重新 requestOutputSize()，解码线程在下一帧前重建。
+    m_reqOutSize.store(0, std::memory_order_relaxed);
+    outW.store(0, std::memory_order_relaxed);
+    outH.store(0, std::memory_order_relaxed);
+    if (m_sws) { sws_freeContext(m_sws); m_sws = nullptr; }
+    if (m_outBuf) { av_freep(&m_outBuf); m_outBufSize = 0; }
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; ++i)
+    {
+        m_outData[i] = nullptr;
+        m_outLinesize[i] = 0;
+    }
     // 新播放开始时清除 stop / pause / seek 快进标志
     m_stopRequested.store(0, std::memory_order_relaxed);
     m_paused.store(0, std::memory_order_relaxed);
     m_seekTargetAbsMs.store(0, std::memory_order_relaxed);
     m_pauseCond.wakeAll();
+}
+
+// 主线程请求新的视频输出尺寸（窗口缩放时）。
+// 只做一次原子写：解码线程在下一帧前读取并在自己的线程内重建 sws 上下文。
+void VideoWorker::requestOutputSize(int w, int h)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    // 宽高打包进一个 64 位量：保证读到的是成对的宽高，不会出现「新宽 + 旧高」
+    const quint64 packed = (quint64(quint32(h)) << 32) | quint64(quint32(w));
+    m_reqOutSize.store(packed, std::memory_order_relaxed);
+}
+
+// 在解码线程内重建视频缩放上下文与 RGB 输出缓冲。
+// 必须与 sws_scale 在同一线程：否则主线程释放旧缓冲时解码线程可能还在用它。
+void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
+                                  int newW, int newH)
+{
+    if (newW <= 0 || newH <= 0)
+        return;
+    if (srcW <= 0 || srcH <= 0)
+        return;
+    if (srcPixFmt == AV_PIX_FMT_NONE)
+        return;
+
+    if (m_sws && outW.load(std::memory_order_relaxed) == newW
+                 && outH.load(std::memory_order_relaxed) == newH)
+        return;   // 尺寸没变，复用现有上下文
+
+    if (m_sws) { sws_freeContext(m_sws); m_sws = nullptr; }
+
+    const int need = av_image_get_buffer_size(AV_PIX_FMT_RGB32, newW, newH, 1);
+    if (need < 0)
+    {
+        qWarning() << "[VideoWorker] 输出缓冲大小计算失败";
+        return;
+    }
+    if (!m_outBuf || m_outBufSize < need)
+    {
+        av_freep(&m_outBuf);
+        m_outBuf = (uint8_t *)av_malloc(need);
+        m_outBufSize = m_outBuf ? need : 0;
+    }
+    if (!m_outBuf)
+    {
+        qWarning() << "[VideoWorker] 输出缓冲分配失败";
+        return;
+    }
+
+    av_image_fill_arrays(m_outData, m_outLinesize, m_outBuf,
+                         AV_PIX_FMT_RGB32, newW, newH, 1);
+
+    m_sws = sws_getContext(srcW, srcH, srcPixFmt,
+                           newW, newH, AV_PIX_FMT_RGB32,
+                           SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!m_sws)
+    {
+        qWarning() << "[VideoWorker] sws_getContext 失败";
+        return;
+    }
+    outW.store(newW, std::memory_order_relaxed);
+    outH.store(newH, std::memory_order_relaxed);
+}
+
+// 释放解码线程持有的 sws 上下文与输出缓冲。
+// 只能在解码线程已停止后调用。
+void VideoWorker::releaseVideoResources()
+{
+    if (m_sws)    { sws_freeContext(m_sws); m_sws = nullptr; }
+    if (m_outBuf) { av_freep(&m_outBuf); m_outBufSize = 0; }
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; ++i)
+    {
+        m_outData[i] = nullptr;
+        m_outLinesize[i] = 0;
+    }
+    outW.store(0, std::memory_order_relaxed);
+    outH.store(0, std::memory_order_relaxed);
+    m_reqOutSize.store(0, std::memory_order_relaxed);
 }
 
 void VideoWorker::setSeekTarget(qint64 absMs)
@@ -282,14 +372,33 @@ void VideoWorker::doDecode()
                         continue;
                     }
 
+                    // ---- 输出尺寸可能已被主线程改变（窗口缩放）----
+                    // 解码线程在自己的线程内重建 sws 上下文与输出缓冲：
+                    // 既保证新帧按新尺寸输出，也不会出现「主线程释放旧缓冲、
+                    // 解码线程还在 sws_scale」的 use-after-free。
+                    const quint64 reqSize = m_reqOutSize.load(std::memory_order_relaxed);
+                    if (reqSize != 0)
+                    {
+                        const int reqW = int(reqSize & 0xffffffffu);
+                        const int reqH = int(reqSize >> 32);
+                        if (reqW != outW.load(std::memory_order_relaxed)
+                         || reqH != outH.load(std::memory_order_relaxed))
+                            rebuildVideoSws(srcW, srcH, m_srcPixFmt, reqW, reqH);
+                    }
+
+                    if (!m_sws || !m_outData[0])
+                        continue;   // 缩放上下文不可用（分配失败）：跳过该帧
+
                     // 像素格式转换 + 直接缩放到目标尺寸（保持宽高比由 sws 上下文保证）
-                    if (imgCtx)
-                        sws_scale(imgCtx, (const unsigned char* const*)pFrame->data,
-                                  pFrame->linesize, 0, srcH,
-                                  pFrameRGB->data, pFrameRGB->linesize);
+                    sws_scale(m_sws, (const unsigned char* const*)pFrame->data,
+                              pFrame->linesize, 0, srcH,
+                              m_outData, m_outLinesize);
 
                     // 构建 QImage（数据已为目标尺寸 outW x outH）
-                    QImage img((uchar*)pFrameRGB->data[0], outW, outH, QImage::Format_RGB32);
+                    QImage img((uchar*)m_outData[0],
+                               outW.load(std::memory_order_relaxed),
+                               outH.load(std::memory_order_relaxed),
+                               QImage::Format_RGB32);
                     img = img.copy(); // 深拷贝，安全传递到主线程
 
                     // 计算 PTS
@@ -521,6 +630,14 @@ MainWindow::MainWindow(QWidget *parent)
     m_videoThread->start();
 }
 
+// 诊断用：解码线程当前实际使用的视频输出尺寸
+QSize MainWindow::decodedOutputSize() const
+{
+    if (!m_videoWorker)
+        return QSize();
+    return QSize(m_videoWorker->currentOutW(), m_videoWorker->currentOutH());
+}
+
 void MainWindow::timeCallback(void)
 {
     // 1. 优先处理 seek
@@ -563,7 +680,14 @@ void MainWindow::onFrameDecoded(QImage img, qint64 ptsMs, int genId)
 
     QPixmap temp = QPixmap::fromImage(img);
     if (!temp.isNull())
+    {
+        // 画面尺寸与当前目标不一致（窗口刚缩放，解码线程还没切换输出尺寸）：
+        // 直接按目标尺寸缩放，避免出现画面尺寸跳变。
+        if (!m_curVideoOutSize.isEmpty() && temp.size() != m_curVideoOutSize)
+            temp = temp.scaled(m_curVideoOutSize, Qt::KeepAspectRatio,
+                               Qt::SmoothTransformation);
         ui->videoLabel->setPixmap(temp);
+    }
 
     if (ptsMs > 0)
     {
@@ -629,12 +753,58 @@ void MainWindow::onAudioPtsUpdated(qint64 ptsMs, int genId)
     }
 }
 
-void MainWindow::resizeEvent(QResizeEvent*)
+void MainWindow::resizeEvent(QResizeEvent *e)
 {
-    // 仅记录目标区域；实际重建 sws 上下文在下一帧刷新时按新尺寸进行，
-    // 避免在 resize 风暴中频繁重新分配（可简单在 onFrameDecoded 中判断尺寸变化）。
-    videoW = ui->videoLabel->size().width();
-    videoH = ui->videoLabel->size().height();
+    // 必须调用基类实现：QMainWindow::resizeEvent 负责菜单栏/工具栏/停靠窗口的重新布局
+    QMainWindow::resizeEvent(e);
+
+    // resize 事件到达时，布局可能还没按新尺寸重新计算，
+    // 因此把「按新尺寸更新视频输出」推迟到事件循环的下一轮统一处理：
+    // 既能拿到最终的画面区尺寸，也能把拖动窗口时的连续 resize 合并成一次。
+    if (!m_resizeUpdatePending)
+    {
+        m_resizeUpdatePending = true;
+        QTimer::singleShot(0, this, &MainWindow::updateVideoOutputSize);
+    }
+}
+
+// 按当前画面区尺寸重算视频输出尺寸，并让解码线程切换到新尺寸。
+// 窗口缩放后必须调用：否则视频画面会一直停留在打开文件时的尺寸（不跟随界面）。
+void MainWindow::updateVideoOutputSize()
+{
+    m_resizeUpdatePending = false;
+
+    if (!pCodecCtx || videoindex < 0 || !m_videoWorker)
+        return;                       // 未打开文件 / 纯音频：无视频画面可调
+
+    // 强制布局按当前窗口尺寸重新计算，保证下面读到的是最终的画面区尺寸
+    if (ui->mainLayout)
+        ui->mainLayout->activate();
+
+    const QSize areaSize = ui->videoLabel->size();
+    if (areaSize.width() <= 0 || areaSize.height() <= 0)
+        return;
+
+    const QSize outSize = computeAspectRatioSize(pCodecCtx->width, pCodecCtx->height,
+                                                 areaSize.width(), areaSize.height());
+    if (outSize.isEmpty() || outSize == m_curVideoOutSize)
+        return;
+
+    m_curVideoOutSize = outSize;
+
+    // 1) 通知解码线程：后续帧按新尺寸输出（解码线程内部重建 sws，线程安全）
+    m_videoWorker->requestOutputSize(outSize.width(), outSize.height());
+
+    // 2) 立即把当前画面缩放到新尺寸：
+    //    暂停 / 播放结束（不会再有新帧到来）时，这是唯一的更新途径；
+    //    播放中则会被下一帧覆盖，避免出现「画面卡在旧尺寸」的跳变。
+    const QPixmap current = ui->videoLabel->pixmap();
+    if (!current.isNull())
+    {
+        const QPixmap scaled = current.scaled(outSize, Qt::KeepAspectRatio,
+                                               Qt::SmoothTransformation);
+        ui->videoLabel->setPixmap(scaled);
+    }
 }
 
 bool MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
@@ -648,13 +818,34 @@ bool MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
     return m_videoWorker->waitForDecodingStopped(timeoutMs);
 }
 
+// 刷新画面区：
+// 1) 必须先清掉上一个文件残留的 pixmap —— 纯音频文件（无视频流）打开后，
+//    永远不会有新的视频帧到来，上一个视频的最后一帧就会一直停留在画面上；
+// 2) 纯音频文件没有画面，给出提示文字，避免用户误以为加载失败。
+// 注意顺序：QLabel::setPixmap() 会清除已设置的文字，setText() 也会清除 pixmap，
+// 因此必须先 setPixmap(QPixmap()) 再 setText()。
+void MainWindow::clearVideoPicture()
+{
+    ui->videoLabel->setPixmap(QPixmap());
+    ui->videoLabel->setText(QString());
+}
+
+void MainWindow::refreshVideoArea()
+{
+    clearVideoPicture();
+    if (m_bAudioOnly)
+        ui->videoLabel->setText(QStringLiteral("纯音频文件，无视频画面"));
+}
+
 void MainWindow::clearContent()
 {
     // 主程序在读文件失败或 0 字节时会送 (nullptr, 0)。此时必须停掉仍在运行的
     // 解码线程与音频输出，否则上一个文件会在后台继续播放/发声。
     stopPlayback();
 
-    ui->videoLabel->clear();
+    // clearFFmpegResources() 已把 m_bAudioOnly 复位为 false，这里统一清空画面，
+    // 保证不残留上一个文件的最后一帧。
+    clearVideoPicture();
     ui->progressSlider->setRange(0, 100);
     ui->progressSlider->setValue(0);
     ui->progressSlider->setEnabled(false);
@@ -700,12 +891,13 @@ void MainWindow::clearFFmpegResources(bool force)
 
     if (swr_ctx)          { swr_free(&swr_ctx); swr_ctx = nullptr; }
     if (audio_out_buffer) { av_freep(&audio_out_buffer); audio_out_buffer = nullptr; }
-    if (img_convert_ctx)  { sws_freeContext(img_convert_ctx); img_convert_ctx = nullptr; }
-    if (out_buffer)       { av_freep(&out_buffer); out_buffer = nullptr; }
+    // 视频缩放上下文与 RGB 输出缓冲归解码线程所有：
+    // 只有解码线程确实已经停止，才能安全地让它释放（否则会与正在进行的 sws_scale 竞争）。
+    if (stopped && m_videoWorker)
+        QMetaObject::invokeMethod(m_videoWorker, "releaseVideoResources", Qt::DirectConnection);
     av_channel_layout_uninit(&out_ch_layout);
     av_channel_layout_default(&out_ch_layout, AUDIO_OUT_CHANNELS);
 
-    if (pFrameRGB)   { av_frame_free(&pFrameRGB);   pFrameRGB   = nullptr; }
     if (pFrame)      { av_frame_free(&pFrame);      pFrame      = nullptr; }
     if (pAudioFrame) { av_frame_free(&pAudioFrame); pAudioFrame = nullptr; }
     if (pCodecCtx)  { avcodec_free_context(&pCodecCtx);  pCodecCtx = nullptr; }
@@ -726,6 +918,7 @@ void MainWindow::clearFFmpegResources(bool force)
     m_bPlaying = false;
     m_bPaused = false;
     m_bAudioOnly = false;  // 重置：下次播放时重新检测
+    m_curVideoOutSize = QSize();   // 重置：下次播放时按新的画面区尺寸重算
 
     {
         QMutexLocker locker(&m_audioMutex);
@@ -888,8 +1081,8 @@ void MainWindow::on_stopBtn_clicked(void)
     m_bPaused = false;
     updatePlayPauseIcon();
 
-    // 清空视频画面
-    ui->videoLabel->clear();
+    // 清空视频画面（纯音频文件则显示提示文字）
+    refreshVideoArea();
 
     // ====== 先停止 worker，再操作 FFmpeg 上下文，避免数据竞争导致崩溃 ======
     const bool workerStopped = stopWorkerAndWait(2000);
@@ -1080,46 +1273,6 @@ QSize MainWindow::computeAspectRatioSize(int srcW, int srcH, int dstW, int dstH)
     return QSize(w, h);
 }
 
-// （重新）创建 sws 上下文：将源帧缩放为 outW x outH 的 RGB32
-void MainWindow::rebuildSwsContext(int srcW, int srcH, AVPixelFormat srcPixFmt, int outW, int outH)
-{
-    if (outW <= 0 || outH <= 0 || !pFrameRGB)
-        return;
-
-    // 若已存在同尺寸上下文则复用
-    if (img_convert_ctx && videoW == outW && videoH == outH)
-        return;
-
-    if (img_convert_ctx) { sws_freeContext(img_convert_ctx); img_convert_ctx = nullptr; }
-
-    int new_buffer_size = av_image_get_buffer_size(AV_PIX_FMT_RGB32, outW, outH, 1);
-    if (new_buffer_size < 0)
-    {
-        qWarning() << "[rebuildSwsContext] 计算输出缓冲大小失败.";
-        return;
-    }
-    if (!out_buffer || out_buffer_size < new_buffer_size)
-    {
-        av_freep(&out_buffer);
-        out_buffer = (unsigned char *)av_malloc(new_buffer_size);
-        out_buffer_size = new_buffer_size;
-    }
-    if (!out_buffer)
-    {
-        qWarning() << "[rebuildSwsContext] 输出缓冲分配失败.";
-        return;
-    }
-
-    av_image_fill_arrays(pFrameRGB->data, pFrameRGB->linesize, out_buffer,
-                         AV_PIX_FMT_RGB32, outW, outH, 1);
-
-    img_convert_ctx = sws_getContext(srcW, srcH, srcPixFmt,
-                                     outW, outH, AV_PIX_FMT_RGB32,
-                                     SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-    videoW = outW;
-    videoH = outH;
-}
-
 // 大文件路径通道入口：设置一个待打开路径，再复用 showVideo 的通用流程（P1-2）
 int MainWindow::showVideoFile(const QString &sPath)
 {
@@ -1136,6 +1289,11 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     if (timer->isActive()) timer->stop();
 
+    // 提前递增播放世代：本次打开之前排队在 UI 线程事件队列里的旧帧信号
+    // （上一文件的 frameDecoded）必须被 onFrameDecoded 的世代校验拦掉，
+    // 否则它们会在新文件解码出第一帧之前把旧画面重新画上去。
+    ++m_genCounter;
+
     // 清理上次播放的资源（包含停止视频解码线程）
     clearFFmpegResources();
     if (m_bCleanupPending)
@@ -1145,6 +1303,12 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         qWarning() << "[ShowVideo] 上一个解码线程仍在停止中，暂不打开新文件";
         return -1;
     }
+
+    // 立即清空画面区：切换文件时上一文件的最后一帧必须消失。
+    // 若新文件没有视频流（如 WAV），之后永远不会有视频帧到来覆盖它，
+    // 残留的旧画面就会一直停留（表现为「播放 WAV 时画面还是上一个 MP4」）。
+    clearVideoPicture();
+
     av_channel_layout_default(&out_ch_layout, AUDIO_OUT_CHANNELS);
 
     pFormatCtx = avformat_alloc_context();
@@ -1241,6 +1405,10 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     }
     m_bAudioOnly = (videoindex < 0);
 
+    // 流信息确定后再次刷新画面区：纯音频文件没有视频流，画面区应显示提示文字，
+    // 而不是空白（更不能残留上一个视频文件的最后一帧）。
+    refreshVideoArea();
+
     // 音频输出设置（仅在有音频流时创建，无声视频不需要）
     if (audioindex >= 0)
     {
@@ -1335,9 +1503,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     // 创建帧（视频帧仅在有视频流时分配）
     if (videoindex >= 0)
     {
-        pFrame    = av_frame_alloc();
-        pFrameRGB = av_frame_alloc();
-        if (!pFrame || !pFrameRGB)
+        pFrame = av_frame_alloc();
+        if (!pFrame)
         {
             qWarning() << "[ShowVideo] 视频帧内存分配失败.";
             clearFFmpegResources();
@@ -1413,7 +1580,9 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         }
     }
 
-    // === 计算视频输出尺寸并创建 sws 上下文（保持宽高比，仅视频文件） ===
+    // === 计算视频输出尺寸（保持宽高比，仅视频文件） ===
+    // 注意：sws 上下文由解码线程自己创建 —— 窗口缩放时必须在解码线程内重建，
+    // 主线程不能释放正在被 sws_scale 使用的缓冲。这里只算出目标尺寸。
     int outW = 0, outH = 0;
     if (videoindex >= 0)
     {
@@ -1424,7 +1593,6 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         QSize outSize = computeAspectRatioSize(pCodecCtx->width, pCodecCtx->height, dstW, dstH);
         outW = outSize.width();
         outH = outSize.height();
-        rebuildSwsContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, outW, outH);
     }
 
     // 总时长(毫秒)：容器 -> 流 -> 按比特率/文件大小估算 -> 兜底
@@ -1475,20 +1643,27 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     // 开始播放
     m_bPlaying = true;
 
-    m_genCounter++;
+    // 播放世代已在函数开头递增过（用于让上一文件排队中的帧信号失效），
+    // 此处直接把当前世代交给 worker，使新帧的 genId 与 m_genCounter 一致。
     m_videoWorker->setContexts(pFormatCtx,
                                pCodecCtx, videoindex,
                                aCodecCtx, audioindex,
                                (videoindex >= 0) ? pCodecCtx->width  : 0,
                                (videoindex >= 0) ? pCodecCtx->height : 0,
-                               outW, outH,
-                               img_convert_ctx,
-                               pFrame, pFrameRGB, pAudioFrame,
-                               out_buffer,
+                               (videoindex >= 0) ? pCodecCtx->pix_fmt : AV_PIX_FMT_NONE,
+                               pFrame, pAudioFrame,
                                swr_ctx, audio_out_buffer,
                                &m_audioMutex, &byteBuf, out_sample_rate,
                                m_genCounter,
                                audio_out_samples_max);
+
+    // 请求解码线程按目标尺寸输出（setContexts 已清空旧请求，必须在其之后调用）。
+    // 之后窗口缩放时由 updateVideoOutputSize() 再次请求新尺寸。
+    if (videoindex >= 0)
+    {
+        m_curVideoOutSize = QSize(outW, outH);
+        m_videoWorker->requestOutputSize(outW, outH);
+    }
 
     // 启动视频解码线程（异步）
     QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);

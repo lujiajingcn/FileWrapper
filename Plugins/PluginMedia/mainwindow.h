@@ -73,19 +73,30 @@ class VideoWorker : public QObject
 
 public:
     explicit VideoWorker(QObject *parent = nullptr);
+    // 析构时兜底释放解码线程持有的 sws 上下文与输出缓冲
+    ~VideoWorker() override;
 
     // 设置解码所需的 FFmpeg 上下文（主线程调用，doDecode 启动前）
+    //
+    // 注意：视频缩放上下文（sws）与 RGB 输出缓冲**不再**由主线程创建，
+    // 改由解码线程自己拥有。原因是窗口缩放时输出尺寸必须跟着变，
+    // 而重建 sws 上下文必须释放旧缓冲——若旧缓冲归主线程所有，
+    // 主线程释放时解码线程可能正在 sws_scale，会造成 use-after-free。
     void setContexts(AVFormatContext *fmtCtx,
                      AVCodecContext *vCodecCtx, int videoIdx,
                      AVCodecContext *aCodecCtx, int audioIdx,
                      int width, int height,
-                     int outWidth, int outHeight,
-                     SwsContext *swsCtx, AVFrame *frame, AVFrame *frameRGB, AVFrame *audioFrame,
-                     uint8_t *outBuf,
+                     AVPixelFormat srcPixFmt,
+                     AVFrame *frame, AVFrame *audioFrame,
                      SwrContext *swr, uint8_t *aOutBuf,
                      QMutex *aMutex, QByteArray *aByteBuf,
                      int outSampleRate, int genId,
                      int audioOutBufCapacity);
+
+    // 请求改变视频输出尺寸（主线程调用，窗口缩放时）。
+    // 解码线程会在下一帧前在自己的线程内重建 sws 上下文与输出缓冲：
+    // 既保证新帧按新尺寸输出，也不会出现「主线程释放、解码线程还在用」的 UAF。
+    void requestOutputSize(int w, int h);
 
     // 阻塞等待 doDecode 退出（用于停止/seek/释放资源），超时返回 false
     bool waitForDecodingStopped(unsigned long timeoutMs = 2000);
@@ -105,8 +116,19 @@ public slots:
     void updateGenId(int genId);
     // 设置 seek 快进目标（绝对 PTS，毫秒）：>0 时丢弃目标前的包
     void setSeekTarget(qint64 absMs);
+    // 释放解码线程自己持有的 sws 上下文与 RGB 输出缓冲。
+    // 只能在解码线程已停止后调用（否则会与正在进行的 sws_scale 竞争）。
+    void releaseVideoResources();
 
     bool isDecodingActive() const { return m_running.load(std::memory_order_relaxed) != 0; }
+
+    // 当前实际使用的视频输出尺寸（诊断/测试用：跨线程读取，仅用于观察）
+    int currentOutW() const { return outW.load(std::memory_order_relaxed); }
+    int currentOutH() const { return outH.load(std::memory_order_relaxed); }
+
+private:
+    // 在解码线程内重建视频缩放上下文与输出缓冲（输出尺寸变化时调用）
+    void rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt, int outW, int outH);
 
 private:
     AVFormatContext *pFormatCtx = nullptr;
@@ -117,10 +139,22 @@ private:
     int audioindex = -1;
 
     int srcW = 0, srcH = 0;
-    int outW = 0, outH = 0;
-    SwsContext      *imgCtx = nullptr;
-    AVFrame         *pFrame = nullptr, *pFrameRGB = nullptr;
-    uint8_t         *out_buffer = nullptr;
+    // 当前 sws 输出尺寸（= 生成的 QImage 尺寸）；原子量：主线程可无锁读取做诊断
+    std::atomic<int> outW{0}, outH{0};
+    AVPixelFormat m_srcPixFmt = AV_PIX_FMT_NONE;
+
+    // 视频缩放上下文与 RGB 输出缓冲：由解码线程自己拥有。
+    // 放在解码线程里，是为了让「窗口缩放 → 换输出尺寸」能在同一线程内完成：
+    // 主线程只发一个尺寸请求，绝不碰正在被 sws_scale 使用的缓冲。
+    SwsContext  *m_sws = nullptr;
+    uint8_t     *m_outBuf = nullptr;
+    int          m_outBufSize = 0;
+    uint8_t     *m_outData[AV_NUM_DATA_POINTERS] = { nullptr };
+    int          m_outLinesize[AV_NUM_DATA_POINTERS] = { 0 };
+    // 主线程请求的输出尺寸：宽高打包进一个 64 位量，保证成对读到（不会读到新宽+旧高）
+    std::atomic<quint64> m_reqOutSize{0};
+
+    AVFrame         *pFrame = nullptr;
 
     SwrContext      *swr_ctx = nullptr;
     AVFrame         *pAudioFrame = nullptr;
@@ -154,6 +188,10 @@ public:
 
     // 当前是否为纯音频播放（无视频流）
     bool isAudioOnly() const { return m_bAudioOnly; }
+
+    // 诊断用：解码线程当前**实际**使用的视频输出尺寸。
+    // 窗口缩放后它应随画面区尺寸一起变化（证明不是只在界面侧拉伸旧帧）。
+    QSize decodedOutputSize() const;
 
     // 由 PluginMedia::stopPlayback() 调用：彻底停止后台播放（停解码线程 + 停音频输出 + 释放 FFmpeg 上下文）。
     // 用于主程序切换文件时，确保被隐藏的旧视频 widget 不再在后台发声/解码。
@@ -195,18 +233,29 @@ private:
     bool stopWorkerAndWait(unsigned long timeoutMs = 2000);
     // 根据源宽高与目标区域计算保持宽高比的目标输出尺寸
     QSize computeAspectRatioSize(int srcW, int srcH, int dstW, int dstH) const;
-    // （重新）创建 sws 上下文，将源帧缩放为 outW x outH 的 RGB32
-    void rebuildSwsContext(int srcW, int srcH, AVPixelFormat srcPixFmt,
-                           int outW, int outH);
+    // 清空画面区（清除残留 pixmap 与文字）：切换文件时必须调用，
+    // 否则上一个文件的最后一帧会残留（例如 MP4 → WAV 切换时，
+    // 纯音频没有任何视频帧到来，上一帧就一直停在画面上）。
+    void clearVideoPicture();
+    // 刷新画面区：清空画面后，纯音频文件补上提示文字。
+    void refreshVideoArea();
+    // 按当前画面区尺寸重算视频输出尺寸，并让解码线程切换到新尺寸。
+    // 窗口缩放后必须调用，否则画面尺寸会停留在打开文件时的取值（不跟随界面）。
+    void updateVideoOutputSize();
 
 private:
     Ui::MainWindow *ui;
     QTimer *timer;
-    int videoW = 0, videoH = 0;
+
+    // 当前视频输出尺寸（已按源宽高比适配到画面区）。
+    // 解码线程按它输出帧；窗口缩放后由 updateVideoOutputSize() 更新。
+    QSize m_curVideoOutSize;
+    // 是否有一次「窗口缩放后的尺寸更新」已排队（用于合并连续的 resize 事件）
+    bool m_resizeUpdatePending = false;
 
     AVFormatContext *pFormatCtx = nullptr;
     AVCodecContext  *pCodecCtx  = nullptr;
-    AVFrame         *pFrame     = nullptr, *pFrameRGB = nullptr;
+    AVFrame         *pFrame     = nullptr;
     AVFrame         *pAudioFrame = nullptr;
     unsigned char   *m_avioBuffer = nullptr;          // 完整文件数据（内存 IO 的数据源）
     unsigned char   *m_avioInternalBuffer = nullptr;  // AVIOContext 内部读缓冲，由 avio_context_free 释放
@@ -224,9 +273,6 @@ private:
     // ===== 音频重采样 =====
     SwrContext        *swr_ctx = nullptr;
     uint8_t           *audio_out_buffer = nullptr;
-    struct SwsContext *img_convert_ctx = nullptr;
-    uint8_t           *out_buffer = nullptr;
-    int                out_buffer_size = 0;  // 当前视频输出缓冲大小（字节）
     AVChannelLayout    out_ch_layout;
 
     // 音频缓存互斥锁
