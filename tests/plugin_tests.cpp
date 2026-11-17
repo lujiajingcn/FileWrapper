@@ -224,7 +224,7 @@ static void checkExtensionMapping()
     static const Case kCases[] = {
         { "docx", "PluginWord" }, { "docm", "PluginWord" }, { "dotx", "PluginWord" },
         { "dotm", "PluginWord" }, { "doc",  "PluginWord" }, { "DOCX", "PluginWord" },
-        { "odt",  "PluginWord" }, { "ott",  "PluginWord" },
+        { "odt",  "PluginWord" }, { "ott",  "PluginWord" }, { "rtf", "PluginWord" },
         { "txt",  "PluginText" },    { "md",   "PluginText" },
         { "vtt",  "PluginText" },    { "srt",  "PluginText" },
         { "jpg",  "PluginPicture" }, { "png",  "PluginPicture" },
@@ -233,6 +233,8 @@ static void checkExtensionMapping()
         { "mp4",  "PluginMedia" },   { "mp3",  "PluginMedia" },
         { "m2ts", "PluginMedia" },
         { "pdf",  "PluginPdf" },
+        { "xlsx", "PluginSheet" },   { "ods",  "PluginSheet" },
+        { "pptx", "PluginSlides" },  { "odp",  "PluginSlides" },
         { "epub", "PluginBook" },    { "fb2",  "PluginBook" },
         { "qzx",  nullptr },
     };
@@ -468,7 +470,6 @@ static void verifyErrorPaths(PluginInterface *tmpl, const QString &work)
     struct Neg { const char *file; const char *expect; const char *label; };
     static const Neg kNegs[] = {
         { "legacy.doc",   "\u53e6\u5b58\u4e3a",            "legacy .doc -> save-as hint" },
-        { "sample.rtf",   "RTF",                            "rtf -> unsupported hint" },
         { "broken.docx",  "docx",                           "broken zip -> parse error" },
         { "notword.docx", "word/document.xml",              "non-word zip -> missing part" },
         { "empty.docx",   "\u6587\u4ef6\u4e3a\u7a7a",       "0 byte -> empty hint" },
@@ -663,9 +664,9 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
 
     // ---- W4: 原硬编码表共 90 项，全部由插件 JSON 接管 ----
     // 90 项声明里有 1 个跨插件重名（".ts" = MPEG-TS 视频 vs TypeScript 文本），
-    // 因此唯一路由数是 106，冲突按 extensionPriority 决出（PluginText 声明 10）。
-    report(pm->registeredExtensionCount() >= 106,
-           QStringLiteral("W4: %1 unique extensions registered (107 declared; .ts is shared)")
+    // 因此唯一路由数是 112，冲突按 extensionPriority 决出（PluginText 声明 10）。
+    report(pm->registeredExtensionCount() >= 112,
+           QStringLiteral("W4: %1 unique extensions registered (113 declared; .ts is shared)")
                .arg(pm->registeredExtensionCount()));
     report(QFileInfo(pm->pluginForExtension(QStringLiteral("ts"))).fileName()
                .compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0,
@@ -1041,6 +1042,132 @@ static void verifyOtherViewers(const QString &work)
         }
         delete p;
         report(bOk, QStringLiteral("V7: PluginPicture renders .webp (qwebp)"));
+    }
+
+    // V8: PluginWord 的 RTF 子集分支：段落 + 字符格式（.rtf 不再是"不支持"提示）
+    if (want("V8"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bText = false;
+        bool bBold = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.rtf"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.rtf"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bText = plain.contains(QString::fromUtf8("第一章 RTF 冒烟"))
+                        && plain.contains(QString::fromUtf8("粗体"));
+                bBold = doc->toHtml().contains(QStringLiteral("font-weight"));
+            }
+        }
+        delete p;
+        report(bText, QStringLiteral("V8a: PluginWord renders .rtf text (RTF parser)"));
+        report(bBold, QStringLiteral("V8b: PluginWord applies .rtf character formatting"));
+    }
+
+    // V9/V10: PluginSheet —— .xlsx（含合并单元格、第二张表）与 .ods
+    if (want("V9"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginSheet.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.xlsx"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.xlsx"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bOk = plain.contains(QString::fromUtf8("张三"))
+                      && plain.contains(QStringLiteral("95"))
+                      && plain.contains(QString::fromUtf8("第二张表"))
+                      && doc->toHtml().contains(QStringLiteral("<table"));
+            }
+        }
+        delete p;
+        report(bOk, QStringLiteral("V9: PluginSheet renders .xlsx (cells + 2 sheets)"));
+    }
+
+    if (want("V10"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginSheet.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.ods"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.ods"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bOk = plain.contains(QString::fromUtf8("王五"))
+                      && plain.contains(QStringLiteral("77"))
+                      && doc->toHtml().contains(QStringLiteral("<table"));
+            }
+        }
+        delete p;
+        report(bOk, QStringLiteral("V10: PluginSheet renders .ods"));
+    }
+
+    // V11/V12: PluginSlides —— .pptx 与 .odp 的逐页静态渲染
+    if (want("V11"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginSlides.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.pptx"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.pptx"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bOk = plain.contains(QString::fromUtf8("PPTX 冒烟标题"))
+                      && plain.contains(QString::fromUtf8("第二页文本框内容"))
+                      && plain.contains(QString::fromUtf8("第 2 页"));
+            }
+        }
+        delete p;
+        report(bOk, QStringLiteral("V11: PluginSlides renders .pptx (2 slides)"));
+    }
+
+    if (want("V12"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginSlides.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("sample.odp"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample.odp"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QTextDocument *doc = documentOf(p->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                bOk = plain.contains(QString::fromUtf8("ODP 冒烟标题"))
+                      && plain.contains(QString::fromUtf8("第二页标题"))
+                      && plain.contains(QString::fromUtf8("第 2 页"));
+            }
+        }
+        delete p;
+        report(bOk, QStringLiteral("V12: PluginSlides renders .odp (2 slides)"));
     }
 }
 

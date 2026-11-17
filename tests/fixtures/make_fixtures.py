@@ -433,12 +433,159 @@ def make_webp():
     return path
 
 
+def make_rtf():
+    """RTF 子集素材：对齐 + 粗体 + 斜体 + 颜色 + 中英文（\\uN 转义）。"""
+    # 中文字符用 \uN? 形式（N 是十进制码点，? 是回退字符，解析时跳过）
+    title = r"\u31532?\u19968?\u31456?\u32?RTF\u32?\u20882?\u28895?"
+    body  = (r"\u26222?\u36890?\u27573?\u33853? {\b \u31895?\u20307?}"
+             r" {\i \u26012?\u20307?} {\cf1 \u32418?\u33394?}\par")
+    rtf = ("{\\rtf1\\ansi\\deff0\\deflang2052\n"
+           "{\\fonttbl{\\f0\\fnil Calibri;}{\\f1\\fnil SimSun;}}\n"
+           "{\\colortbl;\\red204\\green0\\blue0;}\n"
+           "\\pard\\qc\\f0\\fs32 " + title + "\\par\n"
+           "\\pard\\ql\\f1\\fs22 " + body + "\n"
+           "}\n")
+    path = os.path.join(WORK, "sample.rtf")
+    with io.open(path, "w", encoding="ascii", newline="\n") as f:
+        f.write(rtf)
+    return path
+
+
+ODS_MIMETYPE = "application/vnd.oasis.opendocument.spreadsheet"
+ODP_MIMETYPE = "application/vnd.oasis.opendocument.presentation"
+
+ODS_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.3">
+ <office:body>
+  <office:spreadsheet>
+   <table:table table:name="Sheet1">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>姓名</text:p></table:table-cell>
+     <table:table-cell office:value-type="string"><text:p>分数</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>王五</text:p></table:table-cell>
+     <table:table-cell office:value-type="float" office:value="77"><text:p>77</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:spreadsheet>
+ </office:body>
+</office:document-content>
+"""
+
+ODP_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.3">
+ <office:body>
+  <office:presentation>
+   <draw:page draw:name="第1页">
+    <draw:frame svg:width="20cm" svg:height="2cm">
+     <draw:text-box><text:h>ODP 冒烟标题</text:h></draw:text-box>
+    </draw:frame>
+    <draw:frame svg:width="20cm" svg:height="6cm">
+     <draw:text-box><text:p>第一页正文内容</text:p></draw:text-box>
+    </draw:frame>
+   </draw:page>
+   <draw:page draw:name="第2页">
+    <draw:frame svg:width="20cm" svg:height="2cm">
+     <draw:text-box><text:h>第二页标题</text:h></draw:text-box>
+    </draw:frame>
+   </draw:page>
+  </office:presentation>
+ </office:body>
+</office:document-content>
+"""
+
+
+def _write_odf(path, mimetype, content_xml, extra_files=None):
+    """写一个最小 ODF 包（mimetype 必须是第一个条目且不压缩）。"""
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"'
+        ' manifest:version="1.3">\n'
+        ' <manifest:file-entry manifest:full-path="/" manifest:media-type="%s"/>\n'
+        ' <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>\n'
+        '</manifest:manifest>\n' % mimetype
+    )
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), mimetype.encode("ascii"), zipfile.ZIP_STORED)
+        z.writestr("META-INF/manifest.xml", manifest, zipfile.ZIP_DEFLATED)
+        z.writestr("content.xml", content_xml, zipfile.ZIP_DEFLATED)
+        for name, data in (extra_files or {}).items():
+            z.writestr(name, data, zipfile.ZIP_DEFLATED)
+    return path
+
+
+def make_ods():
+    path = os.path.join(WORK, "sample.ods")
+    return _write_odf(path, ODS_MIMETYPE, ODS_CONTENT)
+
+
+def make_odp():
+    path = os.path.join(WORK, "sample.odp")
+    return _write_odf(path, ODP_MIMETYPE, ODP_CONTENT)
+
+
+def make_xlsx():
+    """用 openpyxl 生成：两个工作表 + 合并单元格 + 数字/中文。"""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "数据"
+    ws["A1"] = "姓名"
+    ws["B1"] = "分数"
+    ws["C1"] = "备注"
+    ws["A2"] = "张三"
+    ws["B2"] = 95
+    ws["C2"] = "第一行"
+    ws["A3"] = "李四"
+    ws["B3"] = 88
+    ws["A5"] = "合并单元格"
+    ws.merge_cells("A5:B5")
+
+    ws2 = wb.create_sheet("第二页")
+    ws2["A1"] = "第二张表"
+    ws2["A2"] = 123
+
+    path = os.path.join(WORK, "sample.xlsx")
+    wb.save(path)
+    return path
+
+
+def make_pptx():
+    """用 python-pptx 生成：两页，各自标题与正文。"""
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide1 = prs.slides.add_slide(prs.slide_layouts[1])   # Title and Content
+    slide1.shapes.title.text = "PPTX 冒烟标题"
+    slide1.placeholders[1].text = "第一页正文内容"
+
+    slide2 = prs.slides.add_slide(prs.slide_layouts[5])   # Title Only
+    slide2.shapes.title.text = "第二页标题"
+    box = slide2.shapes.add_textbox(Inches(1), Inches(2), Inches(5), Inches(1.5))
+    box.text_frame.text = "第二页文本框内容"
+
+    path = os.path.join(WORK, "sample.pptx")
+    prs.save(path)
+    return path
+
+
 def make_broken_files():
     with open(os.path.join(WORK, "legacy.doc"), "wb") as f:
         f.write(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 5000)
-
-    with open(os.path.join(WORK, "sample.rtf"), "w", encoding="ascii") as f:
-        f.write("{\\rtf1\\ansi\\deff0 {\\fonttbl {\\f0 Times;}} \\f0 hello RTF.}")
 
     with open(os.path.join(WORK, "broken.docx"), "wb") as f:
         f.write(b"PK\x03\x04" + bytes(range(256)) * 20)
@@ -457,7 +604,8 @@ if __name__ == "__main__":
     for fn in (make_text, make_epub):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
-    for fn in (make_html, make_odt, make_svg, make_webp):
+    for fn in (make_html, make_odt, make_svg, make_webp, make_rtf,
+               make_ods, make_odp, make_xlsx, make_pptx):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()
