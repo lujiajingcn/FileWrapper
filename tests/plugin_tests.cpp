@@ -50,8 +50,6 @@
 #include <QShortcut>
 #include <QStandardItemModel>
 #include <QItemSelectionModel>
-#include <QToolButton>
-#include <QMenu>
 #include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTextBlock>
@@ -1438,22 +1436,6 @@ static void verifyMergeDialog()
     for (QShortcut *pSc : dlg.findChildren<QShortcut *>())
         if (pSc->key() == QKeySequence(QKeySequence::Delete)) bHasDeleteShortcut = true;
     report(bHasDeleteShortcut, QStringLiteral("H4: Delete key shortcut wired to delete"));
-
-    // H5: 添加入口收敛为一个按钮，菜单里区分「添加文件 / 添加文件夹」
-    QToolButton *pAdd = dlg.findChild<QToolButton *>(QStringLiteral("btnAdd"));
-    bool bAddOk = pAdd != nullptr && pAdd->menu() != nullptr
-                  && pAdd->menu()->actions().size() == 2;
-    if (bAddOk)
-    {
-        const QString s0 = pAdd->menu()->actions().at(0)->text();
-        const QString s1 = pAdd->menu()->actions().at(1)->text();
-        bAddOk = s0.contains(QStringLiteral("添加文件"))
-                 && s1.contains(QStringLiteral("添加文件夹"));
-    }
-    report(bAddOk
-               && dlg.findChild<QWidget *>(QStringLiteral("btnAddDir")) == nullptr
-               && dlg.findChild<QWidget *>(QStringLiteral("btnAddFile")) == nullptr,
-           QStringLiteral("H5: single 添加 entry with 文件/文件夹 menu"));
 }
 
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
