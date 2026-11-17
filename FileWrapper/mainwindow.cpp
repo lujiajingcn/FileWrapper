@@ -38,6 +38,7 @@
 #include <QDateTime>
 #include <QSettings>
 #include <QMouseEvent>
+#include <QCloseEvent>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
@@ -2053,7 +2054,11 @@ void MainWindow::onActionSaveFileTriggered()
 
     if(!bOk)
     {
-        QString sMsg = m_fileManager->isCancelRequested()
+        // 进度对话框关闭时也可能发出 canceled()，不能只用 isCancelRequested 判断；
+        // 优先采用 FileManager 给出的具体原因，只有确实是"操作已取消"才提示已取消。
+        const bool bCancelled = m_fileManager->isCancelRequested()
+                                && (sReason.isEmpty() || sReason.contains(tr("取消")));
+        QString sMsg = bCancelled
                 ? tr("保存已取消。改动仍保留在内存中，可重试。")
                 : tr("保存失败。改动仍保留在内存中，可重试。\n\n原因：%1")
                     .arg(sReason.isEmpty() ? tr("未知错误") : sReason);
@@ -2064,6 +2069,18 @@ void MainWindow::onActionSaveFileTriggered()
     // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮
     refreshFilePathView();
     syncActionStates();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    if (!confirmDiscardOrSaveIfDirty())
+    {
+        event->ignore();
+        return;
+    }
+    // 先释放插件实例（停止音视频播放、清理临时副本），再真正退出
+    closeAllTabs();
+    event->accept();
 }
 
 void MainWindow::on_actionAbout_triggered()

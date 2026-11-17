@@ -20,6 +20,7 @@
 #include <QMetaObject>
 
 class QProgressDialog;
+class QCloseEvent;
 
 namespace Ui {
 class MainWindow;
@@ -36,6 +37,8 @@ public:
 protected:
     void initWidgetFilePath();
     void initWidgetFileContent();
+    // 关闭窗口前确认未保存改动（P0：此前直接退出会静默丢失改动）
+    void closeEvent(QCloseEvent *event) override;
 
 signals:
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
