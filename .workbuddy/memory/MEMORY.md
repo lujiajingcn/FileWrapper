@@ -96,12 +96,14 @@
   「插件设置 → 支持的格式…」会列出每个已装插件的后缀，以及常见不支持格式的处理建议。
   注意扩展名不可信（下载改名、.dat/.bin、无后缀），内容判断优先于扩展名。
 - **合并时"已有归档"先拆分**（`FileManager::QMergeFiles`）：选中的文件如果首 4 字节是
-  `FWDA` 魔数，就读它的索引（`inspectArchive`）把条目作为独立输入展开，保留归档内
-  相对路径；不会把 `.dat` 当普通文件嵌成"归档套归档"。撞名（归档里已有 photo.png
-  又选了 photo.png）自动在扩展名前加 ` (2)`。`writeV2Header` 因此多了一个可选参数
-  `pStoredPaths`：给了就直接用它当存储路径，不给仍按"绝对路径相对公共根"生成。
-  合并对话框在检测到归档输入时会提示"其中 N 个是已合并归档，将先拆分再合并"。
-  测试见 `tests/plugin_tests.cpp` 的 G 组（普通合并→再合并→撞名改名）。
+  `FWDA` 魔数，就读它的索引（`inspectArchive`）把条目作为独立输入展开。**每个条目先还原
+  "原始完整路径"**（归档条目 = 该归档的 root + 归档内相对路径；普通文件 = 绝对路径），
+  再统一决定外层 root：所有条目在同一公共目录下 → 存相对路径（显示为 root + 相对路径，
+  保持短路径）；**跨盘符/无公共根 → root 为空，把盘符当首段**（`E:/x` → `E/x`，
+  冒号不能进路径段），保证原 111.dat 里的文件不会因为另一输入在 D: 就被改挂到 D: 下。
+  - 撞名自动加 ` (2)`；`writeV2Header` 多了可选 `pStoredPaths`（给了就按给定路径写）。
+  - 只展开一层：归档条目本身若又是 `.dat` 就作为普通条目保留。
+  - 测试见 `tests/plugin_tests.cpp` 的 G 组（含 `fixtures/rooted.dat` 的跨盘符用例）。
 - **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
   - `pluginbase.h`：`PluginBase<Derived, WindowT>`（CRTP）收口构造/析构、`apiVersion`、
     `getPluginWidget`、`createInstance`、`sendFile`/`sendFileData` 适配；
