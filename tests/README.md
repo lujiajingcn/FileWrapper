@@ -1,7 +1,7 @@
 # 插件测试（plugin tests）
 
 本目录是**仓库内的可复现测试套件**，覆盖「插件基础设施」与 `PluginWord` 的真实渲染，
-共 **135 项断言**。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
+共 **138 项断言**。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
 那些探针随机器一起消失，导致同一套验证别人无法跑、也没法回归。
 
 ## 为什么这样设计
@@ -31,6 +31,7 @@
 | `A` | 主程序链路：`PluginManager` 加载、`QMergeFiles` 合并、`resolvePlugin` 三步、挂进 `QTabWidget`、诊断入口存在 |
 | `X` | B2 实例契约（`createInstance()` 返回空必须报错，不再退化共享实例）、B4 磁盘空间预检、C5 插件禁用/重启用 + 重新加载 |
 | `Y` | C2 数据通道：`PluginFile` 内存/路径两种形态、`sendFile()` 的默认兼容实现（老插件照常收到数据、路径型插件收到原路径）、迁移后的 PluginWord 直接吃 `PluginFile` |
+| `V` | 其余查看器渲染冒烟：PluginText（.txt）、PluginPicture（.png）、PluginBook（.epub，同时覆盖 `Plugins/common/zipreader` 的 deflate 路径） |
 
 素材见 [fixtures/](fixtures)：`basic.docx`（常规排版）、`chinese.docx`（中文样式名 +
 中文编号 + 合并单元格）、`legacy.doc`/`sample.rtf`/`broken.docx`/`notword.docx`/`empty.docx`（异常输入）。
@@ -106,11 +107,19 @@ copy ..\..\..\build\Desktop_Qt_6_9_3_MinGW_64_bit_Debug\FileWrapper\debug\plugin
 - **新增插件**：在 `fixtures/` 放该格式的素材；在 `plugin_tests.cpp` 里加一组断言
   （参考 `verifyBasicDoc()`）；若是新后缀，顺手加到插件的 `pluginX.json`
   并在 `checkExtensionMapping()` 的表里加一行，确认路由。
+  - 插件代码有公共部分：**`Plugins/common/`**（`zipreader`、`pluginbase.h`）。
+    新插件一律继承 `PluginBase<自身, MainWindow>` 并只实现 `showFile()`，
+    不要再抄构造/析构/`apiVersion`/`createInstance` 这套样板；
+    需要共享源码时在 `.pro` 里写 `PLUGIN_SHARED_SOURCES = zipreader`。
+  - 渲染冒烟参考 `verifyOtherViewers()`：**从本程序自己的 `plugins/` 目录**
+    用 `QPluginLoader` 取模板、再 `createInstance()` 渲染，用完 `delete`；
+    **不要**从另一个路径再去加载同一个 DLL（Windows 会当成两个模块，
+    卸载其一会让插件侧遗留对象的虚表悬空 → 退出期崩溃，V 组踩过）。
 - **改插件接口**：记得 `PLUGIN_API_VERSION +1`（见 `include/plugininterface.h`），
   并同步所有插件 JSON 的 `"apiVersion"`；版本门禁用例 `W8` 会继续守住"旧插件被拒"。
   **当前接口版本 = 3**（C2 引入 `sendFile(const PluginFile &)`）。
-- **新插件想吃"零拷贝"通道**：重写 `sendFile(const PluginFile &)`，直接用
-  `file.memory()`；不重写就用默认实现（行为与旧版一致，会复制一次）。
+- **新插件想吃"零拷贝"通道**：在 `showFile()` 里直接用 `file.memory()`；
+  基类的 `sendFile()` 已经把空值/路径/旧通道都适配好了。
 
 ## 已知限制
 

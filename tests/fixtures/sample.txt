@@ -1,0 +1,3 @@
+文本插件冒烟测试
+Second line: plain text stays as-is.
+第三行：数字 12345，符号 <> & 应原样显示。

@@ -10,6 +10,8 @@
   notword.docx   只有 hello.txt 的 ZIP（模拟 xlsx/odt，验证缺少正文部件提示）
   empty.docx     0 字节（验证空文件提示）
   pic.png        basic.docx 里内嵌的图片素材
+  sample.txt     PluginText 冒烟素材（UTF-8 中文 + 原样保留的符号）
+  sample.epub    最小合法 EPUB（PluginBook 冒烟素材，同时覆盖共享 ZipReader 的 inflate）
 
 依赖：python-docx、Pillow。素材已经入库，只有想改排版时才需要重新生成：
   python tests/fixtures/make_fixtures.py
@@ -242,6 +244,63 @@ def make_chinese():
     return out
 
 
+CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+
+EPUB_OPF = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Plugins Smoke EPUB</dc:title>
+    <dc:identifier id="bookid">urn:uuid:00000000-0000-0000-0000-000000000001</dc:identifier>
+    <dc:language>zh-CN</dc:language>
+  </metadata>
+  <manifest>
+    <item id="chap1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chap1"/>
+  </spine>
+</package>
+"""
+
+EPUB_CHAPTER = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>第一章 冒烟</title></head>
+<body>
+  <h1>第一章 冒烟</h1>
+  <p>EPUB 正文内容：这段文字来自测试素材。</p>
+</body>
+</html>
+"""
+
+
+def make_text():
+    """PluginText 的冒烟素材：UTF-8 中文 + 不该被转义的符号。"""
+    path = os.path.join(WORK, "sample.txt")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("文本插件冒烟测试\n")
+        f.write("Second line: plain text stays as-is.\n")
+        f.write("第三行：数字 12345，符号 <> & 应原样显示。\n")
+    return path
+
+
+def make_epub():
+    """最小合法 EPUB：mimetype 必须是第一个条目且不压缩（OCF 规范）。"""
+    path = os.path.join(WORK, "sample.epub")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), b"application/epub+zip",
+                   zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml", CONTAINER_XML, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/content.opf", EPUB_OPF, zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/chapter1.xhtml", EPUB_CHAPTER, zipfile.ZIP_DEFLATED)
+    return path
+
+
 def make_broken_files():
     with open(os.path.join(WORK, "legacy.doc"), "wb") as f:
         f.write(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 5000)
@@ -261,6 +320,9 @@ def make_broken_files():
 if __name__ == "__main__":
     make_png(os.path.join(WORK, "pic.png"))
     for fn in (make_basic, make_chinese):
+        path = fn()
+        print("wrote", path, os.path.getsize(path), "bytes")
+    for fn in (make_text, make_epub):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()

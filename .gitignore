@@ -73,3 +73,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+
+# Python 缓存（生成测试素材时会产生）
+__pycache__/

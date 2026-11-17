@@ -49,6 +49,8 @@
 #include <QTemporaryDir>
 #include <QTextBlock>
 #include <QTextBrowser>
+#include <QTextEdit>
+#include <QLabel>
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QTextFrame>
@@ -858,6 +860,96 @@ static void verifyFileChannel(PluginInterface *wordTemplate, const QString &work
     delete own;
 }
 
+// ---------------------------------------------------------------------------
+// V: 其余查看器的渲染冒烟（Book / Text / Picture）
+//
+// 此前这三家只有"能加载 + 后缀路由"级覆盖。抽取 Plugins/common/zipreader 与
+// 重构插件代理层都需要它们各自渲染一次做兜底 —— 尤其是 Book 的 EPUB 路径，
+// 它是共享 ZipReader 的另一个使用者。
+// ---------------------------------------------------------------------------
+static int countLabelsWithPixmap(QWidget *root)
+{
+    int n = 0;
+    for (QLabel *pLabel : root->findChildren<QLabel *>())
+        if (!pLabel->pixmap().isNull())
+            ++n;
+    return n;
+}
+
+static void verifyOtherViewers(const QString &work)
+{
+    // 调试开关：FW_VIEWER_ONLY=V1/V2/V3 时只跑其中一组（定位退出期崩溃用）
+    const QString sOnly = qEnvironmentVariable("FW_VIEWER_ONLY");
+    auto want = [&sOnly](const char *id) {
+        return sOnly.isEmpty() || sOnly == QLatin1String(id);
+    };
+
+    // 从**本程序自己的 plugins/ 目录**加载（也就是 PluginManager 用的那一份）。
+    // 不要再从 -plugins 参数指向的构建目录加载：那是同一 DLL 的另一条路径，
+    // Windows 会当成两个模块分别映射，卸载其中一份时会让插件侧遗留对象
+    // （QTextBrowser 子类 BookBrowser 等）的虚表悬空 —— 退出期直接崩溃。
+    // 渲染用 createInstance() 出来的独立实例，用完显式 delete，模板留给 PluginManager。
+    const QString sPluginDir = QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
+
+    // V1: PluginText —— .txt 原样显示在文本编辑框
+    if (want("V1"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginText.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            const QByteArray data = readFile(work + QStringLiteral("/sample.txt"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            QTextEdit *pEdit = w ? w->findChild<QTextEdit *>() : nullptr;
+            bOk = pEdit != nullptr
+                  && pEdit->toPlainText().contains(QString::fromUtf8("文本插件冒烟"));
+        }
+        delete p;
+        report(bOk, QStringLiteral("V1: PluginText renders .txt"));
+    }
+
+    // V2: PluginPicture —— .png 变成非空的 QPixmap
+    if (want("V2"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginPicture.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            const QByteArray data = readFile(work + QStringLiteral("/pic.png"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            bOk = w != nullptr && countLabelsWithPixmap(w) > 0;
+        }
+        delete p;
+        report(bOk, QStringLiteral("V2: PluginPicture renders .png"));
+    }
+
+    // V3: PluginBook —— .epub 解析出章节正文（同时覆盖共享 ZipReader 的 deflate 路径）
+    if (want("V3"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginBook.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            const QByteArray data = readFile(work + QStringLiteral("/sample.epub"));
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QWidget *w = p->getPluginWidget();
+            QTextBrowser *pBrowser = w ? w->findChild<QTextBrowser *>() : nullptr;
+            bOk = pBrowser != nullptr
+                  && pBrowser->toPlainText().contains(QString::fromUtf8("第一章 冒烟"));
+        }
+        delete p;
+        report(bOk, QStringLiteral("V3: PluginBook renders .epub (shared ZipReader)"));
+    }
+}
+
 static void verifyInstances(PluginInterface *tmpl, const QString &work)
 {
     PluginInterface *a = tmpl->createInstance();
@@ -1237,6 +1329,10 @@ int main(int argc, char **argv)
 
     // ---------- Y: C2 数据通道 ----------
     verifyFileChannel(tmpl, work);
+
+    // ---------- V: 其余查看器渲染冒烟 ----------
+    if (qEnvironmentVariableIsEmpty("FW_SKIP_VIEWER_SMOKE"))
+        verifyOtherViewers(work);
 
     // ---------- S: 截图（可选，--shots <dir>） ----------
     if (!shotsDir.isEmpty())
