@@ -64,6 +64,7 @@
 
 #include "dlgpluginmap.h"
 #include "filemanager.h"
+#include "formatresolver.h"
 #include "mainwindow.h"
 #include "plugininterface.h"
 #include "pluginmanager.h"
@@ -1171,8 +1172,65 @@ static void verifyOtherViewers(const QString &work)
     }
 }
 
-static void verifyInstances(PluginInterface *tmpl, const QString &work)
+// ---------------------------------------------------------------------------
+// Z: 格式识别（FormatResolver）—— 用户遇到"后缀不认识"的文件时，先按内容判断
+// ---------------------------------------------------------------------------
+static void verifyFormatResolver()
 {
+    // Z1: 标准 PNG 魔数（8 字节魔数 + 4 字节随便的内容）
+    const QByteArray png("\x89PNG\r\n\x1a\nrest", 12);
+    const auto d1 = FormatResolver::detect(QStringLiteral("photo.png"), png);
+    report(d1.formatId == QLatin1String("png") && d1.pluginExt == QLatin1String("png")
+               && d1.fromContent,
+           QStringLiteral("F1: content detects PNG (%1)").arg(d1.displayName));
+
+    // Z2: 后缀不可信：扩展名 .zzz 但内容是 PNG -> 仍然交给图片插件
+    const auto d2 = FormatResolver::detect(QStringLiteral("photo.zzz"), png);
+    report(d2.pluginExt == QLatin1String("png"),
+           QStringLiteral("F2: content wins over wrong extension"));
+
+    // Z3: 旧版 Office（OLE2）：识别得出来，但没有插件能处理，必须给可照做的建议
+    QByteArray ole("\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1", 8);
+    ole += QByteArray(64, '\0');
+    const auto d3 = FormatResolver::detect(QStringLiteral("old.doc"), ole);
+    report(d3.formatId == QLatin1String("ole2") && d3.pluginExt.isEmpty()
+               && d3.advice.contains(QString::fromUtf8("另存为")),
+           QStringLiteral("F3: legacy OLE2 recognized with actionable advice"));
+
+    // Z4: ZIP 家族：按包内标志区分 docx / xlsx / odt
+    QByteArray zipDocx("PK\x03\x04", 4);
+    zipDocx += "....word/document.xml....";
+    QByteArray zipXlsx("PK\x03\x04", 4);
+    zipXlsx += "....xl/workbook.xml....";
+    QByteArray zipOdt("PK\x03\x04", 4);
+    zipOdt += "...mimetypeapplication/vnd.oasis.opendocument.text...";
+    const auto d4 = FormatResolver::detect(QStringLiteral("noext"), zipDocx);
+    const auto d5 = FormatResolver::detect(QStringLiteral("noext"), zipXlsx);
+    const auto d6 = FormatResolver::detect(QStringLiteral("noext"), zipOdt);
+    report(d4.pluginExt == QLatin1String("docx")
+               && d5.pluginExt == QLatin1String("xlsx")
+               && d6.pluginExt == QLatin1String("odt"),
+           QStringLiteral("F4: ZIP subtypes -> docx/xlsx/odt (%1/%2/%3)")
+               .arg(d4.pluginExt, d5.pluginExt, d6.pluginExt));
+
+    // Z5: 完全未知：要有可读建议，而不是空
+    const auto d7 = FormatResolver::detect(QStringLiteral("blob.qqq"), QByteArray());
+    report(d7.formatId == QLatin1String("unknown")
+               && d7.displayName.contains(QString::fromUtf8("未知"))
+               && !d7.advice.isEmpty(),
+           QStringLiteral("F5: unknown format has readable advice"));
+
+    // Z6: 常见不支持格式清单非空，且包含旧版 Office 的处理建议
+    const auto unsupported = FormatResolver::knownUnsupported();
+    bool bDocAdvice = false;
+    for (const auto &p : unsupported)
+        if (p.first.contains(QLatin1String(".doc"))) bDocAdvice = true;
+    report(!unsupported.isEmpty() && bDocAdvice,
+           QStringLiteral("F6: unsupported-format advice list built (%1 entries)")
+               .arg(unsupported.size()));
+}
+
+static void verifyInstances(PluginInterface *tmpl, const QString &work){
     PluginInterface *a = tmpl->createInstance();
     PluginInterface *b = tmpl->createInstance();
     report(a != nullptr && b != nullptr && a != b, QStringLiteral("M1: two independent instances"));
@@ -1400,6 +1458,10 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
     report(sActions.contains(QStringLiteral("插件管理"))
                && sActions.contains(QStringLiteral("重新加载插件")),
            QStringLiteral("A9: menu actions 插件管理 / 重新加载插件 exist"));
+
+    // A10: 「支持的格式」入口（用户遇到不支持的格式时最直接的求助入口）
+    report(sActions.contains(QStringLiteral("支持的格式…")),
+           QStringLiteral("A10: menu action 支持的格式 exists"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,6 +1616,9 @@ int main(int argc, char **argv)
     // ---------- V: 其余查看器渲染冒烟 ----------
     if (qEnvironmentVariableIsEmpty("FW_SKIP_VIEWER_SMOKE"))
         verifyOtherViewers(work);
+
+    // ---------- Z: 格式识别（后缀不可靠时的兜底） ----------
+    verifyFormatResolver();
 
     // ---------- S: 截图（可选，--shots <dir>） ----------
     if (!shotsDir.isEmpty())

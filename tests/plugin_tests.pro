@@ -31,6 +31,7 @@ SOURCES += \
     $$SRC/dlgpluginmap.cpp \
     $$SRC/dlgsplitfile.cpp \
     $$SRC/filemanager.cpp \
+    $$SRC/formatresolver.cpp \
     $$SRC/mainwindow.cpp \
     $$SRC/pluginmanager.cpp \
     $$SRC/plugindiag.cpp \
@@ -45,6 +46,7 @@ HEADERS += \
     $$SRC/dlgpluginmap.h \
     $$SRC/dlgsplitfile.h \
     $$SRC/filemanager.h \
+    $$SRC/formatresolver.h \
     $$SRC/mainwindow.h \
     $$PWD/../include/plugininterface.h \
     $$SRC/pluginmanager.h \

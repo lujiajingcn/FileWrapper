@@ -1,7 +1,7 @@
 # 插件测试（plugin tests）
 
 本目录是**仓库内的可复现测试套件**，覆盖「插件基础设施」与 `PluginWord` 的真实渲染，
-共 **161 项断言**。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
+共 **168 项断言**。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
 那些探针随机器一起消失，导致同一套验证别人无法跑、也没法回归。
 
 ## 为什么这样设计
@@ -32,6 +32,7 @@
 | `X` | B2 实例契约（`createInstance()` 返回空必须报错，不再退化共享实例）、B4 磁盘空间预检、C5 插件禁用/重启用 + 重新加载 |
 | `Y` | C2 数据通道：`PluginFile` 内存/路径两种形态、`sendFile()` 的默认兼容实现（老插件照常收到数据、路径型插件收到原路径）、迁移后的 PluginWord 直接吃 `PluginFile` |
 | `V` | 各查看器渲染冒烟：PluginText（.txt、**.html 富文本**）、PluginPicture（.png、**.svg**、**.webp**）、PluginBook（.epub，覆盖共享 ZipReader 的 deflate 路径）、PluginWord（**.odt/OpenDocument** 的段落/表格、**.rtf 子集**）、PluginSheet（**.xlsx 多表 + 合并单元格**、**.ods**）、PluginSlides（**.pptx**、**.odp** 的逐页静态渲染） |
+| `F` | 格式识别（`FormatResolver`）：PNG/PDF/OLE2/ZIP 家族（docx/xlsx/odt）按内容判断、内容优先于错误后缀、未知格式有可读建议、不支持格式清单非空 |
 
 素材见 [fixtures/](fixtures)：`basic.docx`（常规排版）、`chinese.docx`（中文样式名 +
 中文编号 + 合并单元格）、`legacy.doc`/`sample.rtf`/`broken.docx`/`notword.docx`/`empty.docx`（异常输入）。
