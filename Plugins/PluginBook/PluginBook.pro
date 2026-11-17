@@ -36,18 +36,17 @@ PRE_TARGETDEPS   += $$LIBMOBI_DIR/libmobi.a
 QMAKE_EXTRA_TARGETS += libmobi
 
 SOURCES += \
-        main.cpp \
         mainwindow.cpp \
-        pluginbook.cpp \
-        zipreader.cpp
+        pluginbook.cpp
 
 HEADERS += \
         mainwindow.h \
-        pluginbook.h \
-        zipreader.h
+        pluginbook.h
 
-# 自包含的 ZIP 读取器（zipreader.cpp）用 zlib 解压 deflate 条目。
+# 自包含的 ZIP 读取器来自 Plugins/common/（与 PluginWord 共享同一份源码，
+# 由 plugin_common.pri 编进本插件的 DLL）。它用 zlib 解压 deflate 条目，
 # 链接 MinGW 自带的静态 libz.a（无需额外部署 zlib1.dll）。
+PLUGIN_SHARED_SOURCES = zipreader
 LIBS += -lz
 
 FORMS += \

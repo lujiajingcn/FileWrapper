@@ -1,35 +1,21 @@
 #include "plugintext.h"
 
-PluginText::PluginText(QObject *parent) : QObject(parent)
+bool PluginText::showFile(const PluginFile &file)
 {
-    m_wMainWindow = new MainWindow;
-}
-
-PluginText::~PluginText()
-{
-    delete m_wMainWindow;
-    m_wMainWindow = nullptr;
-}
-
-void PluginText::sendFileData(char *szFileData, qint64 nFileLen)
-{
-    if (szFileData == nullptr || nFileLen <= 0)
+    if (file.isPath())
     {
-        // 主程序在读文件失败 / 0 字节时也会送 (nullptr, 0)：必须清掉内容区，
-        // 否则界面仍停留在上一个文件。
-        if (m_wMainWindow) m_wMainWindow->clearContent();
-        return;
+        // 本插件只吃字节：路径形态就读进内存（Text 不声明 prefersFileByPath）
+        const QByteArray data = file.readAll();
+        if (data.isEmpty())
+            return false;
+        m_wMainWindow->showText(const_cast<char *>(data.constData()), data.size());
+        return true;
     }
-    m_wMainWindow->showText(szFileData, nFileLen);
-}
 
-QWidget* PluginText::getPluginWidget()
-{
-    return m_wMainWindow;
-}
-
-PluginInterface* PluginText::createInstance()
-{
-    // 为新标签页创建一个独立实例（含独立的内部窗口），使同类型多标签页各自独立、互不干扰
-    return new PluginText;
+    const QByteArray &data = file.memory();
+    if (data.isEmpty())
+        return false;
+    // showText(char*, len) 内部会复制一份，这里不需要额外 Const_cast 生命周期管理
+    m_wMainWindow->showText(const_cast<char *>(data.constData()), data.size());
+    return true;
 }

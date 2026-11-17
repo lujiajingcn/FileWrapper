@@ -2,27 +2,24 @@
 #define PLUGINPDF_H
 
 #include "mainwindow.h"
+#include "pluginbase.h"
 
-#include "plugininterface.h"
-
-class PluginPdf : public QObject,public PluginInterface
+// 代理层样板见 Plugins/common/pluginbase.h；本类额外实现"大文件走路径"通道。
+class PluginPdf : public PluginBase<PluginPdf, MainWindow>
 {
     Q_OBJECT
     Q_INTERFACES(PluginInterface)
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginPdf" FILE "pluginPdf.json")
+    using Base = PluginBase<PluginPdf, MainWindow>;
 public:
-    explicit PluginPdf(QObject *parent = nullptr);
-    ~PluginPdf();
-    // 插件 API 版本（B1）：与主程序 plugininterface.h 的 PLUGIN_API_VERSION 一致
-    int apiVersion() const override { return PLUGIN_API_VERSION; }
-    void sendFileData(char *szFileData, qint64 nFileLen);
-    QWidget* getPluginWidget();
-    PluginInterface* createInstance();
+    using Base::Base;
+
+    // 大文件（>= 阈值）由主程序抽到临时文件后走这里，QPdfDocument 直接按路径打开
     bool prefersFileByPath() const override;
     bool sendFileByPath(const QString &path, const QString &displayName) override;
 
-private:
-    MainWindow*         m_wMainWindow;
+protected:
+    bool showFile(const PluginFile &file) override;
 };
 
 #endif // PLUGINPDF_H

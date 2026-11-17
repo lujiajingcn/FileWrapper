@@ -2,24 +2,23 @@
 #define PLUGINMEDIA_H
 
 #include "mainwindow.h"
+#include "pluginbase.h"
 
-#include "plugininterface.h"
-
-class PluginMedia : public QObject,public PluginInterface
+// 代理层样板见 Plugins/common/pluginbase.h；本类额外实现：
+//   * 后台播放相关（stopPlayback / hasBackgroundPlayback）
+//   * 大文件走路径（prefersFileByPath / sendFileByPath）
+//   * showVideo 信号（解码在窗口侧完成，构造时连接）
+class PluginMedia : public PluginBase<PluginMedia, MainWindow>
 {
     Q_OBJECT
     Q_INTERFACES(PluginInterface)
     Q_PLUGIN_METADATA(IID "fileWrapper.pluginMedia" FILE "pluginMedia.json")
+    using Base = PluginBase<PluginMedia, MainWindow>;
 public:
     explicit PluginMedia(QObject *parent = nullptr);
-    ~PluginMedia();
-    // 插件 API 版本（B1）：与主程序 plugininterface.h 的 PLUGIN_API_VERSION 一致
-    int apiVersion() const override { return PLUGIN_API_VERSION; }
-    void sendFileData(char *szFileData, qint64 nFileLen);
-    QWidget* getPluginWidget();
-    void stopPlayback();
-    bool hasBackgroundPlayback() const;
-    PluginInterface* createInstance();
+
+    void stopPlayback() override;
+    bool hasBackgroundPlayback() const override;
 
     // 大文件走文件路径通道，FFmpeg 直接流式读取，避免整块载入内存（P1-2）
     bool prefersFileByPath() const override;
@@ -27,8 +26,9 @@ public:
 
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
-private:
-    MainWindow*         m_wMainWindow;
+
+protected:
+    bool showFile(const PluginFile &file) override;
 };
 
 #endif // PLUGINMEDIA_H

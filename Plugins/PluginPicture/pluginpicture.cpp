@@ -1,36 +1,19 @@
 #include "pluginpicture.h"
-#include <QDebug>
 
-PluginPicture::PluginPicture(QObject *parent) : QObject(parent)
+bool PluginPicture::showFile(const PluginFile &file)
 {
-    m_wMainWindow = new MainWindow;
-}
-
-PluginPicture::~PluginPicture()
-{
-    delete m_wMainWindow;
-    m_wMainWindow = nullptr;
-}
-
-void PluginPicture::sendFileData(char *szFileData, qint64 nFileLen)
-{
-    if (szFileData == nullptr || nFileLen <= 0)
+    if (file.isPath())
     {
-        // 主程序在读文件失败 / 0 字节时也会送 (nullptr, 0)：必须清掉内容区，
-        // 否则界面仍停留在上一个文件。
-        if (m_wMainWindow) m_wMainWindow->clearContent();
-        return;
+        const QByteArray data = file.readAll();
+        if (data.isEmpty())
+            return false;
+        m_wMainWindow->showPicture(const_cast<char *>(data.constData()), data.size());
+        return true;
     }
-    m_wMainWindow->showPicture(szFileData, nFileLen);
-}
 
-QWidget* PluginPicture::getPluginWidget()
-{
-    return m_wMainWindow;
-}
-
-PluginInterface* PluginPicture::createInstance()
-{
-    // 为新标签页创建一个独立实例（含独立的内部窗口），使同类型多标签页各自独立、互不干扰
-    return new PluginPicture;
+    const QByteArray &data = file.memory();
+    if (data.isEmpty())
+        return false;
+    m_wMainWindow->showPicture(const_cast<char *>(data.constData()), data.size());
+    return true;
 }

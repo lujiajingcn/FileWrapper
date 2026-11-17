@@ -1,33 +1,35 @@
 #include "pluginmedia.h"
+
 #include <QFileInfo>
 
-PluginMedia::PluginMedia(QObject *parent) : QObject(parent)
+PluginMedia::PluginMedia(QObject *parent) : Base(parent)
 {
-    m_wMainWindow = new MainWindow;
+    // 内存数据交给窗口侧解码（与原有做法一致：经由信号转到 MainWindow::showVideo）
     connect(this, &PluginMedia::showVideo, m_wMainWindow, &MainWindow::showVideo);
 }
 
-PluginMedia::~PluginMedia()
+bool PluginMedia::showFile(const PluginFile &file)
 {
-    delete m_wMainWindow;
-    m_wMainWindow = nullptr;
-}
+    QByteArray owned;
+    const char *pData = nullptr;
+    qint64 nLen = 0;
 
-void PluginMedia::sendFileData(char *szFileData, qint64 nFileLen)
-{
-    if (szFileData == nullptr || nFileLen <= 0)
+    if (file.isPath())
     {
-        // 主程序在读文件失败 / 0 字节时也会送 (nullptr, 0)：必须停掉旧播放并清画面，
-        // 否则上一个文件会在后台继续解码/发声。
-        if (m_wMainWindow) m_wMainWindow->clearContent();
-        return;
+        owned = file.readAll();
+        pData = owned.constData();
+        nLen  = owned.size();
     }
-    emit showVideo(szFileData, nFileLen);
-}
+    else
+    {
+        pData = file.memory().constData();
+        nLen  = file.memory().size();
+    }
+    if (pData == nullptr || nLen <= 0)
+        return false;
 
-QWidget* PluginMedia::getPluginWidget()
-{
-    return m_wMainWindow;
+    emit showVideo(const_cast<char *>(pData), nLen);
+    return true;
 }
 
 void PluginMedia::stopPlayback()
@@ -41,12 +43,6 @@ bool PluginMedia::hasBackgroundPlayback() const
     // 音视频插件存在后台解码线程与音频输出：被主程序 stopPlayback() 停止后，
     // 其所在标签页再次激活时需要重新渲染（重新打开文件），故返回 true。
     return true;
-}
-
-PluginInterface* PluginMedia::createInstance()
-{
-    // 为新标签页创建一个独立实例（含独立的内部窗口），使同类型多标签页各自独立、互不干扰
-    return new PluginMedia;
 }
 
 bool PluginMedia::prefersFileByPath() const

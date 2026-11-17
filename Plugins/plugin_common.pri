@@ -26,6 +26,25 @@
 # ---- 插件接口头：include/ 是插件与主程序的唯一契约，插件不再依赖主程序源码树 ----
 INCLUDEPATH += $$PWD/../include
 
+# ---- 共享头/源码目录（Plugins/common/）----
+# 所有插件都能 include 到 common/pluginbase.h（代理层基类）；
+# 需要额外共享源码时，在插件 .pro 里写
+#     PLUGIN_SHARED_SOURCES = zipreader
+# 会把这些 common/<name>.cpp/.h 编进**本插件自己**的 DLL。
+#
+# 为什么是"源码共享"而不是静态库/动态库：
+#   * 插件要能独立编译、独立部署、独立禁用（C5），不引入跨插件运行时依赖；
+#   * 共享的只有极少数无状态工具（pluginbase.h / ZipReader），每个 DLL 多编一份
+#     的代价可以忽略，换来构建简单、无库顺序/配置矩阵问题。
+# 注意：改 common/ 下的文件会影响所有引用它的插件，验证要覆盖每一种格式。
+INCLUDEPATH += $$PWD/common
+!isEmpty(PLUGIN_SHARED_SOURCES) {
+    for(shared_src, PLUGIN_SHARED_SOURCES) {
+        SOURCES += $$PWD/common/$${shared_src}.cpp
+        HEADERS += $$PWD/common/$${shared_src}.h
+    }
+}
+
 # ---- 输出目录：主程序 exe 同级 plugins/（自动适配 debug/release 与构建根目录）----
 CONFIG(debug, debug|release): PLUGIN_OUT_DIR = $$OUT_PWD/../../FileWrapper/debug/plugins
 else:                        PLUGIN_OUT_DIR = $$OUT_PWD/../../FileWrapper/release/plugins

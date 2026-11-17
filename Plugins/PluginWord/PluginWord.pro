@@ -2,7 +2,7 @@
 # PluginWord - Word 文档预览插件（OOXML：.docx/.docm/.dotx/.dotm）
 #
 # 只用 Qt 自带模块 + zlib，无第三方库：
-#   * zipreader.cpp  自包含 ZIP 读取器（链接 MinGW 自带静态 libz.a）
+#   * Plugins/common/zipreader.*  自包含 ZIP 读取器（与 PluginBook 共享源码）
 #   * worddocument.cpp  OOXML -> HTML（QDomDocument，需要 Qt6Xml.dll）
 #-------------------------------------------------
 
@@ -20,20 +20,20 @@ CONFIG += c++17
 SOURCES += \
         mainwindow.cpp \
         pluginword.cpp \
-        worddocument.cpp \
-        zipreader.cpp
+        worddocument.cpp
 
 HEADERS += \
         mainwindow.h \
         pluginword.h \
-        worddocument.h \
-        zipreader.h
+        worddocument.h
 
 FORMS += \
         mainwindow.ui
 
-# 自包含的 ZIP 读取器（zipreader.cpp）用 zlib 解压 deflate 条目。
+# 自包含的 ZIP 读取器来自 Plugins/common/（与 PluginBook 共享同一份源码，
+# 由 plugin_common.pri 编进本插件的 DLL）。它用 zlib 解压 deflate 条目，
 # 链接 MinGW 自带的静态 libz.a（无需额外部署 zlib1.dll）。
+PLUGIN_SHARED_SOURCES = zipreader
 LIBS += -lz
 
 # 插件始终输出到主程序 exe 同级的 plugins/ 目录（自动适配 debug/release 与构建根目录）
