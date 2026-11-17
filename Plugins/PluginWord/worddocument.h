@@ -48,6 +48,27 @@ public:
         bool truncated = false;          // 是否因过大被截断
     };
 
+    // ODT 的字符/段落属性（与 docx 的 RunProps/ParProps 不复用：命名与语义都不同）
+    enum class HAlign { Inherit, Left, Center, Right, Justify };
+    struct OdtRun {
+        bool    b       = false;
+        bool    i       = false;
+        bool    u       = false;
+        double  sizePt  = 0.0;
+        QString color;
+        QString fill;
+        QString family;
+    };
+    struct OdtPar {
+        HAlign  align    = HAlign::Inherit;
+        double  leftPt   = 0.0;
+        double  rightPt  = 0.0;
+        double  indentPt = 0.0;
+        double  beforePt = 0.0;
+        double  afterPt  = 0.0;
+        QString fill;
+    };
+
     WordDocument();
 
     // 解析一个 docx/docm/dotx/dotm 容器的字节内容。失败时 error 填入中文原因。
@@ -83,8 +104,6 @@ private:
         QString family;            // 字体名
         void mergeRPr(const QDomElement &rPr);
     };
-
-    enum class HAlign { Inherit, Left, Center, Right, Justify };
 
     struct ParProps {
         HAlign  align        = HAlign::Inherit;
@@ -143,6 +162,34 @@ private:
     void emitAlternateContent(const QDomElement &ac, QStringList &out, const RunProps &base,
                               double scale, const QString &linkTarget);
     QString imageTag(const QDomElement &container, double scale);
+
+    // ---- ODT（OpenDocument Text）：与 docx 共用 ZipReader 与图片资源机制 ----
+    // ODT 与 docx 都是 ZIP+XML，但元素/属性命名完全不同（text:p / style:text-properties…
+    // / fo:font-size），这里用独立的轻量 emitter 映射到同一套 HTML 子集：
+    // 段落/标题/字符格式/列表/表格/内嵌图片/超链接。缩放仍走 render(fontScale)。
+    bool loadOdt(const QByteArray &data, QString *error);
+    void emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int depth);
+    void emitOdtParagraph(const QDomElement &e, QStringList &out, double scale,
+                          bool heading, int headingLevel, int listDepth,
+                          const QString &bulletPrefix);
+    void emitOdtInline(const QDomElement &parent, QStringList &out, const OdtRun &base,
+                       double scale, const QString &link);
+    void emitOdtList(const QDomElement &list, QStringList &out, double scale, int depth);
+    void emitOdtTable(const QDomElement &table, QStringList &out, double scale, int depth);
+    QString odtImageTag(const QDomElement &frame, double scale);
+    OdtRun  odtRunProps(const QString &styleName) const;
+    OdtPar  odtParProps(const QString &styleName) const;
+    QString odtWrapRun(const OdtRun &r, double scale, const QString &html) const;
+    static OdtRun odtMergeRun(const OdtRun &base, const OdtRun &over);
+    static double odtLenToPt(const QString &value);
+
+    bool         m_isOdt = false;
+    QDomDocument m_odtContent;                  // content.xml
+    QDomElement  m_odtText;                     // office:text
+    QDomDocument m_odtStyleDoc;                 // styles.xml（可选）
+    QMap<QString, QDomElement> m_odtStyles;     // style:name -> style:style
+    QMap<QString, QString>     m_odtFontFaces;  // style:font-name -> 字体族
+    QMap<QString, bool>        m_odtListOrdered; // 列表样式名 -> 是否有序
 
     QString m_error;
 

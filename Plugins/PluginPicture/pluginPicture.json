@@ -5,7 +5,8 @@
     "Date":"2023-07-09",
     "apiVersion":3,
     "extensions":[
-        "jpg", "jpeg", "png", "bmp", "gif", "xbm", "xpm", "pbm", "pgm", "ppm"
+        "jpg", "jpeg", "png", "bmp", "gif", "xbm", "xpm", "pbm", "pgm", "ppm",
+        "webp", "svg", "ico", "tiff", "tga", "icns", "wbmp"
     ],
     "Description":"图片查看插件：支持缩放与实际大小。extensions 取代了原先写死在主程序 choosePlugin() 里的后缀表。"
 }

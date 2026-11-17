@@ -21,11 +21,17 @@ public:
     // 打开失败 / 0 字节时清空内容区，避免界面残留上一个文件
     void clearContent();
 
+    // 主程序在送数据前告知文件名：.html/.htm 用富文本渲染，其它仍按纯文本显示
+    void setSourceName(const QString &name) { m_sourceName = name; }
+
 private:
     // 按编码（BOM -> UTF-8 -> 系统本地编码 GBK）解码文本，避免 .sql 等文件乱码
     static QString decodeText(const QByteArray &data);
+    // 文件名未知时，用内容嗅探判断是不是 HTML
+    static bool looksLikeHtml(const QString &text);
 
     Ui::MainWindow *ui;
+    QString m_sourceName;
 };
 
 #endif // MAINWINDOW_H

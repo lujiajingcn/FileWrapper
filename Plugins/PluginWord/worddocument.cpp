@@ -575,6 +575,10 @@ bool WordDocument::open(const QByteArray &data, QString *error)
             "可能原因：文件已损坏、下载不完整，或其实是别的格式（如 .doc / .rtf）。"));
     }
 
+    // ODT（OpenDocument Text）同样是 ZIP 容器：用 mimetype 条目区分（OOXML 没有这个条目）。
+    if (m_zip.entry(QStringLiteral("mimetype")).contains("opendocument.text"))
+        return loadOdt(data, error);
+
     // ---- 1) 通过 _rels/.rels 找到主文档部件 ----
     QString mainPart;
     QDomDocument rootRels;
@@ -948,7 +952,10 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     m_blockBudget = 0;
 
     QStringList out;
-    emitBlocks(m_body, out, fontScale, 0);
+    if (m_isOdt)
+        emitOdtBody(m_odtText, out, fontScale, 0);
+    else
+        emitBlocks(m_body, out, fontScale, 0);
 
     if (m_truncated)
         out << QStringLiteral("<p><i>（文档过大，仅显示前一部分内容）</i></p>");
@@ -1417,4 +1424,582 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
         out << QStringLiteral("</tr>");
     }
     out << QStringLiteral("</table>");
+}
+
+// ============================================================================
+// ODT（OpenDocument Text）支持
+// ----------------------------------------------------------------------------
+// 与 docx 共用：ZipReader（容器）、m_urlPrefix / m_imageCache（图片资源）、
+// m_blockBudget / m_truncated（体量限制）、render(fontScale)（缩放）。
+// 差异只在 XML 形状：元素是 text:p / text:h / text:span / text:list / table:table /
+// draw:frame，格式写在 style:*-properties 里、样式名经 style:name 索引，
+// 样式可沿 style:parent-style-name 继承。
+// ============================================================================
+
+// "12pt" / "0.5cm" / "1.27cm" / "0.75in" / "12px" -> pt（无法识别返回 0）
+double WordDocument::odtLenToPt(const QString &value)
+{
+    static const QRegularExpression re(
+        QStringLiteral("^\\s*(-?[0-9]*\\.?[0-9]+)\\s*(pt|px|cm|mm|in|pc|em)?\\s*$"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch m = re.match(value);
+    if (!m.hasMatch()) return 0.0;
+
+    const double n = m.captured(1).toDouble();
+    const QString unit = m.captured(2).toLower();
+    if (unit.isEmpty() || unit == QLatin1String("pt")) return n;
+    if (unit == QLatin1String("px")) return n * 72.0 / 96.0;
+    if (unit == QLatin1String("cm")) return n * 72.0 / 2.54;
+    if (unit == QLatin1String("mm")) return n * 72.0 / 25.4;
+    if (unit == QLatin1String("in")) return n * 72.0;
+    if (unit == QLatin1String("pc")) return n * 12.0;
+    if (unit == QLatin1String("em")) return n * 10.5;   // 近似：按默认字号
+    return 0.0;
+}
+
+WordDocument::OdtRun WordDocument::odtMergeRun(const OdtRun &base, const OdtRun &over)
+{
+    OdtRun r = base;
+    if (over.b) r.b = true;
+    if (over.i) r.i = true;
+    if (over.u) r.u = true;
+    if (over.sizePt > 0.0)     r.sizePt = over.sizePt;
+    if (!over.color.isEmpty()) r.color = over.color;
+    if (!over.fill.isEmpty())  r.fill = over.fill;
+    if (!over.family.isEmpty()) r.family = over.family;
+    return r;
+}
+
+WordDocument::OdtRun WordDocument::odtRunProps(const QString &styleName) const
+{
+    OdtRun r;
+    QString cur = styleName;
+    QSet<QString> seen;
+    while (!cur.isEmpty() && !seen.contains(cur))
+    {
+        seen.insert(cur);
+        const QDomElement st = m_odtStyles.value(cur);
+        if (st.isNull()) break;
+
+        const QDomElement tp = st.firstChildElement(QStringLiteral("style:text-properties"));
+        if (!tp.isNull())
+        {
+            const QString fw = tp.attribute(QStringLiteral("fo:font-weight"));
+            if (!fw.isEmpty())
+                r.b = (fw.compare(QLatin1String("bold"), Qt::CaseInsensitive) == 0
+                       || fw.toInt() >= 600);
+
+            const QString fs = tp.attribute(QStringLiteral("fo:font-style"));
+            if (!fs.isEmpty())
+                r.i = (fs == QLatin1String("italic") || fs == QLatin1String("oblique"));
+
+            const QString ul = tp.attribute(QStringLiteral("style:text-underline-style"));
+            if (!ul.isEmpty()) r.u = (ul != QLatin1String("none"));
+
+            const QString sz = tp.attribute(QStringLiteral("fo:font-size"));
+            if (!sz.isEmpty())
+            {
+                const double pt = odtLenToPt(sz);
+                if (pt > 0.0) r.sizePt = pt;
+            }
+
+            const QString col = tp.attribute(QStringLiteral("fo:color"));
+            if (!col.isEmpty() && col != QLatin1String("transparent")) r.color = col;
+
+            const QString bg = tp.attribute(QStringLiteral("fo:background-color"));
+            if (!bg.isEmpty() && bg != QLatin1String("transparent")) r.fill = bg;
+
+            const QString fn = tp.attribute(QStringLiteral("style:font-name"));
+            if (!fn.isEmpty() && m_odtFontFaces.contains(fn))
+                r.family = m_odtFontFaces.value(fn);
+        }
+        cur = st.attribute(QStringLiteral("style:parent-style-name"));
+    }
+    return r;
+}
+
+WordDocument::OdtPar WordDocument::odtParProps(const QString &styleName) const
+{
+    OdtPar p;
+    QString cur = styleName;
+    QSet<QString> seen;
+    while (!cur.isEmpty() && !seen.contains(cur))
+    {
+        seen.insert(cur);
+        const QDomElement st = m_odtStyles.value(cur);
+        if (st.isNull()) break;
+
+        const QDomElement pp = st.firstChildElement(QStringLiteral("style:paragraph-properties"));
+        if (!pp.isNull())
+        {
+            const QString al = pp.attribute(QStringLiteral("fo:text-align")).toLower();
+            if (al == QLatin1String("center"))      p.align = HAlign::Center;
+            else if (al == QLatin1String("end")
+                     || al == QLatin1String("right")) p.align = HAlign::Right;
+            else if (al == QLatin1String("justify")) p.align = HAlign::Justify;
+            else if (al == QLatin1String("start")
+                     || al == QLatin1String("left"))  p.align = HAlign::Left;
+
+            auto takeLen = [&pp](const char *attr, double *dst) {
+                const QString v = pp.attribute(QString::fromLatin1(attr));
+                if (v.isEmpty()) return;
+                *dst = odtLenToPt(v);
+            };
+            takeLen("fo:margin-left",  &p.leftPt);
+            takeLen("fo:margin-right", &p.rightPt);
+            takeLen("fo:text-indent",  &p.indentPt);
+            takeLen("fo:margin-top",   &p.beforePt);
+            takeLen("fo:margin-bottom", &p.afterPt);
+
+            const QString bg = pp.attribute(QStringLiteral("fo:background-color"));
+            if (!bg.isEmpty() && bg != QLatin1String("transparent")) p.fill = bg;
+        }
+        cur = st.attribute(QStringLiteral("style:parent-style-name"));
+    }
+    return p;
+}
+
+QString WordDocument::odtWrapRun(const OdtRun &r, double scale, const QString &html) const
+{
+    if (html.isEmpty()) return QString();
+
+    QString s = html;
+    if (r.u) s = QStringLiteral("<u>") + s + QStringLiteral("</u>");
+    if (r.i) s = QStringLiteral("<i>") + s + QStringLiteral("</i>");
+    if (r.b) s = QStringLiteral("<b>") + s + QStringLiteral("</b>");
+
+    QStringList css;
+    const double sz = (r.sizePt > 0.0 ? r.sizePt : m_defaultSizePt) * scale;
+    css << QStringLiteral("font-size:%1pt").arg(fmtNum(sz));
+    if (!r.color.isEmpty())  css << QStringLiteral("color:") + r.color;
+    if (!r.fill.isEmpty())   css << QStringLiteral("background-color:") + r.fill;
+    if (!r.family.isEmpty()) css << QStringLiteral("font-family:") + r.family;
+
+    return QStringLiteral("<span style=\"") + css.join(QLatin1Char(';'))
+           + QStringLiteral("\">") + s + QStringLiteral("</span>");
+}
+
+bool WordDocument::loadOdt(const QByteArray &data, QString *error)
+{
+    auto fail = [&](const QString &msg) {
+        m_error = msg;
+        if (error) *error = msg;
+        return false;
+    };
+
+    if (!m_zip.open(data))
+        return fail(QStringLiteral("无法解析该 ODT 文件：ZIP 容器读取失败（文件可能已损坏）。"));
+
+    if (!loadXmlPart(QStringLiteral("content.xml"), &m_odtContent))
+        return fail(QStringLiteral("无法解析该 ODT 文件：缺少 content.xml。"));
+
+    // styles.xml 是可选的（只有自动样式的文档也能显示）
+    if (!loadXmlPart(QStringLiteral("styles.xml"), &m_odtStyleDoc))
+        m_odtStyleDoc = QDomDocument();
+
+    const QDomElement root = m_odtContent.documentElement();
+    m_odtText = findDescendant(root, QStringLiteral("office:text"));
+    if (m_odtText.isNull())
+        return fail(QStringLiteral("无法解析该 ODT 文件：找不到正文（office:text）。"));
+
+    auto collectFonts = [this](const QDomElement &r) {
+        const QDomElement decls = findDescendant(r, QStringLiteral("office:font-face-decls"));
+        if (decls.isNull()) return;
+        for (QDomElement ff = decls.firstChildElement(QStringLiteral("style:font-face"));
+             !ff.isNull(); ff = ff.nextSiblingElement(QStringLiteral("style:font-face")))
+        {
+            const QString name = ff.attribute(QStringLiteral("style:name"));
+            QString family = ff.attribute(QStringLiteral("svg:font-family")).trimmed();
+            family.remove(QLatin1Char('\''));
+            family.remove(QLatin1Char('"'));
+            family = family.simplified();
+            if (!name.isEmpty() && !family.isEmpty() && !m_odtFontFaces.contains(name))
+                m_odtFontFaces.insert(name, family);
+        }
+    };
+    collectFonts(root);
+
+    // content.xml 里的自动样式（P1/T1…，正文直接引用它们）
+    const QDomElement autoStyles = findDescendant(root, QStringLiteral("office:automatic-styles"));
+    for (QDomElement st = autoStyles.firstChildElement(QStringLiteral("style:style")); !st.isNull();
+         st = st.nextSiblingElement(QStringLiteral("style:style")))
+    {
+        const QString name = st.attribute(QStringLiteral("style:name"));
+        if (!name.isEmpty()) m_odtStyles.insert(name, st);
+    }
+
+    // styles.xml 里的命名样式与列表样式
+    if (!m_odtStyleDoc.isNull())
+    {
+        const QDomElement sroot = m_odtStyleDoc.documentElement();
+        collectFonts(sroot);
+
+        const QDomElement styles = findDescendant(sroot, QStringLiteral("office:styles"));
+        if (!styles.isNull())
+        {
+            for (QDomElement st = styles.firstChildElement(QStringLiteral("style:style")); !st.isNull();
+                 st = st.nextSiblingElement(QStringLiteral("style:style")))
+            {
+                const QString name = st.attribute(QStringLiteral("style:name"));
+                if (!name.isEmpty() && !m_odtStyles.contains(name))
+                    m_odtStyles.insert(name, st);
+            }
+
+            for (QDomElement ls = styles.firstChildElement(QStringLiteral("text:list-style")); !ls.isNull();
+                 ls = ls.nextSiblingElement(QStringLiteral("text:list-style")))
+            {
+                const QString name = ls.attribute(QStringLiteral("style:name"));
+                if (name.isEmpty()) continue;
+                const bool ordered =
+                    !ls.firstChildElement(QStringLiteral("text:list-level-style-number")).isNull();
+                m_odtListOrdered.insert(name, ordered);
+            }
+        }
+    }
+
+    // 文档标题（meta.xml，可选）
+    QDomDocument meta;
+    if (loadXmlPart(QStringLiteral("meta.xml"), &meta))
+    {
+        const QDomElement t = findDescendant(meta.documentElement(), QStringLiteral("dc:title"));
+        if (!t.isNull()) m_title = t.text().trimmed();
+    }
+    if (m_title.isEmpty()) m_title = QStringLiteral("未命名文档");
+
+    m_isOdt = true;
+    m_ok = true;
+    return true;
+}
+
+void WordDocument::emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int depth)
+{
+    if (parent.isNull() || depth > kMaxDepth) return;
+
+    for (QDomElement e = parent.firstChildElement(); !e.isNull(); e = e.nextSiblingElement())
+    {
+        if (m_truncated) return;
+        const QString tag = e.tagName();
+
+        if (tag == QLatin1String("text:p") || tag == QLatin1String("text:h"))
+        {
+            const bool heading = (tag == QLatin1String("text:h"));
+            const int lvl = e.attribute(QStringLiteral("text:outline-level")).toInt();
+            emitOdtParagraph(e, out, scale, heading, lvl > 0 ? lvl : 1, 0, QString());
+        }
+        else if (tag == QLatin1String("text:list"))
+        {
+            emitOdtList(e, out, scale, 0);
+        }
+        else if (tag == QLatin1String("table:table"))
+        {
+            emitOdtTable(e, out, scale, depth);
+        }
+        else if (tag == QLatin1String("text:section")
+                 || tag == QLatin1String("text:index-body"))
+        {
+            emitOdtBody(e, out, scale, depth + 1);
+        }
+        // 其它（目录、脚注/尾注集合、文本框、表单）忽略
+    }
+}
+
+void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, double scale,
+                                    bool heading, int headingLevel, int listDepth,
+                                    const QString &bulletPrefix)
+{
+    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+
+    const QString styleName = e.attribute(QStringLiteral("text:style-name"));
+    OdtRun base = odtRunProps(styleName);
+    OdtPar pp   = odtParProps(styleName);
+
+    if (heading && base.sizePt <= 0.0)
+    {
+        static const double kHeadSize[6] = {20.0, 16.0, 14.0, 12.0, 11.0, 10.5};
+        base.sizePt = kHeadSize[qBound(1, headingLevel, 6) - 1];
+        base.b = true;
+    }
+
+    QStringList runs;
+    emitOdtInline(e, runs, base, scale, QString());
+
+    ++m_stats.paragraphs;
+    if (heading) ++m_stats.headings;
+
+    QStringList css;
+    switch (pp.align)
+    {
+    case HAlign::Left:    css << QStringLiteral("text-align:left");    break;
+    case HAlign::Center:  css << QStringLiteral("text-align:center");  break;
+    case HAlign::Right:   css << QStringLiteral("text-align:right");   break;
+    case HAlign::Justify: css << QStringLiteral("text-align:justify"); break;
+    case HAlign::Inherit: break;
+    }
+
+    double left = pp.leftPt + listDepth * kListIndentPt;
+    if (!bulletPrefix.isEmpty() && pp.indentPt == 0.0) left += kListIndentPt;
+    if (left > 0.0)
+        css << QStringLiteral("margin-left:%1px").arg(fmtNum(left * kPtToPx));
+    if (pp.rightPt > 0.0)
+        css << QStringLiteral("margin-right:%1px").arg(fmtNum(pp.rightPt * kPtToPx));
+
+    double indent = pp.indentPt;
+    if (!bulletPrefix.isEmpty() && indent == 0.0) indent = -kListIndentPt;
+    if (indent != 0.0)
+        css << QStringLiteral("text-indent:%1px").arg(fmtNum(indent * kPtToPx));
+
+    if (pp.beforePt > 0.0)
+        css << QStringLiteral("margin-top:%1px").arg(fmtNum(pp.beforePt * kPtToPx));
+    if (pp.afterPt > 0.0)
+        css << QStringLiteral("margin-bottom:%1px").arg(fmtNum(pp.afterPt * kPtToPx));
+    if (!pp.fill.isEmpty()) css << QStringLiteral("background-color:") + pp.fill;
+
+    const double baseSize = (base.sizePt > 0.0 ? base.sizePt : m_defaultSizePt) * scale;
+    css << QStringLiteral("font-size:%1pt").arg(fmtNum(baseSize));
+    if (heading) css << QStringLiteral("font-weight:bold");
+
+    out << QStringLiteral("<p style=\"") + css.join(QLatin1Char(';')) + QStringLiteral("\">");
+    if (!bulletPrefix.isEmpty())
+        out << QStringLiteral("<span>") + esc(bulletPrefix) + QStringLiteral("</span>");
+    out << runs.join(QString());
+    out << QStringLiteral("</p>");
+}
+
+void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
+                                 const OdtRun &base, double scale, const QString &link)
+{
+    for (QDomNode n = parent.firstChild(); !n.isNull(); n = n.nextSibling())
+    {
+        if (n.isText())
+        {
+            const QString text = n.toText().data();
+            if (!text.isEmpty())
+            {
+                m_stats.chars += int(text.size());
+                out << esc(preserveSpaces(text));
+            }
+            continue;
+        }
+        if (!n.isElement()) continue;
+
+        const QDomElement e = n.toElement();
+        const QString tag = e.tagName();
+
+        if (tag == QLatin1String("text:s"))
+        {
+            int count = e.attribute(QStringLiteral("text:c")).toInt();
+            if (count <= 0) count = 1;
+            if (count > 200) count = 200;
+            for (int i = 0; i < count; ++i) out << QStringLiteral("&#160;");
+        }
+        else if (tag == QLatin1String("text:tab"))
+        {
+            out << QStringLiteral("&#160;&#160;&#160;&#160;");
+        }
+        else if (tag == QLatin1String("text:line-break"))
+        {
+            out << QStringLiteral("<br/>");
+        }
+        else if (tag == QLatin1String("draw:frame") || tag == QLatin1String("draw:custom-shape"))
+        {
+            const QString img = odtImageTag(e, scale);
+            if (!img.isEmpty()) out << img;
+        }
+        else if (tag == QLatin1String("text:span"))
+        {
+            const OdtRun own = odtRunProps(e.attribute(QStringLiteral("text:style-name")));
+            const OdtRun merged = odtMergeRun(base, own);
+
+            QStringList inner;
+            emitOdtInline(e, inner, merged, scale, link);
+            const QString html = inner.join(QString());
+
+            const bool hasFormat = own.b || own.i || own.u || own.sizePt > 0.0
+                                   || !own.color.isEmpty() || !own.fill.isEmpty()
+                                   || !own.family.isEmpty();
+            out << (hasFormat ? odtWrapRun(merged, scale, html) : html);
+        }
+        else if (tag == QLatin1String("text:a"))
+        {
+            const QString href = e.attribute(QStringLiteral("xlink:href"));
+            QStringList inner;
+            emitOdtInline(e, inner, base, scale, href);
+            const QString html = inner.join(QString());
+            const QString low = href.toLower();
+            if (low.startsWith(QLatin1String("http")) || low.startsWith(QLatin1String("mailto"))
+                || low.startsWith(QLatin1String("ftp")))
+                out << QStringLiteral("<a href=\"") + escAttr(href) + QStringLiteral("\">")
+                    + html + QStringLiteral("</a>");
+            else
+                out << html;         // 文档内跳转/外链资源不处理
+        }
+        else if (tag == QLatin1String("text:note"))
+        {
+            // 脚注/尾注：只显示编号标记以外的正文不现实，直接跳过（与 docx 的取舍一致）
+        }
+        else if (tag == QLatin1String("text:bookmark")
+                 || tag == QLatin1String("text:bookmark-start")
+                 || tag == QLatin1String("text:bookmark-end")
+                 || tag == QLatin1String("text:soft-page-break"))
+        {
+            // 标记类元素：不产生内容
+        }
+        else
+        {
+            // text:ruby / text:ruby-base / text:meta 等：透传子节点
+            emitOdtInline(e, out, base, scale, link);
+        }
+    }
+}
+
+void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double scale, int depth)
+{
+    if (depth > kMaxDepth) return;
+
+    const QString styleName = list.attribute(QStringLiteral("text:style-name"));
+    const bool ordered = m_odtListOrdered.value(styleName, false);
+    int index = 0;
+
+    for (QDomElement item = list.firstChildElement(QStringLiteral("text:list-item"));
+         !item.isNull(); item = item.nextSiblingElement(QStringLiteral("text:list-item")))
+    {
+        if (m_truncated) return;
+        if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+
+        ++index;
+        const QString prefix = ordered ? QStringLiteral("%1. ").arg(index)
+                                       : QStringLiteral("• ");
+        bool emitted = false;
+
+        for (QDomElement child = item.firstChildElement(); !child.isNull();
+             child = child.nextSiblingElement())
+        {
+            const QString t = child.tagName();
+            if (t == QLatin1String("text:p") || t == QLatin1String("text:h"))
+            {
+                const bool heading = (t == QLatin1String("text:h"));
+                const int lvl = child.attribute(QStringLiteral("text:outline-level")).toInt();
+                emitOdtParagraph(child, out, scale, heading, lvl > 0 ? lvl : 1, depth + 1,
+                                 emitted ? QString() : prefix);
+                emitted = true;
+            }
+            else if (t == QLatin1String("text:list"))
+            {
+                emitOdtList(child, out, scale, depth + 1);
+            }
+        }
+
+        if (!emitted)
+        {
+            out << QStringLiteral("<p style=\"margin-left:%1px;text-indent:%2px\">")
+                       .arg(fmtNum((depth + 2) * kListIndentPt * kPtToPx))
+                       .arg(fmtNum(-kListIndentPt * kPtToPx))
+                << QStringLiteral("<span>") + esc(prefix) + QStringLiteral("</span>")
+                << QStringLiteral("</p>");
+        }
+    }
+}
+
+void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, double scale, int depth)
+{
+    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+    if (depth > kMaxDepth) return;
+
+    ++m_stats.tables;
+    out << QStringLiteral("<table border=\"1\" cellspacing=\"0\" cellpadding=\"4\" "
+                          "style=\"border-collapse:collapse;font-size:%1pt\">")
+               .arg(fmtNum(m_defaultSizePt * scale));
+
+    for (QDomElement row = table.firstChildElement(QStringLiteral("table:table-row"));
+         !row.isNull(); row = row.nextSiblingElement(QStringLiteral("table:table-row")))
+    {
+        if (m_truncated) break;
+        out << QStringLiteral("<tr>");
+
+        for (QDomElement cell = row.firstChildElement(QStringLiteral("table:table-cell"));
+             !cell.isNull(); cell = cell.nextSiblingElement(QStringLiteral("table:table-cell")))
+        {
+            // 被合并覆盖的空单元格不输出
+            if (cell.tagName() == QLatin1String("table:covered-table-cell")) continue;
+
+            const int span = qBound(1, cell.attribute(
+                QStringLiteral("table:number-columns-spanned")).toInt(), 50);
+
+            QStringList inner;
+            for (QDomElement child = cell.firstChildElement(); !child.isNull();
+                 child = child.nextSiblingElement())
+            {
+                const QString t = child.tagName();
+                if (t == QLatin1String("text:p") || t == QLatin1String("text:h"))
+                {
+                    const bool heading = (t == QLatin1String("text:h"));
+                    const int lvl = child.attribute(QStringLiteral("text:outline-level")).toInt();
+                    emitOdtParagraph(child, inner, scale, heading, lvl > 0 ? lvl : 1, 0, QString());
+                }
+                else if (t == QLatin1String("text:list"))
+                {
+                    emitOdtList(child, inner, scale, depth + 1);
+                }
+                else if (t == QLatin1String("table:table"))
+                {
+                    emitOdtTable(child, inner, scale, depth + 1);
+                }
+            }
+
+            out << QStringLiteral("<td");
+            if (span > 1) out << QStringLiteral(" colspan=\"%1\"").arg(span);
+            out << QStringLiteral(">");
+            if (inner.isEmpty()) out << QStringLiteral("&#160;");
+            else                 out << inner.join(QString());
+            out << QStringLiteral("</td>");
+        }
+        out << QStringLiteral("</tr>");
+    }
+    out << QStringLiteral("</table>");
+}
+
+QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
+{
+    Q_UNUSED(scale);
+
+    const QDomElement img = findDescendant(frame, QStringLiteral("draw:image"));
+    if (img.isNull()) return QString();
+
+    QString href = img.attribute(QStringLiteral("xlink:href")).trimmed();
+    if (href.isEmpty()) return QString();
+    while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
+    if (href.contains(QLatin1String("://"))) return QString();   // 外链图片不联网
+
+    QString key = href;
+    QByteArray bytes = m_zip.entry(href);
+    if (bytes.isEmpty())
+    {
+        key = QStringLiteral("Pictures/") + href;
+        bytes = m_zip.entry(key);
+    }
+    if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) return QString();
+
+    QString url = m_targetToUrl.value(key);
+    if (url.isEmpty())
+    {
+        const QImage im = QImage::fromData(bytes);
+        if (im.isNull()) return QString();      // SVG/WMF 等 Qt 不能直接解码的格式
+        url = m_urlPrefix + QString::number(++m_imageSeq);
+        m_targetToUrl.insert(key, url);
+        m_imageCache.insert(url, im);
+    }
+
+    double wpx = odtLenToPt(frame.attribute(QStringLiteral("svg:width"))) * kPtToPx;
+    double hpx = odtLenToPt(frame.attribute(QStringLiteral("svg:height"))) * kPtToPx;
+    if (wpx > kMaxImageDisplayW)
+    {
+        if (hpx > 0.0) hpx = hpx * kMaxImageDisplayW / wpx;
+        wpx = kMaxImageDisplayW;
+    }
+
+    QString tag = QStringLiteral("<img src=\"") + url + QLatin1Char('"');
+    if (wpx >= 1.0) tag += QStringLiteral(" width=\"%1\"").arg(int(wpx + 0.5));
+    if (hpx >= 1.0) tag += QStringLiteral(" height=\"%1\"").arg(int(hpx + 0.5));
+    tag += QLatin1Char('>');
+    return tag;
 }

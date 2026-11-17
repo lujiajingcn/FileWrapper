@@ -5,7 +5,7 @@
     "Date":"2026-11-17",
     "apiVersion":3,
     "extensions":[
-        "docx", "docm", "dotx", "dotm", "doc"
+        "docx", "docm", "dotx", "dotm", "odt", "ott", "doc"
     ],
     "Dependency":"Qt6Xml.dll（见 FileWrapper/deploy/plugin-deps.manifest）",
     "Description":"Word 文档预览插件：基于自包含最小 ZIP 读取器（zlib）+ QDomDocument 解析 OOXML，把 .docx/.docm/.dotx/.dotm 转成 HTML 用 QTextBrowser 显示（段落与标题样式、字体字号颜色、粗斜体下划删除线、上下标、编号与项目符号含中文数字、表格合并单元格与底纹、内嵌图片、超链接；支持缩放与 Ctrl+滚轮）。旧版 .doc（OLE2 二进制）与 .rtf 识别后给出另存为 .docx 的提示。"

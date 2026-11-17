@@ -1,5 +1,10 @@
 #include "plugintext.h"
 
+void PluginText::setSourceName(const QString &name)
+{
+    if (m_wMainWindow) m_wMainWindow->setSourceName(name);
+}
+
 bool PluginText::showFile(const PluginFile &file)
 {
     if (file.isPath())

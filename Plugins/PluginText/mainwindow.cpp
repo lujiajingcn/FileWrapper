@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 
 // Qt6 已移除 QTextCodec；本地编码回退改用 QString::fromLocal8Bit
+#include <QFileInfo>
 #include <cstring>
 #include <algorithm>
 #include <limits>
@@ -128,7 +129,27 @@ void MainWindow::showText(char *szBuf, qint64 nFileLen)
         return;
     }
     QByteArray array(szBuf, static_cast<qsizetype>(nFileLen));
-    // 必须用 setPlainText：setText 会把内容当富文本解析，打开 HTML/源码文件时
-    // 标签会被吞掉，显示成渲染后的网页（本机 Qt 6.8.3 实测确认）。
-    ui->textEdit->setPlainText(decodeText(array));
+    const QString text = decodeText(array);
+
+    // .html/.htm 交给 QTextEdit 的富文本渲染器（QTextBrowser 的子集）；
+    // 其它文本（源码/日志/JSON…）仍用 setPlainText —— setText 会把标签吃掉。
+    // 文件名未知（测试或外部直接送数据）时用内容嗅探兜底。
+    const QString sExt = QFileInfo(m_sourceName).suffix().toLower();
+    const bool bHtmlByExt = (sExt == QLatin1String("html") || sExt == QLatin1String("htm"));
+    const bool bHtml = bHtmlByExt || (m_sourceName.isEmpty() && looksLikeHtml(text));
+
+    if (bHtml)
+        ui->textEdit->setHtml(text);
+    else
+        ui->textEdit->setPlainText(text);
+}
+
+// 粗略嗅探：只在扩展名未知时使用，宁可漏判（按纯文本显示）也不误判源码文件
+bool MainWindow::looksLikeHtml(const QString &text)
+{
+    const QString head = text.left(2048).toLower();
+    if (!head.trimmed().startsWith(QLatin1Char('<'))) return false;
+    return head.contains(QStringLiteral("<!doctype html"))
+           || head.contains(QStringLiteral("<html"))
+           || (head.contains(QStringLiteral("<body")) && head.contains(QStringLiteral("</")));
 }

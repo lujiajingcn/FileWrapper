@@ -26,6 +26,7 @@ qt-bin|Qt6Xml.dll|Qt6Xml.dll|OOXML 解析：PluginWord（.docx）、PluginBook�
 qt-bin|Qt6Pdf.dll|Qt6Pdf.dll|PDF 渲染：PluginPdf（QPdfDocument）
 qt-bin|Qt6Network.dll|Qt6Network.dll|Qt6Pdf 的运行依赖（加载时自动链入）
 qt-bin|Qt6Multimedia.dll|Qt6Multimedia.dll|音频输出：PluginMedia（QAudioSink/QAudioOutput）
+qt-bin|Qt6Svg.dll|Qt6Svg.dll|SVG 图像解码的运行库：qsvg 插件依赖
 
 // ---- Qt 插件：程序/插件运行期按需加载 ----
 qt-plug|platforms/qwindows.dll|platforms/qwindows.dll|Qt 平台插件：程序启动必需
@@ -33,6 +34,12 @@ qt-plug|styles/qmodernwindowsstyle.dll|styles/qmodernwindowsstyle.dll|Windows 11
 qt-plug|imageformats/qjpeg.dll|imageformats/qjpeg.dll|JPEG 解码：图片插件 + docx/pptx 内嵌 jpg
 qt-plug|imageformats/qgif.dll|imageformats/qgif.dll|GIF 解码：图片插件 + 内嵌 gif
 qt-plug|imageformats/qwebp.dll|imageformats/qwebp.dll|WebP 解码：图片插件
+qt-plug|imageformats/qsvg.dll|imageformats/qsvg.dll|SVG 解码：图片插件（需要 Qt6Svg.dll）
+qt-plug|imageformats/qico.dll|imageformats/qico.dll|ICO 图标解码：图片插件
+qt-plug|imageformats/qtiff.dll|imageformats/qtiff.dll|TIFF 解码：图片插件
+qt-plug|imageformats/qtga.dll|imageformats/qtga.dll|TGA 解码：图片插件
+qt-plug|imageformats/qicns.dll|imageformats/qicns.dll|ICNS 图标解码：图片插件
+qt-plug|imageformats/qwbmp.dll|imageformats/qwbmp.dll|WBMP 解码：图片插件
 qt-plug|multimedia/windowsmediaplugin.dll|multimedia/windowsmediaplugin.dll|Windows 音频设备插件：PluginMedia 出声必需
 
 // ---- 第三方运行库：PluginMedia（FFmpeg 共享库）----

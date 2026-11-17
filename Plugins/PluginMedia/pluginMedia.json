@@ -8,7 +8,8 @@
         "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm",
         "mpg", "mpeg", "ts", "3gp", "3g2", "ogv", "vob", "asf", "rm", "rmvb",
         "mp3", "wav", "wma", "aac", "m4a", "flac", "ogg", "opus",
-        "amr", "aiff", "ape", "ac3"
+        "amr", "aiff", "ape", "ac3",
+        "m2ts", "mts", "mka", "f4v", "mp2"
     ],
     "Description":"基于 FFmpeg 的音视频播放插件（含独立解码线程与音频输出）。extensions 取代了原先写死在主程序 choosePlugin() 里的后缀表。"
 }

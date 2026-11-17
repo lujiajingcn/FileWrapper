@@ -15,6 +15,9 @@ class PluginText : public PluginBase<PluginText, MainWindow>
 public:
     using Base::Base;
 
+    // 主程序在送数据前告知文件名（.html/.htm 需要据此走富文本渲染）
+    void setSourceName(const QString &name) override;
+
 protected:
     bool showFile(const PluginFile &file) override;
 };
