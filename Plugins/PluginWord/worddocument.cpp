@@ -1921,7 +1921,11 @@ void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
             if (!text.isEmpty())
             {
                 m_stats.chars += int(text.size());
-                out << esc(preserveSpaces(text));
+                const QString html = esc(preserveSpaces(text));
+                const bool baseFmt = base.b || base.i || base.u || base.sizePt > 0.0
+                                     || !base.color.isEmpty() || !base.fill.isEmpty()
+                                     || !base.family.isEmpty();
+                out << (baseFmt ? odtWrapRun(base, scale, html) : html);
             }
             continue;
         }

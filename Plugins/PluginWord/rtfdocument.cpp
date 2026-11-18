@@ -115,6 +115,9 @@ void RtfDocument::reset()
     m_defaultSizePt = 10.5;
     m_ok = false;
     m_skipUnicodeFallback = false;
+    m_ucCount = 1;
+    m_fallbackRemaining = 0;
+    m_ucStack.clear();
     m_chars = 0;
 }
 
@@ -312,13 +315,14 @@ void RtfDocument::handleControlWord(const QString &word, bool hasParam, int para
         if (code < 0) code += 65536;
         if (code > 0 && code <= 0x10FFFF)
             m_textBuf += QString(QChar::fromUcs4(uint(code)));   // 代理对由 QString 处理
-        m_skipUnicodeFallback = true;
+        m_fallbackRemaining = m_ucCount;
+        m_skipUnicodeFallback = (m_fallbackRemaining > 0);
         return;
     }
     if (word == QLatin1String("uc") && hasParam)
     {
-        // \ucN：\uN 之后要跳过的回退字符数；这里只按 0/1 处理
-        m_skipUnicodeFallback = hasParam && param > 0;
+        // \ucN：\uN 之后要跳过的回退单元数（N=0/1/2...）
+        m_ucCount = qBound(0, param, 10);
         return;
     }
 
@@ -348,6 +352,7 @@ void RtfDocument::parse()
             }
             m_stateStack.append(m_state);
             m_skipStack.append(m_skipStack.last());
+            m_ucStack.append(m_ucCount);
             ++i;
             continue;
         }
@@ -357,6 +362,7 @@ void RtfDocument::parse()
             decodePendingBytes();
             if (m_stateStack.size() > 1) { m_stateStack.removeLast(); m_state = m_stateStack.last(); }
             if (m_skipStack.size() > 1)  m_skipStack.removeLast();
+            if (m_ucStack.size() > 1)    m_ucCount = m_ucStack.last(), m_ucStack.removeLast();
             ++i;
             continue;
         }
@@ -369,9 +375,9 @@ void RtfDocument::parse()
                 ++i;
                 continue;
             }
-            if (m_skipUnicodeFallback)
+            if (m_skipUnicodeFallback && m_fallbackRemaining > 0)
             {
-                m_skipUnicodeFallback = false;
+                if (--m_fallbackRemaining == 0) m_skipUnicodeFallback = false;
                 ++i;
                 continue;
             }
@@ -415,9 +421,9 @@ void RtfDocument::parse()
                 {
                     // \uN 后面紧跟的 \'hh 是 ANSI 回退，不属于正文：
                     // 命中标志时整组跳过（只清标志，不写回退字节）（P-07）
-                    if (m_skipUnicodeFallback)
+                    if (m_skipUnicodeFallback && m_fallbackRemaining > 0)
                     {
-                        m_skipUnicodeFallback = false;
+                        if (--m_fallbackRemaining == 0) m_skipUnicodeFallback = false;
                         i += 3;
                         continue;
                     }

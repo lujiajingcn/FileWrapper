@@ -76,6 +76,7 @@ private:
     QVector<State> m_stateStack;
     State          m_state;
     QVector<bool>  m_skipStack;
+    QVector<int>   m_ucStack;
     QVector<Para>  m_paras;
     Para           m_para;
     QVector<Run>   m_pendingRuns;   // 当前段已完成的 run
@@ -90,6 +91,8 @@ private:
     double         m_defaultSizePt = 10.5;
     bool           m_ok = false;
     bool           m_skipUnicodeFallback = false;
+    int            m_ucCount = 1;          // \ucN 的 N（默认为 1）
+    int            m_fallbackRemaining = 0;
     int            m_chars = 0;
 };
 
