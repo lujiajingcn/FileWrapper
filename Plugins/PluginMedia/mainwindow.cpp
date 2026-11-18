@@ -733,8 +733,15 @@ void MainWindow::onDecodingFinished(int genId)
             QMutexLocker locker(&m_audioMutex);
             if (!byteBuf.isEmpty())
             {
-                streamOut->write(byteBuf.constData(), byteBuf.size());
-                byteBuf.clear();
+                qint64 off = 0;
+                while (off < byteBuf.size())
+                {
+                    const qint64 n = streamOut->write(byteBuf.constData() + off, byteBuf.size() - off);
+                    if (n <= 0) break;
+                    off += n;
+                }
+                if (off > 0) byteBuf.remove(0, int(off));
+                if (off == 0) qWarning() << "[EOF] 尾部 PCM 未能写入音频设备";
             }
         }
 
@@ -1159,11 +1166,16 @@ void MainWindow::on_stopBtn_clicked(void)
 
     if (audioOutput) audioOutput->stop();
 
-    // 清除 stop 标志，允许后续恢复播放（doSeek / 重新 play）
-    if (m_videoWorker)
+    // 只有 worker 真正停下来了才清除 stop 标志；超时仍放行会让旧线程
+    // 在“已停止”的 UI 状态下继续解码，并与后续 seek/释放竞争。
+    if (m_videoWorker && workerStopped)
     {
         QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
         QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
+    }
+    else if (!workerStopped)
+    {
+        m_bCleanupPending = true;
     }
 
     qDebug() << "[Stop] Stopped";
@@ -1205,6 +1217,10 @@ void MainWindow::doSeek(qint64 ms)
     {
         qWarning() << "[Seek] 解码线程未在 2s 内退出，放弃本次跳转";
         m_bSeekPending = false;
+        m_nCurrentMs = previousMs;
+        m_bPlaying = wasPlaying;   // 恢复 seek 前的播放状态，UI 不留在“已暂停”
+        updatePlayPauseIcon();
+        if (wasPlaying && timer) timer->start(20);
         return;
     }
 

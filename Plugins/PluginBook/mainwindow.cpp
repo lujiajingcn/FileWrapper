@@ -11,6 +11,7 @@
 #include <QImage>
 #include <QImageReader>
 #include <QUrl>
+#include <QUuid>
 #include <QLabel>
 #include <QDebug>
 #include <QDir>
@@ -685,11 +686,13 @@ bool MainWindow::loadMobi(const QByteArray &data)
     if (data.isEmpty()) return false;
 
     // libmobi 没有「内存加载」接口，先把字节落一个临时文件再加载
-    QString tmpPath = QDir::temp().absoluteFilePath(
-        QString("fw_mobi_%1.mobi").arg(quintptr(this), 0, 16));
+    // 不可预测且独占创建：避免同名临时文件被预置/并发截断，崩溃残留也不会
+    // 被下一次加载复用。QUuid 只用于消歧，不承担安全随机性。
+    const QString tmpPath = QDir::temp().absoluteFilePath(
+        QStringLiteral("fw_mobi_%1.mobi").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
     {
         QFile tf(tmpPath);
-        if (!tf.open(QIODevice::WriteOnly) || tf.write(data) != data.size())
+        if (!tf.open(QIODevice::WriteOnly | QIODevice::NewOnly) || tf.write(data) != data.size())
         {
             tf.remove();
             return false;
