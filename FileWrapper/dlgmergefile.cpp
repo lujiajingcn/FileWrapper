@@ -264,37 +264,27 @@ void DlgMergeFile::on_btnOk_clicked()
         return;
     }
 
-    // P0-1：输出文件不能是任一输入文件（目录输入需展开后逐一比较）。
-    // 底层 FileManager 也会再校验一次，这里提前拦截可给出更明确的提示。
-    const QString outKey = QFileInfo(sOutput).absoluteFilePath().toLower();
+    // P0-1：输出文件不能是任一输入文件。
+    // 目录输入不再递归枚举全部文件（大目录会在点确定后卡很久才出现进度框）：
+    // 只要输出路径位于输入目录内，就必然可能覆盖输入，直接拒绝。
+    const QString outKey = QDir::cleanPath(QFileInfo(sOutput).absoluteFilePath()).toLower();
     for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
     {
         const QString sItem = m_hModelFilePath->item(i, 0)->text();
         const QFileInfo info(sItem);
+        const QString sItemAbs = QDir::cleanPath(info.absoluteFilePath()).toLower();
         if (info.isDir())
         {
-            QDirIterator it(sItem, QDir::Files, QDirIterator::Subdirectories);
-            int nScanned = 0;
-            while (it.hasNext())
+            if (outKey == sItemAbs
+                || outKey.startsWith(sItemAbs + QLatin1Char('/')))
             {
-                if (++nScanned > 200000)
-                {
-                    QMessageBox::warning(this, "提示",
-                        "输入目录文件数超过 200000，无法在合理时间内完成输出冲突检查。\n"
-                        "请缩小输入目录范围，或先合并到其它输出文件。");
-                    return;
-                }
-                const QString sub = it.next();
-                if (QFileInfo(sub).absoluteFilePath().toLower() == outKey)
-                {
-                    QMessageBox::warning(this, "提示",
-                        "输出文件不能是待合并文件之一：\n" + sub +
-                        "\n\n合并会先清空输出文件再读取输入，导致源数据丢失。请选择其它输出路径。");
-                    return;
-                }
+                QMessageBox::warning(this, "提示",
+                    "输出文件不能位于待合并的输入目录内：\n" + sItem +
+                    "\n\n合并会先清空输出文件再读取输入，导致源数据丢失。请选择其它输出路径。");
+                return;
             }
         }
-        else if (info.absoluteFilePath().toLower() == outKey)
+        else if (sItemAbs == outKey)
         {
             QMessageBox::warning(this, "提示",
                 "输出文件不能是待合并文件之一：\n" + sItem +

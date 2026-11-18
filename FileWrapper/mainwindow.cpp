@@ -1724,6 +1724,20 @@ void MainWindow::on_actionMergeFile_triggered()
         QStringList qLFilePaths = dlgMergeFile.getFilePaths();
         QString sMergedFilePath = dlgMergeFile.getMergedFilePath();
 
+        // 先显示进度框，再展开目录：大目录展开可能耗时，不能等展开完才弹框。
+        QProgressDialog dlgProgress(QStringLiteral("正在扫描待合并文件..."), QStringLiteral("取消"), 0, 0, this);
+        dlgProgress.setWindowTitle(QStringLiteral("合并文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        bool bOk = false;
+        QString sResultMsg;
+        beginProgressOperation(&dlgProgress, &bOk, &sResultMsg);
+        dlgProgress.show();
+        QApplication::processEvents();
+        setOperationsEnabled(false);
+
         QVector<QString> vtFilesPaths;
         foreach(QString sFilePath, qLFilePaths)
         {
@@ -1745,14 +1759,17 @@ void MainWindow::on_actionMergeFile_triggered()
             }
         }
 
-        // —— 进度条：合并可能耗时，显示进度并支持取消 ——
-        QProgressDialog dlgProgress(QStringLiteral("正在合并文件..."), QStringLiteral("取消"), 0, 100, this);
-        dlgProgress.setWindowTitle(QStringLiteral("合并文件"));
-        dlgProgress.setWindowModality(Qt::WindowModal);
-        dlgProgress.setMinimumDuration(0);
-        dlgProgress.setAutoClose(false);
-        dlgProgress.setAutoReset(false);
-        dlgProgress.setValue(0);
+        if (m_fileManager->isCancelRequested())
+        {
+            dlgProgress.close();
+            endProgressOperation();
+            setOperationsEnabled(true);
+            syncActionStates();
+            QMessageBox::information(this, QStringLiteral("合并文件"), QStringLiteral("已取消。"));
+            return;
+        }
+        dlgProgress.setRange(0, 100);
+        dlgProgress.setLabelText(QStringLiteral("正在合并文件..."));
 
         // 选中的文件里如果有已合并的 .dat：合并时会把它们拆分成条目，而不是当成普通文件
         int nArchivedInputs = 0;
@@ -1769,14 +1786,6 @@ void MainWindow::on_actionMergeFile_triggered()
             dlgProgress.setLabelText(QStringLiteral(
                 "正在合并文件（其中 %1 个是已合并归档，将先拆分再合并）...")
                     .arg(nArchivedInputs));
-
-        bool bOk = false;
-        QString sResultMsg;
-        beginProgressOperation(&dlgProgress, &bOk, &sResultMsg);   // 只替换这三条连接，不影响常驻连接
-
-        dlgProgress.show();
-        QApplication::processEvents();
-        setOperationsEnabled(false);   // 防止 processEvents 期间重入（P3-2）
 
         emit QMergeFiles(vtFilesPaths, sMergedFilePath);
 
@@ -1814,7 +1823,7 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
     // 同时用 canonical 路径 + 深度上限防止 junction/symlink 自指导致无限递归。
     QSet<QString> visited;
     std::function<void(const QString &, int)> walk = [&](const QString &sCurrent, int nDepth) {
-        if (nDepth > 64)
+        if (nDepth > 64 || m_fileManager->isCancelRequested())
             return;
         QDir d(sCurrent);
         if (!d.exists())
@@ -1832,6 +1841,8 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
         const QFileInfoList list = d.entryInfoList();
         for (const QFileInfo &fi : list)
         {
+            if (m_fileManager->isCancelRequested())
+                return;
             if (!fi.isDir())
             {
                 if (!CheckFileExt(fi.fileName(), arrFileExts))
