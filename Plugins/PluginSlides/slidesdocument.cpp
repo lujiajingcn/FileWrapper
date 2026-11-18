@@ -315,6 +315,7 @@ bool SlidesDocument::parsePptx(QString *error)
                                     }
                                 }
                                 if (text.trimmed().isEmpty()) continue;
+                                if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
                                 Block b;
                                 b.text = text;
                                 b.sizePt = sizePt;
@@ -446,6 +447,7 @@ bool SlidesDocument::parseOdp(QString *error)
                     const bool heading = (p.tagName() == QLatin1String("text:h"));
                     const QString text = p.text().trimmed();
                     if (text.isEmpty()) continue;
+                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
                     Block b;
                     b.text = text;
                     b.title = heading;

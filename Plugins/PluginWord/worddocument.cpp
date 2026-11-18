@@ -1049,7 +1049,7 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     m_numCounters.clear();
     m_truncated = false;
     m_blockBudget = 0;
-    m_nDecodedImageBytes = 0;    // P-14：每次渲染重新统计本次解码进缓存的图片字节
+    // 缓存跨 render 保留，预算也必须累计；只有 reset() 清空缓存时才归零。
 
     // RTF 走自己的轻量解析器：直接产出 HTML，不需要 ZipReader / 样式表
     if (m_isRtf)
@@ -1466,7 +1466,7 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
 
             const QDomElement tcPr = tc.firstChildElement(QStringLiteral("w:tcPr"));
             const int gs = childVal(tcPr, QStringLiteral("w:gridSpan")).toInt();
-            if (gs > 0) c.colSpan = gs;
+            if (gs > 0) c.colSpan = qBound(1, gs, 1000);   // 防超大 colspan/col 溢出
 
             const QDomElement vm = firstChild(tcPr, QStringLiteral("w:vMerge"));
             if (!vm.isNull())
@@ -1476,6 +1476,7 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
             }
 
             col += c.colSpan;
+            if (col > 1000000) { m_truncated = true; break; }
             row.append(c);
         }
         if (!row.isEmpty()) rows.append(row);
