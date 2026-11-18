@@ -724,6 +724,20 @@ void MainWindow::onDecodingFinished(int genId)
         m_bPaused = false;
         updatePlayPauseIcon();
 
+        // EOF 时 byteBuf 里可能还有最后一拍 PCM 未写出（timeCallback 才消费），
+        // 先排空再停 timer，避免音频尾部被截断。
+        if (audioOutput && streamOut
+            && audioOutput->state() != QAudio::StoppedState
+            && audioOutput->state() != QAudio::SuspendedState)
+        {
+            QMutexLocker locker(&m_audioMutex);
+            if (!byteBuf.isEmpty())
+            {
+                streamOut->write(byteBuf.constData(), byteBuf.size());
+                byteBuf.clear();
+            }
+        }
+
         if (timer->isActive())
             timer->stop();
     }
@@ -1041,7 +1055,15 @@ void MainWindow::on_progressSlider_sliderReleased(void)
 // 与本文件其余控制调用（requestStop / clearStopRequest / updateGenId / seek 里的 setPaused）保持一致。
 void MainWindow::on_playPauseBtn_clicked(void)
 {
-    if (!m_bPlaying) return;
+    // Stop 或自然播放结束后 m_bPlaying=false：从起点重新播放（按钮此前是死控件）
+    if (!m_bPlaying)
+    {
+        if (pFormatCtx == nullptr)
+            return;   // 没有打开过媒体或资源已释放，无从重播
+        if (timer->isActive()) timer->stop();
+        doSeek(0);
+        return;
+    }
 
     m_bPaused = !m_bPaused;
     updatePlayPauseIcon();
@@ -1060,17 +1082,37 @@ void MainWindow::on_playPauseBtn_clicked(void)
         // 事件循环依然被 doDecode 占着，队列投递无法唤醒它 → 会「暂停后无法恢复」）
         QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
         if (!timer->isActive()) timer->start(20);
-        if (audioOutput) audioOutput->resume();
+        ensureAudioStarted();   // 若曾被 Stop 过，此时音频流已失效，需要重新 start()
         qDebug() << "[Play/Pause] Playing";
     }
 }
 
 void MainWindow::updatePlayPauseIcon()
 {
-    if (m_bPaused)
+    // 三态：未播放/暂停显示 ▶，播放中显示 ⏸；Stop/EOF 后按钮应回到可重播状态
+    if (!m_bPlaying || m_bPaused)
         ui->playPauseBtn->setText("▶");
     else
         ui->playPauseBtn->setText("⏸");
+}
+
+bool MainWindow::ensureAudioStarted()
+{
+    if (audioOutput == nullptr)
+        return true;   // 无音频流（纯视频）
+
+    if (audioOutput->state() == QAudio::StoppedState)
+    {
+        audioOutput->setVolume(m_nVolume / 100.0f);
+        streamOut = audioOutput->start();
+        return streamOut != nullptr;
+    }
+    if (audioOutput->state() == QAudio::SuspendedState)
+    {
+        audioOutput->resume();
+        return true;
+    }
+    return streamOut != nullptr;
 }
 
 // ====== 停止 ======
@@ -1212,7 +1254,7 @@ void MainWindow::doSeek(qint64 ms)
         m_bPlaying = wasPlaying;
         m_bPaused = false;
         updatePlayPauseIcon();
-        if (audioOutput) audioOutput->resume();
+        ensureAudioStarted();   // Stop 过之后音频流已失效，不能只 resume()
 
         m_genCounter++;
         restartDecode(m_genCounter);
@@ -1241,7 +1283,8 @@ void MainWindow::doSeek(qint64 ms)
     qDebug() << "[Seek] fast-forward target(abs ms) =" << (ms + m_nStartMs);
     m_videoWorker->setSeekTarget(ms + m_nStartMs);
 
-    if (audioOutput) audioOutput->resume();
+    updatePlayPauseIcon();
+    ensureAudioStarted();   // 首次播放/Stop 后重播：StoppedState 需要重新 start()
 
     m_genCounter++;
     restartDecode(m_genCounter);
@@ -1661,10 +1704,10 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     m_bSeekPending = false;
     m_nTargetMs = 0;
     m_bPaused = false;
-    updatePlayPauseIcon();
 
-    // 开始播放
+    // 开始播放（先置 m_bPlaying，再刷新图标：图标三态依赖它）
     m_bPlaying = true;
+    updatePlayPauseIcon();
 
     // 播放世代已在函数开头递增过（用于让上一文件排队中的帧信号失效），
     // 此处直接把当前世代交给 worker，使新帧的 genId 与 m_genCounter 一致。

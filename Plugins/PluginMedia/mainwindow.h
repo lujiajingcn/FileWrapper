@@ -56,10 +56,10 @@ static const int           AUDIO_OUT_CHANNELS    = 2;
 static const int           AUDIO_OUT_SAMPLE_RATE = 44100;
 static const AVSampleFormat AUDIO_OUT_FORMAT     = AV_SAMPLE_FMT_S16;
 
-// 音频缓冲上界：约 2 秒 PCM 数据（防止解码快于播放时无限增长 / 延迟累积）
+// 音频缓冲上界：约 8 秒 PCM 数据（防止解码快于播放时无限增长 / 延迟累积）
 // ASF/WMV 容器的音频包交错通常不如 MP4 均匀，需要更大的缓冲来吸收突发音频包，
 // 避免缓冲区满后丢弃音频块导致"跳帧"。
-// 2 通道 * 2 字节(S16) * 44100 * 2
+// 2 通道 * 2 字节(S16) * 44100 * 8
 static const int AUDIO_BUFFER_LIMIT_BYTES = AUDIO_OUT_CHANNELS * 2 * AUDIO_OUT_SAMPLE_RATE * 8;
 
 namespace Ui {
@@ -231,6 +231,9 @@ private:
     void doSeek(qint64 ms);
     void updateProgressDisplay();
     void updatePlayPauseIcon();
+    // Stop 后 QAudioSink 进入 StoppedState、streamOut 失效：按需重新 start()，
+    // 供 seek/重播/继续播放复用（resume() 不能从 StoppedState 恢复）。
+    bool ensureAudioStarted();
     // 停止 worker 并阻塞等待其退出 doDecode；返回 false 表示超时、worker 仍在运行
     bool stopWorkerAndWait(unsigned long timeoutMs = 2000);
     // 根据源宽高与目标区域计算保持宽高比的目标输出尺寸

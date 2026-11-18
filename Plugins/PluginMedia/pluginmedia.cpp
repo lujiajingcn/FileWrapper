@@ -28,7 +28,14 @@ bool PluginMedia::showFile(const PluginFile &file)
     if (pData == nullptr || nLen <= 0)
         return false;
 
-    emit showVideo(const_cast<char *>(pData), nLen);
+    // 直接调用窗口侧 showVideo 以拿到 int 返回值（信号是 void，失败状态会被丢弃）。
+    // 失败时统一复位进度条/时间标签/播放图标，避免残留上一个文件的状态。
+    const int nRet = m_wMainWindow->showVideo(const_cast<char *>(pData), nLen);
+    if (nRet < 0)
+    {
+        m_wMainWindow->clearContent();
+        return false;
+    }
     return true;
 }
 
@@ -64,5 +71,10 @@ bool PluginMedia::sendFileMapped(char *pData, qint64 nFileLen, const QString &di
     Q_UNUSED(displayName);
     if (m_wMainWindow == nullptr || pData == nullptr || nFileLen <= 0)
         return false;
-    return m_wMainWindow->showVideoMapped(pData, nFileLen) >= 0;
+    if (m_wMainWindow->showVideoMapped(pData, nFileLen) < 0)
+    {
+        m_wMainWindow->clearContent();
+        return false;
+    }
+    return true;
 }

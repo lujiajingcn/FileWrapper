@@ -62,6 +62,8 @@
 #include <QTextBrowser>
 #include <QTextEdit>
 #include <QLabel>
+#include <QSlider>
+#include <cstring>
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QTextFrame>
@@ -1190,6 +1192,69 @@ static void verifyOtherViewers(const QString &work)
         }
         delete p;
         report(bOk, QStringLiteral("V12: PluginSlides renders .odp (2 slides)"));
+    }
+
+    // V13: PluginMedia —— Stop/EOF 后按钮可重播；失败文件复位界面（V-01/V-03）
+    if (want("V13"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginMedia.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOpen = false, bPlayingIcon = false, bStopIcon = false;
+        bool bReplayIcon = false, bBadReset = false;
+        if (p != nullptr)
+        {
+            // 生成 0.5 秒静音 PCM WAV（合法容器，FFmpeg 可解析）
+            auto putU32 = [](QByteArray &d, int nPos, quint32 v) {
+                for (int i = 0; i < 4; ++i) d[nPos + i] = char((v >> (8 * i)) & 0xFF);
+            };
+            auto putU16 = [](QByteArray &d, int nPos, quint16 v) {
+                for (int i = 0; i < 2; ++i) d[nPos + i] = char((v >> (8 * i)) & 0xFF);
+            };
+            const int nSamples = 44100 / 2;
+            QByteArray wav(44 + nSamples * 2, '\0');
+            std::memcpy(wav.data(), "RIFF", 4);
+            putU32(wav, 4, quint32(36 + nSamples * 2));
+            std::memcpy(wav.data() + 8, "WAVEfmt ", 8);
+            putU32(wav, 16, 16);
+            putU16(wav, 20, 1);
+            putU16(wav, 22, 1);
+            putU32(wav, 24, 44100);
+            putU32(wav, 28, 44100 * 2);
+            putU16(wav, 32, 2);
+            putU16(wav, 34, 16);
+            std::memcpy(wav.data() + 36, "data", 4);
+            putU32(wav, 40, quint32(nSamples * 2));
+
+            bOpen = p->sendFile(PluginFile::fromMemory(wav, QStringLiteral("audit.wav")));
+            QWidget *pWin = p->getPluginWidget();
+            auto *pPlay = pWin ? pWin->findChild<QPushButton *>(QStringLiteral("playPauseBtn")) : nullptr;
+            auto *pStop = pWin ? pWin->findChild<QPushButton *>(QStringLiteral("stopBtn")) : nullptr;
+            auto *pTime = pWin ? pWin->findChild<QLabel *>(QStringLiteral("timeLabel")) : nullptr;
+            auto *pSlider = pWin ? pWin->findChild<QSlider *>(QStringLiteral("progressSlider")) : nullptr;
+            for (int i = 0; i < 5; ++i) QApplication::processEvents();
+            bPlayingIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
+
+            if (pStop) pStop->click();
+            QApplication::processEvents();
+            bStopIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+
+            if (pPlay) pPlay->click();   // 从起点重播
+            for (int i = 0; i < 5; ++i) QApplication::processEvents();
+            bReplayIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
+
+            // 坏数据：showFile 应返回 false 并把进度/时间/按钮复位
+            const QByteArray junk("this is not a media file", 24);
+            const bool bRejected = !p->sendFile(PluginFile::fromMemory(junk, QStringLiteral("bad.mp4")));
+            QApplication::processEvents();
+            bBadReset = bRejected && pTime != nullptr
+                        && pTime->text() == QStringLiteral("0:00 / 0:00")
+                        && pSlider != nullptr && !pSlider->isEnabled()
+                        && pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+        }
+        delete p;
+        report(bOpen && bPlayingIcon && bStopIcon && bReplayIcon && bBadReset,
+               QStringLiteral("V13: media stop/replay button and failure reset"));
     }
 }
 
