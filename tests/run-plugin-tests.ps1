@@ -20,6 +20,7 @@ param(
     [string]$AppBuildDir = '',
     [string]$FixturesDir = '',
     [string]$Python = '',
+    [ValidateSet('debug','release')][string]$Config = 'debug',
     [switch]$SkipProjectBuild,
     [switch]$RegenerateFixtures,
     [switch]$SkipShots
@@ -74,7 +75,7 @@ try {
     Write-Host "   make  : $Make"
 
     # Keep PATH consistent for qmake-driven compiler lookups and for the test run
-    $AppExeDirGuess = if ($AppBuildDir) { Join-Path $AppBuildDir 'FileWrapper\debug' } else { '' }
+    $AppExeDirGuess = if ($AppBuildDir) { Join-Path $AppBuildDir (Join-Path 'FileWrapper' $Config) } else { '' }
     $env:PATH = "$MingwBinResolved;$QtBinResolved;$AppExeDirGuess;$env:PATH"
 
     # ------------------------------------------------------------ app build dir
@@ -87,7 +88,7 @@ try {
         New-Item -ItemType Directory -Force -Path $AppBuildDir | Out-Null
         Push-Location $AppBuildDir
         try {
-            & $QMake -o Makefile $AppPro -spec win32-g++ 'CONFIG+=debug' 'CONFIG+=qml_debug'
+            & $QMake -o Makefile $AppPro -spec win32-g++ "CONFIG+=$Config" 'CONFIG+=qml_debug'
             if ($LASTEXITCODE -ne 0) { throw "qmake failed for the application" }
             & $Make -j4
             if ($LASTEXITCODE -ne 0) { throw "make failed for the application" }
@@ -99,7 +100,7 @@ try {
     if (-not (Test-Path $AppBuildDir)) {
         throw "app build dir not found: $AppBuildDir -- build the application first (drop -SkipProjectBuild) or pass a valid -AppBuildDir."
     }
-    $AppExeDir = Join-Path $AppBuildDir 'FileWrapper\debug'
+    $AppExeDir = Join-Path $AppBuildDir (Join-Path 'FileWrapper' $Config)
     $AppPluginsDir = Join-Path $AppExeDir 'plugins'
     if (-not (Test-Path $AppPluginsDir)) {
         throw "plugins dir not found: $AppPluginsDir -- build the application first (drop -SkipProjectBuild) or pass -AppBuildDir."
@@ -133,7 +134,7 @@ try {
     New-Item -ItemType Directory -Force -Path $TestBuild | Out-Null
     Push-Location $TestBuild
     try {
-        & $QMake -o Makefile (Join-Path $TestsDir 'plugin_tests.pro') -spec win32-g++ 'CONFIG+=debug'
+        & $QMake -o Makefile (Join-Path $TestsDir 'plugin_tests.pro') -spec win32-g++ "CONFIG+=$Config"
         if ($LASTEXITCODE -ne 0) { throw "qmake failed for the test program" }
         & $Make -j4
         if ($LASTEXITCODE -ne 0) { throw "make failed for the test program" }

@@ -690,9 +690,13 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
     // ---- W4: 原硬编码表共 90 项，全部由插件 JSON 接管 ----
     // 90 项声明里有 1 个跨插件重名（".ts" = MPEG-TS 视频 vs TypeScript 文本），
     // 因此唯一路由数是 112，冲突按 extensionPriority 决出（PluginText 声明 10）。
-    report(pm->registeredExtensionCount() >= 112,
-           QStringLiteral("W4: %1 unique extensions registered (113 declared; .ts is shared)")
-               .arg(pm->registeredExtensionCount()));
+    // 112 里混有 W1 扫描用的 ZZBroken sidecar 假后缀 zzz；扣除后再核对
+    // 真实 8 个插件 JSON 的 111 个唯一后缀，避免断言依赖假插件状态。
+    const int nRegistered = pm->registeredExtensionCount();
+    const int nFake = pm->pluginForExtension(QStringLiteral("zzz")).isEmpty() ? 0 : 1;
+    report(nRegistered - nFake == 111,
+           QStringLiteral("W4: %1 real unique extensions (fake zzz excluded; raw=%2)")
+               .arg(nRegistered - nFake).arg(nRegistered));
     report(QFileInfo(pm->pluginForExtension(QStringLiteral("ts"))).fileName()
                .compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0,
            QStringLiteral("W4b: .ts -> %1 (extensionPriority resolves the MPEG-TS/TypeScript clash)")
@@ -1654,7 +1658,10 @@ static void verifyMergeDialog()
            QStringLiteral("H9: tree sort is per-level, directories first, size numeric/recursive"));
 
     // H10: 真实 MainWindow 树形填充——目录"合计大小/文件夹"、同级目录优先排序
-    const QString sTreeDir = QDir::tempPath() + QStringLiteral("/fw_tree_sort_test_%1").arg(QCoreApplication::applicationPid());
+    const QString sTreeDir = [] {
+        return QDir::tempPath() + QStringLiteral("/fw_tree_sort_test_%1")
+                                    .arg(QCoreApplication::applicationPid());
+    }();
     QDir(sTreeDir).removeRecursively();
     QDir().mkpath(sTreeDir + QStringLiteral("/sub"));
     auto writeBytes = [](const QString &sPath, int n) {
@@ -1898,7 +1905,8 @@ static void verifyMergeDialog()
         {
             pRefreshView->expand(pRefreshModel->indexFromItem(pRefreshSub));
             QApplication::processEvents();
-            pFilterEdit->setText(QStringLiteral("fw_tree_sort_test"));   // 匹配全部条目，保持层级
+            pFilterEdit->setText(QFileInfo(QDir::tempPath() + QStringLiteral("/fw_tree_sort_test_%1")
+                                           .arg(QCoreApplication::applicationPid())).fileName());
             QApplication::processEvents();
             // 筛选会重建模型：必须从新模型重新取根，旧指针已失效
             QStandardItem *pRefreshRootAfter = pRefreshModel->item(0, 0);
