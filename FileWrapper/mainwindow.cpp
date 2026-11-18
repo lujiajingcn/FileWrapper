@@ -2298,9 +2298,30 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
             }
             if (QLabel *pLabel = m_pActiveProgress->findChild<QLabel*>())
             {
-                // 路径过长时省略中段：保留"正在合并:"前缀与末尾的进度数字/大小
-                const int nAvail = qMax(80, pLabel->width() - 8);
-                sText = pLabel->fontMetrics().elidedText(sText, Qt::ElideMiddle, nAvail);
+                const QFontMetrics fm = pLabel->fontMetrics();
+                // 对话框固定 560 宽；用对话框宽度而不是 label 当前宽度，
+                // 避免首次 show 前 label 还没拿到最终几何。
+                const int nAvail = qMax(200, m_pActiveProgress->width() - 40);
+                const QStringList lines = sText.split(QLatin1Char('\n'));
+                if (lines.size() >= 2)
+                {
+                    // 第一行是「正在合并: <路径>」：只省略路径中段，
+                    // 保留固定前缀；第二行的大小/剩余时间原样保留。
+                    QString sHead = lines.first();
+                    const int nSep = sHead.indexOf(QStringLiteral(": "));
+                    const QString sPrefix = (nSep >= 0) ? sHead.left(nSep + 2) : QString();
+                    QString sPath = (nSep >= 0) ? sHead.mid(nSep + 2) : sHead;
+                    const int nPathAvail = qMax(40, nAvail - fm.horizontalAdvance(sPrefix));
+                    sPath = fm.elidedText(sPath, Qt::ElideMiddle, nPathAvail);
+                    QStringList outLines = lines;
+                    outLines[0] = sPrefix + sPath;
+                    sText = outLines.join(QLatin1Char('\n'));
+                }
+                else
+                {
+                    // 分割/校验等单行状态：整行省略中段，保证末尾大小可见。
+                    sText = fm.elidedText(sText, Qt::ElideMiddle, nAvail);
+                }
                 pLabel->setToolTip(status);      // 鼠标悬停可看完整路径
             }
             m_pActiveProgress->setLabelText(sText);
