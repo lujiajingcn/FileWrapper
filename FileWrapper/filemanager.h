@@ -41,6 +41,7 @@ public:
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
+    QString lastOutputPath() const;
 
     // 完整解析 + 合法性校验（不只是头部 CRC），供加载 / 分割 / 校验共用（P2-3）
     bool validateMergedFile(QString sFilePath);
@@ -152,6 +153,7 @@ private:
     bool                     m_bCancelRequested = false;
     bool                     m_bBusy = false;
     QString                  m_sLastError;
+    QString                  m_sLastOutputPath;
     FwArc::Meta              m_meta;
     QHash<QString,quint32>   m_mapContentCrc;
 };

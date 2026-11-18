@@ -2509,8 +2509,11 @@ void MainWindow::onActionOutputFileTriggered()
         if (!sErr.isEmpty())
             QMessageBox::warning(this, QStringLiteral("导出文件"), sErr);
         else
+        {
+            const QString sActual = m_fileManager->lastOutputPath();
             QMessageBox::information(this, QStringLiteral("导出文件"),
-                                     QStringLiteral("导出完成：%1").arg(fileInfo.sFileName));
+                                     QStringLiteral("导出完成：%1").arg(sActual.isEmpty() ? fileInfo.sFileName : sActual));
+        }
     }
 }
 

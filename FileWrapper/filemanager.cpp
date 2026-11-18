@@ -72,6 +72,7 @@ void FileManager::setError(const QString &sMsg)
 }
 
 QString FileManager::lastError() const { return m_sLastError; }
+QString FileManager::lastOutputPath() const { return m_sLastOutputPath; }
 bool    FileManager::isBusy() const { return m_bBusy; }
 bool    FileManager::isCancelRequested() const { return m_bCancelRequested; }
 bool    FileManager::isArchiveLoaded() const
@@ -903,9 +904,11 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.nOffset      = qint64(e.contentPos);
                 s.nLength      = qint64(e.size);
                 // 用来源归档的 root 还原它原本的完整路径；手工构造的归档可能没有 root
-                s.sOriginPath  = meta.root.isEmpty()
-                                     ? e.relPath
-                                     : meta.root + QLatin1Char('/') + e.relPath;
+                // v1 的 relPath 可能被降级成纯文件名；displayPath 才是原始完整路径。
+                s.sOriginPath = e.displayPath.isEmpty()
+                    ? (meta.root.isEmpty() ? e.relPath
+                                           : meta.root + QLatin1Char('/') + e.relPath)
+                    : e.displayPath;
                 s.sDisplayName = QFileInfo(e.relPath).fileName();
                 s.bFromArchive = true;
                 sources.append(s);
@@ -1939,6 +1942,7 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
 void FileManager::outputFile(QString sFilePath, QString sOutputDir)
 {
     m_sLastError.clear();
+    m_sLastOutputPath.clear();
     // 新操作开始：清掉上一次取消留下的标志，否则这里会"立刻取消"
     m_bCancelRequested = false;
     auto it = m_mapFileInfos.find(sFilePath);
@@ -2039,6 +2043,7 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
         return;
     }
     m_sLastError.clear();
+    m_sLastOutputPath = sOut;
 }
 
 // ============================================================
