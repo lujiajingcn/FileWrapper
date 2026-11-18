@@ -15,6 +15,7 @@ constexpr int    kMaxBlocks   = 2000;
 constexpr double kEmuPerPt    = 12700.0;      // 1pt = 12700 EMU
 constexpr qint64 kMaxImageBytes = 32LL * 1024 * 1024;
 constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;   // 整份文档累计解码预算
+constexpr qint64 kMaxSlidesTextChars = 20LL * 1000 * 1000;      // 整份文档累计正文字符
 
 QString esc(const QString &s)
 {
@@ -94,6 +95,7 @@ void SlidesDocument::reset()
     m_zip = ZipReader();
     m_slides.clear();
     m_images.clear();
+    m_imageByKey.clear();
     m_kind.clear();
     m_imageSeq = 0;
     m_truncated = false;
@@ -105,15 +107,32 @@ QString SlidesDocument::normalizePath(const QString &baseDir, const QString &rel
     return joinPath(baseDir, rel);
 }
 
-void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, Block *block)
+void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
+                              const QString &sKey)
 {
     if (bytes.isEmpty() || bytes.size() > kMaxImageBytes || block == nullptr) return;
+
+    // 同一 zip 图片被多页/多次 a:blip 引用时复用已有 URL，不重复解码。
+    if (!sKey.isEmpty() && m_imageByKey.contains(sKey))
+    {
+        const QString sExisting = m_imageByKey.value(sKey);
+        const QImage &img = m_images[sExisting];
+        block->imageUrl = sExisting;
+        const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
+        const double h = qBound(1.0, hPt > 0.0 ? hPt
+                                               : (w * img.height() / qMax(1, img.width())),
+                                10000.0);
+        block->imgW = w;
+        block->imgH = h;
+        return;
+    }
 
     const QImage img = QImage::fromData(bytes);
     if (img.isNull()) return;      // WMF/EMF 等 Qt 不能直接解码的格式
 
     const QString url = m_urlPrefix + QString::number(++m_imageSeq);
     m_images.insert(url, img);
+    if (!sKey.isEmpty()) m_imageByKey.insert(sKey, url);
     block->imageUrl = url;
     // 文档属性里的显示尺寸不可信：必须有上限，否则 2e8pt 会把页面撑成超宽布局。
     const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
@@ -190,13 +209,17 @@ bool SlidesDocument::parsePptx(QString *error)
         if (target.isEmpty()) continue;
         QString path = normalizePath(QStringLiteral("ppt"), target);
         if (!path.startsWith(QLatin1String("ppt/"))) path = QStringLiteral("ppt/") + path;
-        slidePaths.append(path);
+        // 同一个 slide XML 被多个 sldId 引用时只解析一次（否则 200 个 sldId
+        // 可重复解压/解析同一份 64MiB slide）。
+        if (!slidePaths.contains(path))
+            slidePaths.append(path);
     }
     if (slidePaths.isEmpty())
         return fail(QStringLiteral("演示文稿里没有任何幻灯片。"));
 
     // 整份文档的累计解码预算（像素估算）：超预算的图片不再加入文档
     qint64 decodedBytes = 0;
+    qint64 totalTextChars = 0;
 
     for (int si = 0; si < slidePaths.size() && si < kMaxSlides; ++si)
     {
@@ -264,7 +287,7 @@ bool SlidesDocument::parsePptx(QString *error)
                                 const QString mediaPath = normalizePath(slideDir, target);
                                 Block b;
                                 b.order = y * 100000.0 + x;
-                                addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt, &b);
+                                addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt, &b, mediaPath);
                                 if (!b.imageUrl.isEmpty()
                                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                                 {
@@ -317,6 +340,8 @@ bool SlidesDocument::parsePptx(QString *error)
                                 }
                                 if (text.trimmed().isEmpty()) continue;
                                 if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                                totalTextChars += text.size();
+                                if (totalTextChars > kMaxSlidesTextChars) { m_truncated = true; break; }
                                 Block b;
                                 b.text = text;
                                 b.sizePt = sizePt;
@@ -377,8 +402,9 @@ bool SlidesDocument::parseOdp(QString *error)
     if (pages.isEmpty())
         return fail(QStringLiteral("ODP 里找不到 draw:page。"));
 
-    // 整份文档的累计解码预算（像素估算）：超预算的图片不再加入文档
+    // 整份文档的累计解码/文本预算：超预算的内容不再加入文档
     qint64 decodedBytes = 0;
+    qint64 totalTextChars = 0;
 
     for (const QDomElement &page : pages)
     {
@@ -425,7 +451,7 @@ bool SlidesDocument::parseOdp(QString *error)
                 while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
-                addImage(m_zip.entry(href), wPt, hPt, &b);
+                addImage(m_zip.entry(href), wPt, hPt, &b, href);
                 if (!b.imageUrl.isEmpty()
                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                 {
@@ -461,6 +487,8 @@ bool SlidesDocument::parseOdp(QString *error)
                     const QString text = p.text().trimmed();
                     if (text.isEmpty()) continue;
                     if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                    totalTextChars += text.size();
+                    if (totalTextChars > kMaxSlidesTextChars) { m_truncated = true; break; }
                     Block b;
                     b.text = text;
                     b.title = heading;

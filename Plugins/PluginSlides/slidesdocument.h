@@ -2,6 +2,7 @@
 #define SLIDESDOCUMENT_H
 
 #include <QByteArray>
+#include <QHash>
 #include <QImage>
 #include <QMap>
 #include <QString>
@@ -58,12 +59,14 @@ private:
 
     bool parsePptx(QString *error);
     bool parseOdp(QString *error);
-    void addImage(const QByteArray &bytes, double wPt, double hPt, Block *block);
+    void addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
+                  const QString &sKey = QString());
     QString normalizePath(const QString &baseDir, const QString &rel) const;
 
     ZipReader        m_zip;
     QVector<Slide>   m_slides;
     QMap<QString, QImage> m_images;   // URL -> 图像
+    QHash<QString, QString> m_imageByKey; // zip 内路径 -> URL（重复引用去重）
     QString          m_kind;
     int              m_imageSeq = 0;
     QString          m_urlPrefix = QStringLiteral("simg://slide/");
