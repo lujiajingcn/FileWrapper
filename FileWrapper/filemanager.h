@@ -87,6 +87,8 @@ public slots:
     void QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile);
     void QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir);
     void cancelOperation();
+    // 复位取消标志：新操作开始时必须调用，否则上一次"取消"会让后续操作立刻失败
+    void resetCancel() { m_bCancelRequested = false; }
 
 private:
     QString getFileName(QString sFilePath);

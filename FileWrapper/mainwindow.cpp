@@ -276,6 +276,7 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_tvFilePath->setSortingEnabled(false);
+    m_tvFilePath->header()->installEventFilter(this);
 
     // 添加工具栏
     m_tbFilePath = new QToolBar(ui->dwFilePath);
@@ -1340,6 +1341,21 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
 // 在 viewport 层接管双击可同时绕开这两个问题，且对目录与文件一视同仁。
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
+    // 表头：仅「文件路径」列可排序。大小/类型目前是显示文本，按文本排序会误导
+    // （"9.50 KB" 会排在 "23 B" 前），因此吃掉这两列的点击并给出说明。
+    if (m_tvFilePath && !m_bTreeMode && obj == m_tvFilePath->header()
+        && event->type() == QEvent::MouseButtonRelease)
+    {
+        QMouseEvent *me = static_cast<QMouseEvent *>(event);
+        const int nSection = m_tvFilePath->header()->logicalIndexAt(me->position().toPoint());
+        if (nSection == 1 || nSection == 2)
+        {
+            statusBar()->showMessage(
+                tr("目前仅支持按「文件路径」排序（大小/类型的数值排序尚未实现）"), 3000);
+            return true;
+        }
+    }
+
     if (m_tvFilePath && m_hModelFilePath
         && obj == m_tvFilePath->viewport()
         && event->type() == QEvent::MouseButtonDblClick)
@@ -1436,6 +1452,14 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     setWindowTitle(tr("文件查看器 - %1").arg(QFileInfo(sFileName).fileName()));
     m_tvFilePath->header()->setVisible(true);
+
+    // 换归档时清掉上一份的筛选词，避免新归档"看起来是空的"
+    if (m_leFilter && !m_leFilter->text().isEmpty())
+    {
+        QSignalBlocker blocker(m_leFilter);
+        m_leFilter->clear();
+        m_sFilter.clear();
+    }
 
     // 加载成功后重置所有已打开的文件标签页（旧归档的文件路径已失效）
     closeAllTabs();
@@ -1897,6 +1921,8 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
 void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QString *psResultMsg)
 {
     endProgressOperation();
+    // 任何新进度操作开始前复位取消标志（否则上一次取消会让这次立刻失败）
+    m_fileManager->resetCancel();
     m_pActiveProgress = dlg;
     m_progressTimer.start();
     *pbOk = false;
@@ -2027,6 +2053,10 @@ void MainWindow::restoreExpandedItems(const QModelIndex &index, const QString &s
 void MainWindow::refreshFilePathView()
 {
     populateFilePathView(m_bShowPath);
+    // 平铺模式下若已启用排序，刷新后重新套用当前排序列，避免恢复成归档顺序
+    if (!m_bTreeMode && m_tvFilePath->isSortingEnabled())
+        m_tvFilePath->sortByColumn(m_tvFilePath->header()->sortIndicatorSection(),
+                                   m_tvFilePath->header()->sortIndicatorOrder());
 }
 
 void MainWindow::onActionViewTreeTriggered()
@@ -2292,6 +2322,12 @@ void MainWindow::on_actionUnloadFile_triggered()
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     m_tvFilePath->header()->setVisible(false);
     setWindowTitle(tr("文件查看器"));
+    if (m_leFilter && !m_leFilter->text().isEmpty())
+    {
+        QSignalBlocker blocker(m_leFilter);
+        m_leFilter->clear();
+        m_sFilter.clear();
+    }
     syncActionStates();
 
     // 卸载归档后关闭所有已打开的文件标签页

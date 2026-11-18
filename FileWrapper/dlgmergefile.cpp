@@ -71,13 +71,14 @@ QString DlgMergeFile::getMergedFilePath()
     return ui->leMergedFilePath->text();
 }
 
-void DlgMergeFile::addPathItem(const QString &sPath)
+void DlgMergeFile::addPathItem(const QString &sPath, bool bUpdateSummary)
 {
     if (sPath.isEmpty() || !duplicatCheck(sPath))
         return;
     m_hModelFilePath->setItem(m_hModelFilePath->rowCount(), 0,
                               new QStandardItem(sPath));
-    updateSummary();
+    if (bUpdateSummary)
+        updateSummary();
 }
 
 // 摘要：输入项数、展开后的文件数/总大小、其中多少个是已合并的 .dat
@@ -127,12 +128,16 @@ void DlgMergeFile::updateSummary()
 
 void DlgMergeFile::addDroppedUrls(const QList<QUrl> &urls)
 {
+    bool bAny = false;
     for (const QUrl &u : urls)
     {
         if (!u.isLocalFile())
             continue;
-        addPathItem(QFileInfo(u.toLocalFile()).absoluteFilePath());
+        addPathItem(QFileInfo(u.toLocalFile()).absoluteFilePath(), false);
+        bAny = true;
     }
+    if (bAny)
+        updateSummary();
 }
 
 bool DlgMergeFile::eventFilter(QObject *obj, QEvent *ev)
@@ -180,7 +185,9 @@ void DlgMergeFile::on_btnAddFile_clicked()
 {
     QStringList qLFilePaths = QFileDialog::getOpenFileNames(this, tr("选择待合并的文件"), "", tr("All Files (*.*)"));
     for (const QString &sFilePath : qLFilePaths)
-        addPathItem(sFilePath);
+        addPathItem(sFilePath, false);
+    if (!qLFilePaths.isEmpty())
+        updateSummary();
 }
 
 void DlgMergeFile::on_btnDelete_clicked()

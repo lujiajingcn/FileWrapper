@@ -42,7 +42,7 @@ protected:
     bool eventFilter(QObject *obj, QEvent *ev) override;
 
 private:
-    void addPathItem(const QString &sPath);
+    void addPathItem(const QString &sPath, bool bUpdateSummary = true);
     void updateSummary();                        // 刷新"共 N 个文件 / X MB"摘要
     void addDroppedUrls(const QList<QUrl> &urls);
 

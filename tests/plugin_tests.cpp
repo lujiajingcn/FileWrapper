@@ -1549,7 +1549,8 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     }
 
     // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
-    const QString sDup = work + QStringLiteral("/dup_paths.dat");    if (QFileInfo::exists(sDup))
+    const QString sDup = work + QStringLiteral("/dup_paths.dat");
+    if (QFileInfo::exists(sDup))
     {
         FileManager fm5;
         fm5.QLoadMergedFile(sDup);
@@ -1559,6 +1560,21 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         report(!bSave3 && sErr3.contains(QStringLiteral("重复路径"))
                    && !fm5.isCancelRequested(),
                QStringLiteral("K3: duplicate stored paths reject save (%1)").arg(sErr3));
+    }
+
+    // K5: 取消标志复位：上一次"取消"不应让后续导出/大文件打开立刻失败
+    if (FileManager::inspectArchive(sCross, crossMeta, err1))
+    {
+        FileManager fm6;
+        fm6.QLoadMergedFile(sCross);
+        fm6.cancelOperation();
+        const bool bCancelled = fm6.isCancelRequested();
+        fm6.resetCancel();
+        const bool bReset = !fm6.isCancelRequested();
+        fm6.outputFile(crossPaths.isEmpty() ? QString() : crossPaths.first(), scratchDir);
+        report(bCancelled && bReset && fm6.lastError().isEmpty(),
+               QStringLiteral("K5: cancel flag reset lets next export succeed (%1)")
+                   .arg(fm6.lastError()));
     }
 }
 

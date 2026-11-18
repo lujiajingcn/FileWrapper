@@ -344,6 +344,8 @@ bool FileManager::inspectArchive(const QString &sPath, FwArc::Meta &meta, QStrin
 bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
                                          const QString &sOutPath, QString &sErr)
 {
+    // 大文件抽取也可能被取消；开始前复位，避免上一次取消把这次直接判掉
+    m_bCancelRequested = false;
     auto it = m_mapFileInfos.find(sDisplayName);
     if (it == m_mapFileInfos.end())
     {
@@ -1832,6 +1834,8 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
 void FileManager::outputFile(QString sFilePath, QString sOutputDir)
 {
     m_sLastError.clear();
+    // 新操作开始：清掉上一次取消留下的标志，否则这里会"立刻取消"
+    m_bCancelRequested = false;
     auto it = m_mapFileInfos.find(sFilePath);
     if (it == m_mapFileInfos.end())
     {
