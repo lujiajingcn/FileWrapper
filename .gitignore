@@ -78,3 +78,7 @@ Desktop.ini
 __pycache__/
 
 /tests/k2_sibling.txt
+
+/Plugins/PluginBook/thirdparty/libmobi/**/*.o
+/Plugins/PluginBook/thirdparty/libmobi/**/*.d
+/Plugins/PluginBook/thirdparty/libmobi/libmobi.a
