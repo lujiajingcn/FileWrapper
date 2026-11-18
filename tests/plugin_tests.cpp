@@ -2053,6 +2053,7 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
                    && !hasDup(samePaths),
                QStringLiteral("K2: same-drive save keeps subdirectories (%1)")
                    .arg(samePaths.join(QStringLiteral(", "))));
+        QFile::remove(sUp);   // 不把临时来源文件留进 fixtures 上级目录
     }
 
     // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
