@@ -81,6 +81,8 @@ protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
     void populateFilePathView(bool bShowPath);
     void refreshFilePathView();
+    // 保存重写归档后，按路径把各标签页缓存的 FILEINFO 更新为最新偏移
+    void refreshTabInfosFromManager();
     void populateFilePathList(bool bShowPath);
     void populateFilePathTree();
     void applyCurrentSortToModel();
@@ -172,6 +174,7 @@ private:
     QSet<QWidget*>           m_setPluginWidgets;
     // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗
     QSet<QString>            m_setWarnedPlugins;
+    QSet<QString>            m_setBuiltinTextPlugins;   // 用户选择“以文本查看”的插件，允许再次兜底
     QSet<QString>            m_setTempFiles;
     QSet<QString>            m_setExpandedBeforeSort;   // 树形点列头排序前记住的展开目录
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用

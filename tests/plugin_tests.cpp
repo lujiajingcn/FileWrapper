@@ -2081,6 +2081,72 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
                QStringLiteral("K5: cancel flag reset lets next export succeed (%1)")
                    .arg(fm6.lastError()));
     }
+
+    // K6: 删除后重加同路径文件不得复用旧 CRC（A-02）
+    {
+        const QString sSrc = scratchDir + QStringLiteral("/crc_readd.bin");
+        const QString sArc = scratchDir + QStringLiteral("/crc_readd.dat");
+        auto write = [](const QString &p, char c) {
+            QFile f(p);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            return f.write(QByteArray(64, c)) == 64;
+        };
+        write(sSrc, 'A');
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{sSrc}, sArc);
+        fm.QLoadMergedFile(sArc);
+        QString sPath = fm.getFileInfos().isEmpty() ? QString() : fm.getFileInfos().first().sFilePath;
+        const bool bDel = fm.deleteFile(sPath);
+        write(sPath, 'B');
+        fm.addFiles(QVector<QString>{sPath});
+        QString sErr;
+        const QByteArray data = fm.entryContent(sPath, &sErr);
+        report(bDel && !data.isEmpty() && !sErr.contains(QStringLiteral("CRC")),
+               QStringLiteral("K6: re-added file after delete does not reuse stale CRC (%1)").arg(sErr));
+    }
+
+    // K7: 合并输出不能是当前已加载归档（A-13）
+    {
+        const QString sSrc = scratchDir + QStringLiteral("/merge_loaded.bin");
+        const QString sOther = scratchDir + QStringLiteral("/merge_other.bin");
+        const QString sArc = scratchDir + QStringLiteral("/merge_loaded.dat");
+        auto write = [](const QString &p, char c) {
+            QFile f(p);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            return f.write(QByteArray(32, c)) == 32;
+        };
+        write(sSrc, 'a');
+        write(sOther, 'b');
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{sSrc}, sArc);
+        fm.QLoadMergedFile(sArc);
+        bool bDone = false, bOk = true;
+        QString sMsg;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&](bool ok, const QString &m) { bDone = true; bOk = ok; sMsg = m; });
+        fm.QMergeFiles(QVector<QString>{sOther}, sArc);
+        report(bDone && !bOk && sMsg.contains(QStringLiteral("当前已加载")),
+               QStringLiteral("K7: merge refuses currently loaded archive as output"));
+    }
+
+    // K8: 合并输出不能是已存在目录（A-23）
+    {
+        const QString sSrc = scratchDir + QStringLiteral("/merge_dir.bin");
+        const QString sOut = scratchDir + QStringLiteral("/merge_out_dir");
+        QFile f(sSrc);
+        f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        f.write(QByteArray(32, 'd'));
+        f.close();
+        QDir().mkpath(sOut);
+        FileManager fm;
+        bool bDone = false, bOk = true;
+        QString sMsg;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&](bool ok, const QString &m) { bDone = true; bOk = ok; sMsg = m; });
+        fm.QMergeFiles(QVector<QString>{sSrc}, sOut);
+        report(bDone && !bOk && sMsg.contains(QStringLiteral("目录")),
+               QStringLiteral("K8: merge refuses directory as output"));
+    }
 }
 
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)

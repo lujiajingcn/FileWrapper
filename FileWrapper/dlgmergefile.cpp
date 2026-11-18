@@ -153,7 +153,10 @@ bool DlgMergeFile::eventFilter(QObject *obj, QEvent *ev)
         auto *pDrag = static_cast<QDragMoveEvent *>(ev);
         if (pDrag->mimeData() && pDrag->mimeData()->hasUrls())
         {
-            pDrag->acceptProposedAction();
+            // 只接受复制：若接受 MoveAction，Explorer 会删除源文件，
+            // 而本对话框只是记录路径、并没有搬运任何字节。
+            pDrag->setDropAction(Qt::CopyAction);
+            pDrag->accept();
             return true;
         }
         break;
@@ -164,7 +167,8 @@ bool DlgMergeFile::eventFilter(QObject *obj, QEvent *ev)
         if (pDrop->mimeData() && pDrop->mimeData()->hasUrls())
         {
             addDroppedUrls(pDrop->mimeData()->urls());
-            pDrop->acceptProposedAction();
+            pDrop->setDropAction(Qt::CopyAction);
+            pDrop->accept();
             return true;
         }
         break;
@@ -242,6 +246,17 @@ void DlgMergeFile::on_btnOk_clicked()
     if(sOutput.isEmpty())
     {
         QMessageBox::information(this, "提示", "合并后的文件路径为空");
+        return;
+    }
+
+    // 输出必须是文件路径：QFileInfo::exists() 对目录也为真，
+    // 若把目录交给底层，QFile::rename 会把整个目录移走后再写归档。
+    const QFileInfo outInfo(sOutput);
+    if (outInfo.isDir())
+    {
+        QMessageBox::warning(this, "提示",
+            "输出路径是一个已存在的目录：\n" + sOutput +
+            "\n\n请选择一个文件路径（例如 ...\\合并结果.dat），不能直接输出到目录。");
         return;
     }
 

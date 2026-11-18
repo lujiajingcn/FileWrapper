@@ -11,7 +11,11 @@
 #   Usage:
 #     powershell -NoProfile -ExecutionPolicy Bypass -File deploy\package.ps1 `
 #        -BuildDir <...\build-...\FileWrapper\debug> -OutDir <target dir> `
-#        [-QtBin <qt bin dir>]
+#        [-QtBin <qt bin dir>] [-Overwrite]
+#
+#   OutDir is cleared only when it is an empty directory, a directory created
+#   by this script (marked .filewrapper-package), or when -Overwrite is given.
+#   It is refused when it equals / is an ancestor of BuildDir or the repo root.
 #
 #   Exit code: 0 = packaged, 1 = bad invocation / windeployqt failure.
 # =============================================================================
@@ -19,7 +23,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$QtBin = ''
+    [string]$QtBin = '',
+    [switch]$Overwrite
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,8 +47,29 @@ if (-not (Test-Path -LiteralPath $windeploy)) { Fail "windeployqt not found: $wi
 $exe = Join-Path $BuildDir 'FileWrapper.exe'
 if (-not (Test-Path -LiteralPath $exe)) { Fail "FileWrapper.exe not found in $BuildDir" }
 
-if (Test-Path -LiteralPath $OutDir) { Remove-Item -LiteralPath $OutDir -Recurse -Force }
+$outFull   = [System.IO.Path]::GetFullPath($OutDir).TrimEnd('\')
+$buildFull = [System.IO.Path]::GetFullPath($BuildDir).TrimEnd('\')
+$repoRoot  = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')).TrimEnd('\')
+$outRoot   = [System.IO.Path]::GetPathRoot($outFull).TrimEnd('\')
+
+if ($outFull -ieq $buildFull) { Fail "OutDir must not be the build dir: $OutDir" }
+if ($outRoot -ne '' -and $outFull -ieq $outRoot) { Fail "OutDir must not be a drive root: $OutDir" }
+foreach ($protected in @($buildFull, $repoRoot)) {
+    if ($protected.ToLowerInvariant().StartsWith($outFull.ToLowerInvariant() + '\')) {
+        Fail "OutDir must not be an ancestor of $protected : $OutDir"
+    }
+}
+
+if (Test-Path -LiteralPath $OutDir) {
+    $existing = @(Get-ChildItem -LiteralPath $OutDir -Force)
+    $marker = Join-Path $OutDir '.filewrapper-package'
+    if ($existing.Count -gt 0 -and -not (Test-Path -LiteralPath $marker) -and -not $Overwrite) {
+        Fail "OutDir is not empty and was not created by this script: $OutDir (pass -Overwrite to replace it)"
+    }
+    Remove-Item -LiteralPath $OutDir -Recurse -Force
+}
 New-Item -ItemType Directory -Path $OutDir | Out-Null
+Set-Content -LiteralPath (Join-Path $OutDir '.filewrapper-package') -Value 'created by deploy/package.ps1' -Encoding ASCII
 
 # 1) main binary + plugin folders
 Copy-Item -LiteralPath $exe -Destination $OutDir -Force

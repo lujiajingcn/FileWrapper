@@ -15,6 +15,47 @@
 static const qint64 kCopyChunk = 1024 * 1024;      // 流式复制缓冲 1 MB
 static const qint64 kCrcChunk  = 1024 * 1024;      // 头部区校验缓冲
 
+// 「按原路径」时把归档 displayPath 还原为绝对路径：
+//   - 拒绝 "." / ".." 段，避免导出/分割写出归档指定目录之外；
+//   - 跨盘/rootless 归档把 E:/x 存成 E/x，这里补回盘符冒号；
+//   - 非绝对路径直接拒绝，而不是按当前工作目录静默落盘。
+static QString absoluteOriginalPath(const QString &sDisplayPath, QString *psErr = nullptr)
+{
+    if (psErr) psErr->clear();
+    QString p = FwArc::normalizePath(sDisplayPath);
+    const QStringList segs = p.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    if (segs.isEmpty())
+    {
+        if (psErr) *psErr = QStringLiteral("路径为空");
+        return QString();
+    }
+    for (const QString &seg : segs)
+    {
+        if (seg == QLatin1String(".") || seg == QLatin1String(".."))
+        {
+            if (psErr) *psErr = QStringLiteral("路径包含非法回溯段：%1").arg(sDisplayPath);
+            return QString();
+        }
+    }
+
+    // 扁平模式：E:/x 会存成 E/x（无冒号）。仅单个字母首段才还原，避免误伤普通相对目录。
+    if (segs.size() >= 2 && segs.first().size() == 1
+        && segs.first().at(0).isLetter())
+    {
+        QStringList rest = segs;
+        const QString sDrive = rest.takeFirst();
+        p = sDrive + QStringLiteral(":/") + rest.join(QLatin1Char('/'));
+    }
+
+    const QFileInfo fi(p);
+    if (!fi.isAbsolute())
+    {
+        if (psErr) *psErr = QStringLiteral("不是绝对路径：%1").arg(sDisplayPath);
+        return QString();
+    }
+    return fi.absoluteFilePath();
+}
+
 // ============================================================
 // 基础访问器
 // ============================================================
@@ -529,6 +570,7 @@ bool FileManager::deleteFile(const QString &sFilePath)
     m_vtFileInfos.remove(idx);
     m_mapFileInfos.remove(sFilePath);
     m_setPendingFiles.remove(sFilePath);
+    m_mapContentCrc.remove(sFilePath);   // 删除后重加同路径文件不能再用旧 CRC
     m_bDirty = true;
     return true;
 }
@@ -745,6 +787,21 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     if (vtInputFiles.isEmpty()) { finish(false, tr("没有要合并的文件")); return; }
     if (sOutputFile.isEmpty())  { finish(false, tr("输出路径为空")); return; }
+
+    const QFileInfo outInfo(sOutputFile);
+    if (outInfo.isDir())
+    {
+        finish(false, tr("输出路径是一个已存在的目录，请选择文件路径：%1").arg(sOutputFile));
+        return;
+    }
+    if (isArchiveLoaded()
+        && QFileInfo(m_qFile.fileName()).absoluteFilePath().compare(
+               outInfo.absoluteFilePath(), Qt::CaseInsensitive) == 0)
+    {
+        finish(false, tr("输出不能是当前已加载的归档：%1\n请先卸载该归档，或选择其它输出文件。")
+                           .arg(sOutputFile));
+        return;
+    }
 
     // —— P0-1：输出文件不能是任一输入文件（canonical 比较，兼容大小写与相对路径）——
     const QString outCanon = QFileInfo(sOutputFile).canonicalFilePath();
@@ -1429,15 +1486,14 @@ QString FileManager::chooseOutputPath(const QString &sBaseDir, const FwArc::Entr
     QString target;
     if (bUseOldPath)
     {
-        const QString p = FwArc::normalizePath(e.displayPath);
-        const QStringList segs = p.split('/', Qt::SkipEmptyParts);
-        for (const QString &seg : segs)
-            if (seg == "." || seg == "..") return QString();   // 拒绝回溯
-        if (p.isEmpty() || FwArc::isReservedDeviceName(segs.isEmpty() ? p : segs.last()))
+        QString why;
+        target = absoluteOriginalPath(e.displayPath, &why);
+        if (target.isEmpty())
+            return QString();   // 拒绝回溯/非绝对路径，而不是落到 CWD
+        if (FwArc::isReservedDeviceName(QFileInfo(target).fileName()))
             return QString();
-        for (int i = 0; i < p.size(); ++i)
-            if (p.at(i).unicode() < 32) return QString();
-        target = p;
+        for (int i = 0; i < target.size(); ++i)
+            if (target.at(i).unicode() < 32) return QString();
     }
     else
     {
@@ -1880,7 +1936,13 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
     }
     else
     {
-        sOut = sFilePath;   // 「按原路径导出」：仍做覆盖保护
+        QString sPathErr;
+        sOut = absoluteOriginalPath(sFilePath, &sPathErr);
+        if (sOut.isEmpty())
+        {
+            setError(tr("无法按原路径导出（%1）：%2").arg(sPathErr, sFilePath));
+            return;
+        }
     }
 
     // 绝不静默覆盖已有文件

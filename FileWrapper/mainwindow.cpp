@@ -28,6 +28,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QSet>
+#include <functional>
 #include <QList>
 #include <QMap>
 #include <QStyle>
@@ -315,6 +316,11 @@ void MainWindow::initWidgetFilePath()
     m_tbFilePath->addAction(m_acDelFile);
     m_tbFilePath->addAction(m_acOutputFile);
     m_tbFilePath->addAction(m_acSaveFile);
+
+    // 文件列表 dock 可关闭且 saveState() 会持久化隐藏态；必须提供恢复入口，
+    // 否则用户关掉后再启动就再也看不到列表（只能删 ini）。
+    QMenu *pViewMenu = menuBar()->addMenu(tr("视图"));
+    pViewMenu->addAction(ui->dwFilePath->toggleViewAction());
 
     // 筛选框：按路径/文件名过滤列表（树形与平铺模式都生效）
     m_leFilter = new QLineEdit(m_tbFilePath);
@@ -615,6 +621,7 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
         {
             if (pbUseBuiltinText) *pbUseBuiltinText = true;
             m_setWarnedPlugins.insert(sPluginPath);
+            m_setBuiltinTextPlugins.insert(sPluginPath);
             return nullptr;
         }
         m_setWarnedPlugins.insert(sPluginPath);
@@ -623,9 +630,14 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
 
     PluginManager *pMgr = PluginManager::getInstance();
 
-    // 同一插件在本会话已经提示过、且用户当时选择放弃：不再反复弹窗打扰
+    // 同一插件在本会话已经提示过、且用户当时选择放弃：不再反复弹窗打扰。
+    // 但用户当时选择过“以文本查看”的，第二次仍应走文本兜底，而不是静默失败。
     if (m_setWarnedPlugins.contains(sPluginPath))
+    {
+        if (pbUseBuiltinText && m_setBuiltinTextPlugins.contains(sPluginPath))
+            *pbUseBuiltinText = true;
         return nullptr;
+    }
 
     for (;;)   // 用户点「重试加载」后仍失败时重新展示，直到成功或放弃
     {
@@ -659,6 +671,7 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
             if (pTemplate != nullptr)
             {
                 m_setWarnedPlugins.remove(sPluginPath);   // 恢复正常，允许以后再提示
+                m_setBuiltinTextPlugins.remove(sPluginPath);
                 return pTemplate;
             }
             continue;                                      // 还是不行：带着新错误再显示一次
@@ -667,6 +680,7 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
         {
             if (pbUseBuiltinText) *pbUseBuiltinText = true;
             m_setWarnedPlugins.insert(sPluginPath);
+            m_setBuiltinTextPlugins.insert(sPluginPath);
             return nullptr;
         }
         Q_UNUSED(bCancel);
@@ -825,6 +839,7 @@ void MainWindow::reloadAllPlugins()
     }
     closeAllTabs();                        // 销毁标签页持有的插件实例
     m_setWarnedPlugins.clear();
+    m_setBuiltinTextPlugins.clear();
     m_setPluginWidgets.clear();
 
     PluginManager *pMgr = PluginManager::getInstance();
@@ -1238,6 +1253,17 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         {
             onFileManagerWarning(QStringLiteral("大文件准备失败，将尝试内存方式：%1").arg(sErr));
         }
+    }
+
+    // 非路径型查看器没有流式通道：>=128MB 时不要先整块读入再让插件拒绝。
+    if (info.nFileLen >= kLargeFileThreshold && !iface->prefersFileByPath())
+    {
+        QMessageBox::warning(this, tr("打不开文件"),
+            tr("文件过大（%1），当前查看器不支持流式读取。\n"
+               "请先使用「导出文件」或「分割文件」处理该文件。")
+                .arg(FwArc::formatSize(info.nFileLen)));
+        iface->sendFileData(nullptr, 0);
+        return;
     }
 
     // C2：内存通道直接读进 QByteArray（不再经过 new char[] + delete[] 的中转），
@@ -1699,47 +1725,46 @@ void MainWindow::on_actionMergeFile_triggered()
 bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringList& arrFiles, bool bSubDir)
 {
     QDir dir(sDir);
-    if(!dir.exists())
+    if (!dir.exists())
         return false;
 
-    dir.setFilter(QDir::Dirs | QDir::Files);
+    // 空目录（或 exists 真但枚举失败）不能先 list.at(0)；
+    // 同时用 canonical 路径 + 深度上限防止 junction/symlink 自指导致无限递归。
+    QSet<QString> visited;
+    std::function<void(const QString &, int)> walk = [&](const QString &sCurrent, int nDepth) {
+        if (nDepth > 64)
+            return;
+        QDir d(sCurrent);
+        if (!d.exists())
+            return;
+        QString sKey = QFileInfo(sCurrent).canonicalFilePath();
+        if (sKey.isEmpty())
+            sKey = d.absolutePath();
+        sKey = sKey.toLower();
+        if (visited.contains(sKey))
+            return;
+        visited.insert(sKey);
 
-    // 文件夹排在前面
-    dir.setSorting(QDir::DirsFirst);
-    QFileInfoList list = dir.entryInfoList();
-
-    int i = 0;
-    QString sFileName;
-    QString sSlash = "/";
-
-    do
-    {
-        QFileInfo fi = list.at(i);
-        sFileName = fi.fileName();
-        if(!fi.isDir())
+        d.setFilter(QDir::Dirs | QDir::Files);
+        d.setSorting(QDir::DirsFirst);
+        const QFileInfoList list = d.entryInfoList();
+        for (const QFileInfo &fi : list)
         {
-            if (CheckFileExt(sFileName, arrFileExts))
+            if (!fi.isDir())
             {
-                sFileName = QString("%1%2%3").arg(sDir).arg(sSlash).arg(sFileName);
-                arrFiles << sFileName;
+                if (!CheckFileExt(fi.fileName(), arrFileExts))
+                    continue;
+                arrFiles << d.absoluteFilePath(fi.fileName());
+                continue;
             }
+            if (!bSubDir)
+                continue;
+            if (fi.fileName() == QLatin1String(".") || fi.fileName() == QLatin1String(".."))
+                continue;
+            walk(fi.filePath(), nDepth + 1);
         }
-        else
-        {
-            if(!(fi.fileName() == "." || fi.fileName() == "..") && bSubDir)
-            {
-                QString sSubDir = QString("%1%2%3").arg(sDir).arg(sSlash).arg(sFileName);
-                if (sSubDir.endsWith(sSlash))
-                    sSubDir.chop(1);
-
-                FindFile(fi.filePath(), arrFileExts, arrFiles, bSubDir);
-            }
-        }
-
-        ++i;
-
-    } while(i < list.size());
-
+    };
+    walk(sDir, 0);
     return true;
 }
 
@@ -1784,6 +1809,13 @@ QString MainWindow::choosePlugin(QString sFileExt)
 
 void MainWindow::on_actionSplitFile_triggered()
 {
+    if (m_fileManager->isDirty()
+        && QMessageBox::question(this, tr("未保存的改动"),
+               tr("当前归档有未保存改动，分割将基于磁盘上的旧归档执行，"
+                  "新添加的条目不会出现在结果中。\n是否继续？"),
+               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+
     DlgSplitFile dlgSplitFile(this);
     // 已加载归档时预填"待分割文件路径"，用户不必再手选一次
     if (m_fileManager->isArchiveLoaded())
@@ -2219,6 +2251,12 @@ void MainWindow::onActionVerifyArchiveTriggered()
                                  QStringLiteral("请先加载一个归档文件。"));
         return;
     }
+    if (m_fileManager->isDirty()
+        && QMessageBox::question(this, tr("未保存的改动"),
+               tr("当前归档有未保存改动，校验将基于磁盘上的旧归档执行，"
+                  "报告中条目数可能与列表不一致。\n是否继续？"),
+               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
     QProgressDialog dlg(QStringLiteral("正在校验归档内容..."), QStringLiteral("取消"), 0, 100, this);
     dlg.setWindowTitle(QStringLiteral("校验归档"));
     dlg.setWindowModality(Qt::WindowModal);
@@ -2285,6 +2323,26 @@ void MainWindow::refreshFilePathView()
 {
     // populateFilePathView 内部会按当前模式启用/停用排序并重新套用当前排序列
     populateFilePathView(m_bShowPath);
+}
+
+// 保存会重写归档并重新计算所有内容偏移；标签页里缓存的是打开时的 FILEINFO 拷贝，
+// 必须按路径回填，否则下一条 ≥128MB 的 mmap 会用旧偏移读错位数据。
+void MainWindow::refreshTabInfosFromManager()
+{
+    const QVector<FILEINFO> infos = m_fileManager->getFileInfos();
+    for (TabDoc &doc : m_vTabDocs)
+    {
+        if (doc.info.sFilePath.isEmpty())
+            continue;
+        for (const FILEINFO &fi : infos)
+        {
+            if (fi.sFilePath == doc.info.sFilePath)
+            {
+                doc.info = fi;
+                break;
+            }
+        }
+    }
 }
 
 void MainWindow::onActionViewTreeTriggered()
@@ -2491,6 +2549,7 @@ void MainWindow::onActionSaveFileTriggered()
     }
 
     // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮
+    refreshTabInfosFromManager();
     refreshFilePathView();
     syncActionStates();
 }
