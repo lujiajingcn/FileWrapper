@@ -2687,6 +2687,16 @@ void MainWindow::onActionSaveFileTriggered()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // 分割/合并/保存可能持续数分钟；期间 FileManager 会通过 processEvents
+    // 回到事件循环。若此时允许关闭主窗口，后续 progressChanged 会回调已销毁
+    // 的 MainWindow（进度框/状态栏），造成崩溃。必须等操作结束或先在进度框取消。
+    if (m_fileManager->isBusy())
+    {
+        QMessageBox::information(this, tr("操作进行中"),
+            tr("正在合并/分割/保存归档，请等待完成，或先在进度对话框中点击“取消”。"));
+        event->ignore();
+        return;
+    }
     if (!confirmDiscardOrSaveIfDirty())
     {
         event->ignore();
