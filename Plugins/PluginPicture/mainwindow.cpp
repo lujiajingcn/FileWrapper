@@ -90,6 +90,9 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
         else
             m_scale = (qreal)qMin(this->height(), 600) / m_originalPix.height();
         if (m_scale <= 0.0) m_scale = 1.0;
+        // 与放大/缩小按钮统一到 [0.1,8]；否则 16x16 小图标可初始 30 倍，
+        // 点“放大”反而被钳到 8 倍变小。
+        m_scale = qBound(0.1, m_scale, 8.0);
     }
     m_rotateDeg = 0;
     applyTransform();
@@ -152,7 +155,7 @@ void MainWindow::fitToWindow()
                    qreal(avail.height() - nMargin) / orig.height());
     if (m_scale <= 0.0)
         return;
-    m_scale = qBound(0.05, m_scale, 8.0);
+    m_scale = qBound(0.1, m_scale, 8.0);
     applyTransform();
 }
 

@@ -42,7 +42,9 @@ bool ZipReader::open(const QByteArray &data)
     qint64 eocd = -1;
     qint64 start = data.size() - 22;
     if (start < 0) start = 0;
-    for (qint64 i = start; i >= 0; --i)
+    // ZIP 规范：EOCD 只可能出现在最后 22+65535 字节内，不必全文件反向扫描。
+    const qint64 lowest = qMax<qint64>(0, data.size() - 22 - 65535);
+    for (qint64 i = start; i >= lowest; --i)
     {
         if (rd32(data.constData() + i) == 0x06054b50u) { eocd = i; break; }
     }
@@ -122,6 +124,8 @@ QByteArray ZipReader::entry(const QString &name) const
         // 读本地文件头，取真实的文件名/扩展字段长度以跳到数据区
         if (e.localOff + 30 > m_data.size())
             return QByteArray();
+        if (rd32(m_data.constData() + e.localOff) != 0x04034b50u)
+            return QByteArray();   // 本地头签名不匹配，拒绝按伪造偏移解读
         quint16 lnameLen  = rd16(m_data.constData() + e.localOff + 26);
         quint16 lextraLen = rd16(m_data.constData() + e.localOff + 28);
         qint64 dataOff = e.localOff + 30 + lnameLen + lextraLen;
