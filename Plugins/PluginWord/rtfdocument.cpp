@@ -122,11 +122,12 @@ void RtfDocument::flushParagraph()
 {
     flushRun();
     if (m_paras.size() >= kMaxParagraphs) return;
-    m_paras.append(m_para);
-    m_para = Para();
+    // 对齐/缩进属于刚结束的段落；必须先写入再 append，否则每段都滞后一段。
     m_para.align    = m_paraAlign;
     m_para.leftPt   = m_paraLeftPt;
     m_para.indentPt = m_paraIndentPt;
+    m_paras.append(m_para);
+    m_para = Para();
 }
 
 void RtfDocument::flushRun()
@@ -150,12 +151,15 @@ void RtfDocument::flushRun()
 
 void RtfDocument::appendText(const QString &text)
 {
-    if (text.isEmpty() || m_chars >= kMaxChars) return;
-    m_textBuf += text;
+    if (text.isEmpty()) return;
+    const int remaining = kMaxChars - m_chars - m_textBuf.size();
+    if (remaining <= 0) return;
+    m_textBuf += text.left(remaining);   // 单段长文本也必须受 kMaxChars 约束
 }
 
 void RtfDocument::appendByte(unsigned char byte)
 {
+    if (m_pendingBytes.size() >= 1024 * 1024) return;   // 防止 \'hh 洪泛
     m_pendingBytes.append(static_cast<char>(byte));
 }
 
@@ -163,8 +167,10 @@ void RtfDocument::decodePendingBytes()
 {
     if (m_pendingBytes.isEmpty()) return;
     // RTF 里的 \'hh 是"ANSI 代码页"字节；中文环境按本地编码（GBK）解码。
-    m_textBuf += QString::fromLocal8Bit(m_pendingBytes);
+    const QString decoded = QString::fromLocal8Bit(m_pendingBytes);
     m_pendingBytes.clear();
+    const int remaining = kMaxChars - m_chars - m_textBuf.size();
+    if (remaining > 0) m_textBuf += decoded.left(remaining);
 }
 
 // ---- 字体表 / 颜色表：整组跳过渲染，但要先从中取出映射 ----
@@ -334,6 +340,12 @@ void RtfDocument::parse()
         if (c == '{')
         {
             flushRun();
+            if (m_stateStack.size() >= 4096)
+            {
+                // 嵌套上限：RTF 不需要几千层分组；继续会 OOM。已解析内容保留。
+                m_chars = kMaxChars;
+                break;
+            }
             m_stateStack.append(m_state);
             m_skipStack.append(m_skipStack.last());
             ++i;
