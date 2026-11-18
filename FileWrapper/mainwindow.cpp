@@ -40,6 +40,8 @@
 #include <QMouseEvent>
 #include <QCloseEvent>
 #include <QLineEdit>
+#include <QTimer>
+#include <QEventLoop>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
@@ -940,6 +942,22 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
                 .arg(info.sFileName), 5000);
     }
 
+    // 该页已持有同一插件的独占实例：直接复用，仅替换文件并重新渲染。
+    // 先用扩展名做一次轻量判断，避免"创建临时实例再删掉"的浪费
+    //（媒体插件构造还会起解码线程，虽小但完全没必要）。
+    const QString sExtQuick = QFileInfo(info.sFilePath).suffix();
+    const QString sByExtQuick = choosePlugin(sExtQuick);
+    if (doc.hasFile && doc.ownsInterface && doc.interface != nullptr
+        && !sByExtQuick.isEmpty() && !sByExtQuick.startsWith(QStringLiteral("builtin://"))
+        && doc.pluginPath == sByExtQuick)
+    {
+        m_vTabDocs[cur].info = info;
+        m_vTabDocs[cur].needsRender = true;
+        ui->tabWidget->setTabText(cur, info.sFileName);
+        activateTab(cur);
+        return;
+    }
+
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
     bool bOwned = false;
@@ -1234,11 +1252,32 @@ void MainWindow::activateTab(int index)
     m_pCurrentInterface = doc.interface;
 
     // 渲染：首次打开、文件被替换，或带后台播放的实例被停播后（缓存已失效）时，
-    // 重新读取文件内容并送入插件
+    // 重新读取文件内容并送入插件。
+    // 放到下一轮事件循环执行：先让标签页/标题立即切过去，避免双击后整个窗口
+    // 在渲染期间（大图/大日志/首次打开媒体可达数百毫秒）毫无响应。
     if (doc.needsRender)
     {
-        renderFile(doc.info, doc.interface);
-        doc.needsRender = false;
+        const quint64 nGen = ++m_nRenderGen;
+        const int nIndex = index;
+        const QString sExpectPath = doc.info.sFilePath;
+        QTimer::singleShot(0, this, [this, nIndex, nGen, sExpectPath]() {
+            if (nGen != m_nRenderGen)
+                return;                                  // 已被更新的切换取消
+            if (nIndex < 0 || nIndex >= m_vTabDocs.size())
+                return;
+            if (ui->tabWidget->currentIndex() != nIndex)
+                return;                                  // 用户已切走，保留 needsRender
+            TabDoc &d = m_vTabDocs[nIndex];
+            if (!d.needsRender || d.interface == nullptr
+                || d.info.sFilePath != sExpectPath)
+                return;
+            d.needsRender = false;
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            statusBar()->showMessage(tr("正在打开 %1…").arg(d.info.sFileName));
+            renderFile(d.info, d.interface);
+            QApplication::restoreOverrideCursor();
+            statusBar()->clearMessage();
+        });
     }
 }
 
