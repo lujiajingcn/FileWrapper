@@ -166,6 +166,9 @@ public:
 
     // 切换文件时由主程序调用：停止该插件正在进行的后台播放（视频/音频等）。
     virtual void stopPlayback() {}
+    // 停止并等待后台线程真正退出；返回 false 表示仍可能访问宿主映射，
+    // 宿主不得 unmap。默认实现等价于旧 stopPlayback()（同步插件恒为 true）。
+    virtual bool stopPlaybackAndWait() { stopPlayback(); return true; }
     // 该插件是否存在「后台播放」（音视频解码线程 / 音频输出等持续占用的运行态）。
     virtual bool hasBackgroundPlayback() const { return false; }
 

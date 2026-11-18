@@ -18,6 +18,7 @@ public:
     explicit PluginMedia(QObject *parent = nullptr);
 
     void stopPlayback() override;
+    bool stopPlaybackAndWait() override;
     bool hasBackgroundPlayback() const override;
 
     // 大文件走文件路径通道，FFmpeg 直接流式读取，避免整块载入内存（P1-2）

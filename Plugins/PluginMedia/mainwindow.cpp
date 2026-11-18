@@ -959,11 +959,9 @@ void MainWindow::clearContent()
     updatePlayPauseIcon();
 }
 
-void MainWindow::stopPlayback()
+bool MainWindow::stopPlaybackAndWait()
 {
-    // 宿主在 stopPlayback() 返回后会立刻 unmap 归档内容区；此时如果解码线程
-    // 仍在运行，它会通过 VideoWorker::setContexts 持有的裸指针读已释放映射。
-    // 2s 正常等待失败时继续阻塞到 worker 真正退出，再强制释放上下文。
+    // 宿主返回前必须确认 worker 已退出，否则不能 unmap 归档映射。
     if (m_videoWorker && !stopWorkerAndWait(2000))
     {
         qWarning() << "[Stop] 解码线程 2s 未退出，等待 doDecode 真正返回"
@@ -971,13 +969,19 @@ void MainWindow::stopPlayback()
         if (!m_videoWorker->waitForDecodingStopped(30000))
         {
             qWarning() << "[Stop] doDecode 30s 仍未退出，拒绝释放上下文"
-                          "（避免宿主释放映射后 UAF）";
+                          "（宿主据此不得 unmap）";
             m_bCleanupPending = true;
-            return;
+            return false;
         }
     }
     clearFFmpegResources(true);
-    qDebug() << "[Stop] stopPlayback (切换文件，停止后台播放)";
+    qDebug() << "[Stop] stopPlaybackAndWait";
+    return true;
+}
+
+void MainWindow::stopPlayback()
+{
+    stopPlaybackAndWait();
 }
 
 void MainWindow::clearFFmpegResources(bool force)

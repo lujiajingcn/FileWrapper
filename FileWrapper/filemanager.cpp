@@ -76,7 +76,7 @@ void FileManager::setError(const QString &sMsg)
 
 QString FileManager::lastError() const { return m_sLastError; }
 QString FileManager::lastOutputPath() const { return m_sLastOutputPath; }
-bool    FileManager::isBusy() const { return m_bBusy; }
+bool    FileManager::isBusy() const { return m_nBusyDepth > 0; }
 bool    FileManager::isCancelRequested() const { return m_bCancelRequested; }
 bool    FileManager::isArchiveLoaded() const
 {
@@ -566,7 +566,7 @@ void FileManager::unLoadMergedFile()
 
 void FileManager::addFiles(const QVector<QString> &vtNewFiles)
 {
-    if (!isArchiveLoaded() || m_bBusy) return;
+    if (!isArchiveLoaded() || isBusy()) return;
 
     bool bChanged = false;
     for (const QString &fp : vtNewFiles)
@@ -592,7 +592,7 @@ void FileManager::addFiles(const QVector<QString> &vtNewFiles)
 
 bool FileManager::deleteFile(const QString &sFilePath)
 {
-    if (m_bBusy) return false;
+    if (isBusy()) return false;
     int idx = -1;
     for (int i = 0; i < m_vtFileInfos.size(); ++i)
         if (m_vtFileInfos.at(i).sFilePath == sFilePath) { idx = i; break; }
@@ -613,7 +613,7 @@ bool FileManager::save()
         setError(QStringLiteral("没有已加载的归档文件，无法保存"));
         return false;
     }
-    if (m_bBusy)
+    if (isBusy())
     {
         setError(QStringLiteral("另有文件操作正在进行，请稍后重试"));
         return false;
@@ -797,7 +797,7 @@ bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst
 
 void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile)
 {
-    if (m_bBusy) { emit operationFinished(false, tr("另有文件操作正在进行")); return; }
+    if (isBusy()) { emit operationFinished(false, tr("另有文件操作正在进行")); return; }
     BusyGuard guard(this);
 
     auto finish = [this](bool ok, const QString &msg) {
@@ -1562,7 +1562,7 @@ QString FileManager::chooseOutputPath(const QString &sBaseDir, const FwArc::Entr
 
 void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString sSplitFileDir)
 {
-    if (m_bBusy) { emit operationFinished(false, tr("另有文件操作正在进行")); return; }
+    if (isBusy()) { emit operationFinished(false, tr("另有文件操作正在进行")); return; }
     BusyGuard guard(this);
 
     auto finish = [this](bool ok, const QString &msg) {

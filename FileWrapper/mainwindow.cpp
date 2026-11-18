@@ -231,7 +231,7 @@ MainWindow::~MainWindow()
     // 先停止后台播放，再销毁标签页，最后清理临时文件
     if (m_pCurrentInterface != nullptr)
     {
-        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface->stopPlaybackAndWait();
         m_pCurrentInterface = nullptr;
     }
     for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
@@ -417,7 +417,7 @@ void MainWindow::closeAllTabs()
     // 先停止当前实例的后台播放，再逐个销毁标签页（避免音视频在实例销毁前仍在后台运行）
     if (m_pCurrentInterface != nullptr)
     {
-        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface->stopPlaybackAndWait();
         m_pCurrentInterface = nullptr;
     }
 
@@ -836,7 +836,7 @@ void MainWindow::reloadAllPlugins()
 
     if (m_pCurrentInterface != nullptr)
     {
-        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface->stopPlaybackAndWait();
         m_pCurrentInterface = nullptr;
     }
     closeAllTabs();                        // 销毁标签页持有的插件实例
@@ -1082,10 +1082,11 @@ void MainWindow::stopCurrentPlaybackAndInvalidate()
     if (pOld == nullptr)
         return;
 
-    pOld->stopPlayback();
-    // M-04 已保证 stopPlayback 返回时 worker 已退出；此时可以安全释放该实例的
-    // mmap，避免后台标签长期持有映射阻止归档重写/保存。
-    releaseMappedInput(pOld);
+    const bool bSafeToUnmap = pOld->stopPlaybackAndWait();
+    // 只有 worker 确认退出才释放该实例的 mmap；否则保留映射，宁可由后续
+    // releaseAllMappedInputs 重试，也不能冒 UAF 风险。
+    if (bSafeToUnmap)
+        releaseMappedInput(pOld);
 
     if (!pOld->hasBackgroundPlayback())
         return;
@@ -1326,6 +1327,8 @@ void MainWindow::releaseMappedInput(PluginInterface *iface)
 
 void MainWindow::releaseAllMappedInputs()
 {
+    // 只在关闭/析构路径调用：此时标签页实例已或即将销毁，不能再解引用
+    // 插件指针；正常切页的安全释放由 stopCurrentPlaybackAndInvalidate 负责。
     qDeleteAll(m_mapMappedInputs);
     m_mapMappedInputs.clear();
 }
@@ -1416,7 +1419,7 @@ void MainWindow::onTabCloseRequested(int index)
     if (m_vTabDocs.at(index).interface != nullptr
         && m_vTabDocs.at(index).interface == m_pCurrentInterface)
     {
-        m_pCurrentInterface->stopPlayback();
+        m_pCurrentInterface->stopPlaybackAndWait();
         m_pCurrentInterface = nullptr;
     }
 

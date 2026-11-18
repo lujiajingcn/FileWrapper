@@ -142,8 +142,8 @@ private:
 
 private:
     struct BusyGuard {
-        explicit BusyGuard(FileManager *fm) : p(fm) { p->m_bBusy = true; p->m_bCancelRequested = false; }
-        ~BusyGuard() { p->m_bBusy = false; }
+        explicit BusyGuard(FileManager *fm) : p(fm) { ++p->m_nBusyDepth; p->m_bCancelRequested = false; }
+        ~BusyGuard() { if (p->m_nBusyDepth > 0) --p->m_nBusyDepth; }
         FileManager *p;
     };
 
@@ -153,7 +153,7 @@ private:
     QSet<QString>            m_setPendingFiles;
     bool                     m_bDirty = false;
     bool                     m_bCancelRequested = false;
-    bool                     m_bBusy = false;
+    int                      m_nBusyDepth = 0;
     QString                  m_sLastError;
     QString                  m_sLastOutputPath;
     FwArc::Meta              m_meta;

@@ -39,6 +39,11 @@ bool PluginMedia::showFile(const PluginFile &file)
     return true;
 }
 
+bool PluginMedia::stopPlaybackAndWait()
+{
+    return m_wMainWindow ? m_wMainWindow->stopPlaybackAndWait() : true;
+}
+
 void PluginMedia::stopPlayback()
 {
     if (m_wMainWindow)

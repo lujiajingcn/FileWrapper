@@ -196,6 +196,7 @@ public:
     // 由 PluginMedia::stopPlayback() 调用：彻底停止后台播放（停解码线程 + 停音频输出 + 释放 FFmpeg 上下文）。
     // 用于主程序切换文件时，确保被隐藏的旧视频 widget 不再在后台发声/解码。
     void stopPlayback();
+    bool stopPlaybackAndWait();
     // 打开失败 / 0 字节时停止后台播放并清空画面，避免残留上一个文件
     void clearContent();
 
