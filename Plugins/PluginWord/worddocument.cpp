@@ -607,6 +607,7 @@ void WordDocument::reset()
     m_blockBudget = 0;
     m_imageSeq = 0;
     m_targetToUrl.clear();
+    m_failedImages.clear();
     m_imageCache.clear();
     m_nDecodedImageBytes = 0;    // P-14：图片缓存清空，累计解码预算同步归零
     m_rtf.reset();
@@ -1099,19 +1100,19 @@ void WordDocument::emitBlocks(const QDomElement &parent, QStringList &out, doubl
         else if (tag == QLatin1String("w:sdt"))
         {
             const QDomElement content = e.firstChildElement(QStringLiteral("w:sdtContent"));
-            if (!content.isNull()) emitBlocks(content, out, scale, depth);
+            if (!content.isNull()) emitBlocks(content, out, scale, depth + 1);
         }
         else if (tag == QLatin1String("w:ins") || tag == QLatin1String("w:moveTo")
                  || tag == QLatin1String("w:customXml") || tag == QLatin1String("w:smartTag"))
         {
-            emitBlocks(e, out, scale, depth);
+            emitBlocks(e, out, scale, depth + 1);
         }
         else if (tag == QLatin1String("mc:AlternateContent"))
         {
             // Word 2010+ 的兼容性包装：优先取 mc:Choice，否则取 mc:Fallback
             QDomElement chosen = e.firstChildElement(QStringLiteral("mc:Choice"));
             if (chosen.isNull()) chosen = e.firstChildElement(QStringLiteral("mc:Fallback"));
-            if (!chosen.isNull()) emitBlocks(chosen, out, scale, depth);
+            if (!chosen.isNull()) emitBlocks(chosen, out, scale, depth + 1);
         }
         // 其余（w:sectPr / w:bookmarkStart / w:del ...）对页面显示无意义，跳过
     }
@@ -1214,6 +1215,9 @@ void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double 
 void WordDocument::emitRuns(const QDomElement &parent, QStringList &out, const RunProps &base,
                             double scale, const QString &linkTarget)
 {
+    struct DepthGuard { int &d; explicit DepthGuard(int &x) : d(x) { ++d; } ~DepthGuard() { --d; } };
+    DepthGuard guard(m_nInlineDepth);
+    if (m_nInlineDepth > 64) { m_truncated = true; return; }
     for (QDomElement e = parent.firstChildElement(); !e.isNull(); e = e.nextSiblingElement())
     {
         const QString tag = e.tagName();
@@ -1407,19 +1411,23 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
     const QString part = resolvePart(m_mainPartDir, target);
     if (part.isEmpty()) return QString();       // 外链图片，不联网加载
 
+    if (m_failedImages.contains(part)) return QString();
     QString url = m_targetToUrl.value(part);
     if (url.isEmpty())
     {
         const QByteArray bytes = m_zip.entry(part);
-        if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) return QString();
+        if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) { m_failedImages.insert(part); return QString(); }
         const QImage img = QImage::fromData(bytes);
-        if (img.isNull()) return QString();      // WMF/EMF 等 Qt 不支持的格式
+        if (img.isNull()) { m_failedImages.insert(part); return QString(); }      // WMF/EMF 等 Qt 不支持的格式
 
         // 整个文档的累计解码预算（P-14）：超出预算的图片不再缓存，
         // 避免多张接近单图上限的图片叠加占用数 GB 内存；QImage 随作用域释放。
         const qint64 decoded = decodedImageBytes(img);
         if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
+        {
+            m_failedImages.insert(part);   // 负缓存：后续引用不再重复解压/解码
             return QString();
+        }
 
         url = m_urlPrefix + QString::number(++m_imageSeq);
         m_targetToUrl.insert(part, url);
@@ -1460,6 +1468,7 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
         for (QDomElement tc = tr.firstChildElement(QStringLiteral("w:tc"));
              !tc.isNull(); tc = tc.nextSiblingElement(QStringLiteral("w:tc")))
         {
+            if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
             CellInfo c;
             c.el = tc;
             c.colStart = col;
@@ -1898,6 +1907,9 @@ void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, doub
 void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
                                  const OdtRun &base, double scale, const QString &link)
 {
+    struct DepthGuard { int &d; explicit DepthGuard(int &x) : d(x) { ++d; } ~DepthGuard() { --d; } };
+    DepthGuard guard(m_nInlineDepth);
+    if (m_nInlineDepth > 64) { m_truncated = true; return; }
     for (QDomNode n = parent.firstChild(); !n.isNull(); n = n.nextSibling())
     {
         if (n.isText())
