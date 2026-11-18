@@ -629,16 +629,24 @@ static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
     QProcess d6Child;
     d6Child.start(QCoreApplication::applicationFilePath(),
                   QStringList{QStringLiteral("--d6-child")});
-    const bool bChildFinished = d6Child.waitForFinished(60000);
+    bool bChildFinished = d6Child.waitForFinished(60000);
+    if (!bChildFinished)
+    {
+        d6Child.kill();
+        bChildFinished = d6Child.waitForFinished(5000);
+    }
     const bool bD6 = bChildFinished && d6Child.exitStatus() == QProcess::NormalExit
                      && d6Child.exitCode() == 0;
-    report(bD6, QStringLiteral("D6: retry recovered in isolated process (exit %1)")
-                    .arg(bChildFinished ? d6Child.exitCode() : -999));
+    const QString sJson = sPath.left(sPath.size() - 4) + QStringLiteral(".json");
+    const bool bDllRemoved = QFile::remove(sPath) || !QFile::exists(sPath);
+    const bool bJsonRemoved = QFile::remove(sJson) || !QFile::exists(sJson);
+    report(bD6 && bDllRemoved && bJsonRemoved,
+           QStringLiteral("D6: retry recovered in isolated process (exit %1, cleanup=%2/%3)")
+               .arg(bChildFinished ? d6Child.exitCode() : -999)
+               .arg(bDllRemoved).arg(bJsonRemoved));
     if (!bD6)
         note(QStringLiteral("D6 child stderr: ")
              + QString::fromLocal8Bit(d6Child.readAllStandardError()).left(400));
-    QFile::remove(sPath);
-    QFile::remove(sPath.left(sPath.size() - 4) + QStringLiteral(".json"));
 
     // ---- D7: 文件损坏时重试不会假装成功 ----
     // 注意必须换一个"本进程从未加载过"的文件名：同一个路径在 D6 已被成功加载，
@@ -698,7 +706,7 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
 
     // ---- W4: 原硬编码表共 90 项，全部由插件 JSON 接管 ----
     // 90 项声明里有 1 个跨插件重名（".ts" = MPEG-TS 视频 vs TypeScript 文本），
-    // 因此唯一路由数是 112，冲突按 extensionPriority 决出（PluginText 声明 10）。
+    // 因此真实插件唯一路由数是 111（zzz 为 W1 假插件 sidecar），冲突按 extensionPriority 决出。
     // 112 里混有 W1 扫描用的 ZZBroken sidecar 假后缀 zzz；扣除后再核对
     // 真实 8 个插件 JSON 的 111 个唯一后缀，避免断言依赖假插件状态。
     const int nRegistered = pm->registeredExtensionCount();
@@ -2359,8 +2367,8 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
 static int runBrokenRetryChild()
 {
     QTemporaryDir childSettings;
-    if (childSettings.isValid())
-        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, childSettings.path());
+    if (!childSettings.isValid()) return 2;
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, childSettings.path());
     const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
     const QString dll = dir + QStringLiteral("/ZZBroken.dll");
     const QString json = dir + QStringLiteral("/ZZBroken.json");
@@ -2381,10 +2389,12 @@ static int runBrokenRetryChild()
     pm->loadAllPlugins();
     const bool bRecorded = !pm->failureFor(dll).isEmpty();
 
-    QFile::remove(dll);
-    if (!QFile::copy(dir + QStringLiteral("/PluginPdf.dll"), dll)) return 1;
+    if (!QFile::remove(dll)) return 3;
+    if (!QFile::copy(dir + QStringLiteral("/PluginPdf.dll"), dll)) return 4;
     const int nRecovered = pm->retryFailedPlugins();
-    const bool bOk = bRecorded && nRecovered == 1 && pm->getInterface(dll) != nullptr;
+    const bool bOk = bRecorded && nRecovered == 1
+                     && pm->getInterface(dll) != nullptr
+                     && pm->failureFor(dll).isEmpty();
     return bOk ? 0 : 1;
 }
 
@@ -2558,14 +2568,16 @@ int main(int argc, char **argv)
     }
     else
     {
-        ++g_skipped;
-        note(QStringLiteral("[SKIP] whole V group skipped by FW_SKIP_VIEWER_SMOKE"));
+        g_skipped += 16;   // V1..V14 共 16 条 report
+        note(QStringLiteral("[SKIP] whole V group skipped by FW_SKIP_VIEWER_SMOKE (16 assertions)"));
     }
 
     // ---------- Z: 格式识别（后缀不可靠时的兜底） ----------
     verifyFormatResolver();
 
     // ---------- S: 截图（可选，--shots <dir>） ----------
+    if (shotsDir.isEmpty())
+        g_skipped += 3;   // 3 张截图未启用，按断言数计入 SKIP
     if (!shotsDir.isEmpty())
     {
         const QString shots = shotsDir;
@@ -2610,6 +2622,12 @@ int main(int argc, char **argv)
     verifyCreateInstanceContract(tmpl);
     verifyDiskSpaceCheck();
     verifyPluginToggleAndReload();
+
+    // H10/H13 的 PID 临时目录收尾清理
+    QDir(QDir::tempPath() + QStringLiteral("/fw_tree_sort_test_%1")
+             .arg(QCoreApplication::applicationPid())).removeRecursively();
+    QDir(QDir::tempPath() + QStringLiteral("/fw_chain_test_%1")
+             .arg(QCoreApplication::applicationPid())).removeRecursively();
 
     // ---------- 汇总 ----------
     out(QStringLiteral("---------------------------------------------"));

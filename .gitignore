@@ -76,3 +76,5 @@ Desktop.ini
 
 # Python 缓存（生成测试素材时会产生）
 __pycache__/
+
+/tests/k2_sibling.txt

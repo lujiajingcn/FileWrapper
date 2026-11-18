@@ -704,7 +704,11 @@ def _normalize_all_fixtures():
     for name in os.listdir(WORK):
         if name.lower().endswith((".docx", ".xlsx", ".pptx", ".odt", ".ods",
                                   ".odp", ".epub")):
-            _normalize_zip_time(os.path.join(WORK, name))
+            try:
+                _normalize_zip_time(os.path.join(WORK, name))
+            except (zipfile.BadZipFile, OSError):
+                # broken.docx/empty.docx 等本来就是坏素材，跳过归一化。
+                pass
 
 
 def _preflight_deps():

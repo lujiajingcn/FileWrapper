@@ -173,8 +173,10 @@ static QByteArray makeGarbage()
 // ---------- 主测试 ----------
 int main(int argc, char *argv[])
 {
-    g_logFile.setFileName(QDir::temp().absoluteFilePath(QStringLiteral("booktest_result.txt")));
-    g_logFile.open(QIODevice::WriteOnly | QIODevice::Text);
+    g_logFile.setFileName(QDir::temp().absoluteFilePath(
+        QStringLiteral("booktest_result_%1.txt").arg(QCoreApplication::applicationPid())));
+    if (!g_logFile.open(QIODevice::WriteOnly | QIODevice::Text))
+        qWarning() << "cannot open booktest log:" << g_logFile.fileName();
     g_log.setDevice(&g_logFile);
 
     logLine("=== PluginBook 最小自测开始 ===");

@@ -1073,7 +1073,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         FwArc::Crc32 eCrc;
         bOk = streamCopy(src, s.nOffset, s.nLength, fTmp, eCrc,
                          copiedTotal, totalBytes,
-                         tr("正在合并: %1").arg(s.sOriginPath), err);
+                         tr("正在合并: %1\n").arg(s.sOriginPath), err);
         contentCrcs.append(eCrc.value());
         src.close();
     }
@@ -1595,16 +1595,18 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
     for (const FwArc::Entry &e : meta.entries) totalBytes += qint64(e.size);
 
     // 目标盘空间预检（按第一个输出目录估算；跨盘条目无法精确，尽力而为）。
-    const QString sSpaceDir = bIsSaveAsOldPath
-        ? QFileInfo(meta.entries.isEmpty() ? sInputFile : meta.entries.first().displayPath).absolutePath()
-        : sSplitFileDir;
-    const QStorageInfo storage(sSpaceDir);
-    if (storage.isValid() && storage.bytesAvailable() >= 0 && totalBytes > storage.bytesAvailable())
+    // 只有固定输出目录才能准确预检；按原路径时条目分散在多盘，不能用一个卷判断。
+    if (!bIsSaveAsOldPath)
     {
-        finish(false, tr("目标磁盘空间不足：需要约 %1，可用 %2（%3）")
-                           .arg(FwArc::formatSize(totalBytes),
-                                FwArc::formatSize(storage.bytesAvailable()), sSpaceDir));
-        return;
+        const QStorageInfo storage(sSplitFileDir);
+        if (storage.isValid() && storage.bytesAvailable() >= 0
+            && totalBytes > storage.bytesAvailable())
+        {
+            finish(false, tr("目标磁盘空间不足：需要约 %1，可用 %2（%3）")
+                               .arg(FwArc::formatSize(totalBytes),
+                                    FwArc::formatSize(storage.bytesAvailable()), sSplitFileDir));
+            return;
+        }
     }
 
     qint64 copiedTotal = 0;

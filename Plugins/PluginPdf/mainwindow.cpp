@@ -168,7 +168,7 @@ void MainWindow::updatePage()
     QSize target(qMax(1, qRound(pt.width()  * factor)),
                  qMax(1, qRound(pt.height() * factor)));
     // 433 字节的 PDF 也能声明 12000x12000pt；无上限会一次分配 ~1.1GB。
-    constexpr int kMaxPdfRenderDim = 8192;
+    constexpr int kMaxPdfRenderDim = 4096;
     if (target.width() > kMaxPdfRenderDim || target.height() > kMaxPdfRenderDim)
         target.scale(kMaxPdfRenderDim, kMaxPdfRenderDim, Qt::KeepAspectRatio);
     const QImage pdfImage = m_doc.render(m_nCurPage, target);

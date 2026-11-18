@@ -111,14 +111,16 @@ QString SlidesDocument::normalizePath(const QString &baseDir, const QString &rel
 }
 
 void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
-                              const QString &sKey)
+                              const QString &sKey, bool *pbNewDecoded)
 {
+    if (pbNewDecoded) *pbNewDecoded = false;
     if (bytes.isEmpty() || bytes.size() > kMaxImageBytes || block == nullptr) return;
 
+    const QString sCacheKey = sKey.toLower();
     // 同一 zip 图片被多页/多次 a:blip 引用时复用已有 URL，不重复解码。
-    if (!sKey.isEmpty() && m_imageByKey.contains(sKey))
+    if (!sCacheKey.isEmpty() && m_imageByKey.contains(sCacheKey))
     {
-        const QString sExisting = m_imageByKey.value(sKey);
+        const QString sExisting = m_imageByKey.value(sCacheKey);
         const QImage &img = m_images[sExisting];
         block->imageUrl = sExisting;
         const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
@@ -135,7 +137,8 @@ void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, B
 
     const QString url = m_urlPrefix + QString::number(++m_imageSeq);
     m_images.insert(url, img);
-    if (!sKey.isEmpty()) m_imageByKey.insert(sKey, url);
+    if (!sCacheKey.isEmpty()) m_imageByKey.insert(sCacheKey, url);
+    if (pbNewDecoded) *pbNewDecoded = true;
     block->imageUrl = url;
     // 文档属性里的显示尺寸不可信：必须有上限，否则 2e8pt 会把页面撑成超宽布局。
     const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
@@ -210,8 +213,10 @@ bool SlidesDocument::parsePptx(QString *error)
         if (++sldIdCount > kMaxSlides) { m_truncated = true; break; }
         const QString target = presRelTargets.value(e.attribute(QStringLiteral("r:id")));
         if (target.isEmpty()) continue;
+        const bool bAbsoluteTarget = target.trimmed().startsWith(QLatin1Char('/'));
         QString path = normalizePath(QStringLiteral("ppt"), target);
-        if (!path.startsWith(QLatin1String("ppt/"))) path = QStringLiteral("ppt/") + path;
+        if (!bAbsoluteTarget && !path.startsWith(QLatin1String("ppt/")))
+            path = QStringLiteral("ppt/") + path;
         // 同一个 slide XML 被多个 sldId 引用时只解析一次（否则 200 个 sldId
         // 可重复解压/解析同一份 64MiB slide）。
         if (!slidePaths.contains(path))
@@ -290,12 +295,15 @@ bool SlidesDocument::parsePptx(QString *error)
                                 const QString mediaPath = normalizePath(slideDir, target);
                                 Block b;
                                 b.order = y * 100000.0 + x;
-                                addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt, &b, mediaPath);
-                                if (!b.imageUrl.isEmpty()
+                                bool bNewDecoded = false;
+                                addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt,
+                                         &b, mediaPath, &bNewDecoded);
+                                if (bNewDecoded && !b.imageUrl.isEmpty()
                                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                                 {
-                                    // 超整份文档的累计解码预算：丢弃该图，文档其余内容照常显示
+                                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删
                                     m_images.remove(b.imageUrl);
+                                    m_imageByKey.remove(mediaPath.toLower());
                                     b.imageUrl.clear();
                                     m_truncated = true;
                                 }
@@ -312,7 +320,7 @@ bool SlidesDocument::parsePptx(QString *error)
                 {
                     // 文本框：p:txBody/a:p（段落），每个段落一个 Block
                     std::function<void(const QDomElement &)> findTxBody = [&](const QDomElement &e) {
-                        if (e.tagName() == QLatin1String("p:txBody"))
+                        if (e.tagName() == QLatin1String("p:txBody") || e.tagName() == QLatin1String("a:txBody"))
                         {
                             for (QDomElement p = e.firstChildElement(QStringLiteral("a:p")); !p.isNull();
                                  p = p.nextSiblingElement(QStringLiteral("a:p")))
@@ -454,12 +462,14 @@ bool SlidesDocument::parseOdp(QString *error)
                 while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
-                addImage(m_zip.entry(href), wPt, hPt, &b, href);
-                if (!b.imageUrl.isEmpty()
+                bool bNewDecoded = false;
+                addImage(m_zip.entry(href), wPt, hPt, &b, href, &bNewDecoded);
+                if (bNewDecoded && !b.imageUrl.isEmpty()
                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                 {
-                    // 超整份文档的累计解码预算：丢弃该图，文档其余内容照常显示
+                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删
                     m_images.remove(b.imageUrl);
+                    m_imageByKey.remove(href.toLower());
                     b.imageUrl.clear();
                     m_truncated = true;
                 }

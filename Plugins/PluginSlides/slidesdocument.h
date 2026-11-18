@@ -60,7 +60,7 @@ private:
     bool parsePptx(QString *error);
     bool parseOdp(QString *error);
     void addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
-                  const QString &sKey = QString());
+                  const QString &sKey = QString(), bool *pbNewDecoded = nullptr);
     QString normalizePath(const QString &baseDir, const QString &rel) const;
 
     ZipReader        m_zip;

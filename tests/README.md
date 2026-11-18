@@ -1,7 +1,7 @@
 # 插件测试（plugin tests）
 
 本目录是**仓库内的可复现测试套件**，覆盖「插件基础设施」与 `PluginWord` 的真实渲染，
-共 **197 项断言**（`-SkipShots` 194 项）。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
+共 **197 项断言**（完整 197 PASS；`-SkipShots` 为 194 PASS + 3 SKIP）。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
 那些探针随机器一起消失，导致同一套验证别人无法跑、也没法回归。
 
 ## 为什么这样设计
@@ -31,10 +31,10 @@
 | `A` | 主程序链路：`PluginManager` 加载、`QMergeFiles` 合并、`resolvePlugin` 三步、挂进 `QTabWidget`、诊断入口存在 |
 | `X` | B2 实例契约（`createInstance()` 返回空必须报错，不再退化共享实例）、B4 磁盘空间预检、C5 插件禁用/重启用 + 重新加载 |
 | `Y` | C2 数据通道：`PluginFile` 内存/路径两种形态、`sendFile()` 的默认兼容实现（老插件照常收到数据、路径型插件收到原路径）、迁移后的 PluginWord 直接吃 `PluginFile` |
-| `V` | 各查看器渲染冒烟：PluginText（.txt、**.html 富文本**）、PluginPicture（.png、**.svg**、**.webp**）、PluginBook（.epub，覆盖共享 ZipReader 的 deflate 路径）、PluginWord（**.odt/OpenDocument** 的段落/表格、**.rtf 子集**）、PluginSheet（**.xlsx 多表 + 合并单元格**、**.ods**）、PluginSlides（**.pptx**、**.odp** 的逐页静态渲染） |
+| `V` | 各查看器渲染冒烟：PluginText（.txt、**.html 富文本**）、PluginPicture（.png、**.svg**、**.webp**）、PluginBook（.epub，覆盖共享 ZipReader 的 deflate 路径）、PluginWord（**.odt/OpenDocument** 的段落/表格、**.rtf 子集**）、PluginSheet（**.xlsx 多表 + 合并单元格**、**.ods**）、PluginSlides（**.pptx**、**.odp** 的逐页静态渲染）、V13 媒体停止/重播三态与失败复位、V14 RTF Unicode 回退 |
 | `F` | 格式识别（`FormatResolver`）：PNG/PDF/OLE2/ZIP 家族（docx/xlsx/odt）按内容判断、内容优先于错误后缀、未知格式有可读建议、不支持格式清单非空 |
 | `G` | 合并展开：已有 `.dat` 作为输入时被拆成条目参与合并（不产生嵌套归档）、同目录合并保持短相对路径、不同盘符来源的条目**保留原归属**（`D/testfiles_copy/...` 不会被改挂到另一个盘）、撞名自动改名 |
-| `H` | 合并对话框交互：列表为多选整行选择、删除只移除选中项、Delete 键等价于删除按钮；分割对话框支持预填；大小列按数值字节排序；平铺模式一进入就启用列排序（不依赖先点一次"平铺显示"）；树形模式同级排序、目录优先，目录显示子树合计大小与"文件夹"类型；排序（含点列头/筛选刷新）不改变节点展开/收起状态；角色隔离（FILEINFO/IsDir 不混用）；单链目录压缩无空壳；导出对话框按单选项取路径；媒体停止/重播三态与失败复位（V13）；RTF Unicode 回退字节不写入正文（V14） |
+| `H` | 合并对话框交互：列表为多选整行选择、删除只移除选中项、Delete 键等价于删除按钮；分割对话框支持预填；大小列按数值字节排序；平铺模式一进入就启用列排序（不依赖先点一次"平铺显示"）；树形模式同级排序、目录优先，目录显示子树合计大小与"文件夹"类型；排序（含点列头/筛选刷新）不改变节点展开/收起状态；角色隔离（FILEINFO/IsDir 不混用）；单链目录压缩无空壳；导出对话框按单选项取路径 |
 | `K` | 保存路径规划：跨盘添加后保存仍保留 `E/...`/`D/...` 盘符段、同盘添加后保留子目录层级、归档内重复路径会被拒绝保存；`archivePath()` 供分割预填 |
 
 素材见 [fixtures/](fixtures)：`basic.docx`（常规排版）、`chinese.docx`（中文样式名 +
@@ -71,7 +71,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1 -
 | `-AppBuildDir <dir>` | 主程序影子构建根目录（含 `FileWrapper/`、`Plugins/`）；默认 `tests/build/app` |
 | `-FixturesDir <dir>` | 素材目录；默认 `tests/fixtures` |
 | `-SkipProjectBuild` | 不构建主程序，直接复用 `-AppBuildDir` |
-| `-SkipShots` | 不输出渲染截图 |
+| `-Config <debug\|release>` | 构建/测试配置；默认 debug |
+| `-SkipShots` | 不输出渲染截图（3 条截图断言计 SKIP） |
 | `-RegenerateFixtures` | 先跑 `fixtures/make_fixtures.py` 重新生成素材 |
 | `-Python <exe>` | Python 可执行文件路径（配合 `-RegenerateFixtures`） |
 

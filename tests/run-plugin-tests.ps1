@@ -140,7 +140,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "make failed for the test program" }
     } finally { Pop-Location }
 
-    $TestRunDir = Join-Path $TestBuild 'debug'
+    $TestRunDir = Join-Path $TestBuild $Config
     $TestExe = Join-Path $TestRunDir 'plugin_tests.exe'
     if (-not (Test-Path $TestExe)) { throw "test executable not found: $TestExe" }
 

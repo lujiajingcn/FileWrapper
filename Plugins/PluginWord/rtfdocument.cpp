@@ -118,6 +118,9 @@ void RtfDocument::reset()
     m_ucCount = 1;
     m_fallbackRemaining = 0;
     m_ucStack.clear();
+    m_paraAlign = 0;
+    m_paraLeftPt = 0.0;
+    m_paraIndentPt = 0.0;
     m_chars = 0;
 }
 
@@ -314,7 +317,7 @@ void RtfDocument::handleControlWord(const QString &word, bool hasParam, int para
         int code = param;
         if (code < 0) code += 65536;
         if (code > 0 && code <= 0x10FFFF)
-            m_textBuf += QString(QChar::fromUcs4(uint(code)));   // 代理对由 QString 处理
+            appendText(QString(QChar::fromUcs4(uint(code))));   // 同样受 kMaxChars 约束
         m_fallbackRemaining = m_ucCount;
         m_skipUnicodeFallback = (m_fallbackRemaining > 0);
         return;

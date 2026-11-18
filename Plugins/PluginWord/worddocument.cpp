@@ -1,4 +1,5 @@
 #include "worddocument.h"
+#include "xmlguard.h"
 
 #include <QDomElement>
 #include <QRegularExpression>
@@ -630,6 +631,7 @@ bool WordDocument::loadXmlPart(const QString &path, QDomDocument *doc) const
     if (path.isEmpty()) return false;
     const QByteArray bytes = m_zip.entry(path);
     if (bytes.isEmpty()) return false;
+    if (!xmlWithinTagBudget(bytes)) return false;
     const QDomDocument::ParseResult pr = doc->setContent(bytes);
     return static_cast<bool>(pr);
 }
@@ -744,6 +746,11 @@ bool WordDocument::loadMainPart(const QString &path)
         return false;
     }
 
+    if (!xmlWithinTagBudget(bytes))
+    {
+        m_error = QStringLiteral("正文 XML 元素过多，已拒绝解析");
+        return false;
+    }
     QDomDocument doc;
     const QDomDocument::ParseResult pr = doc.setContent(bytes);
     if (!pr)
@@ -2140,6 +2147,9 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     if (href.contains(QLatin1String("://"))) return QString();   // 外链图片不联网
 
     // 先查缓存，再决定是否解压；重复引用/缩放重渲染不再重复 inflate。
+    if (m_failedImages.contains(href)
+        || m_failedImages.contains(QStringLiteral("Pictures/") + href))
+        return QString();
     QString key = href;
     QString url = m_targetToUrl.value(key);
     if (url.isEmpty())
@@ -2156,17 +2166,24 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
             key = QStringLiteral("Pictures/") + href;
             bytes = m_zip.entry(key);
         }
-        if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) return QString();
+        if (bytes.isEmpty() || bytes.size() > kMaxImageBytes)
+        {
+            m_failedImages.insert(key);
+            return QString();
+        }
     }
     if (url.isEmpty())
     {
         const QImage im = QImage::fromData(bytes);
-        if (im.isNull()) return QString();      // SVG/WMF 等 Qt 不能直接解码的格式
+        if (im.isNull()) { m_failedImages.insert(key); return QString(); }      // SVG/WMF 等 Qt 不能直接解码的格式
 
         // 与 docx 共用同一份累计解码预算（P-14）：超预算的图片忽略，不缓存
         const qint64 decoded = decodedImageBytes(im);
         if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
+        {
+            m_failedImages.insert(key);
             return QString();
+        }
 
         url = m_urlPrefix + QString::number(++m_imageSeq);
         m_targetToUrl.insert(key, url);

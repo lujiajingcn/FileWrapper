@@ -337,6 +337,17 @@ void VideoWorker::doDecode()
                 {
                     const int r = avcodec_receive_frame(pCodecCtx, pFrame);
                     if (r < 0) break;
+                    if (pFrame->width > 0 && pFrame->height > 0
+                        && (pFrame->width != srcW || pFrame->height != srcH
+                            || pFrame->format != int(m_srcPixFmt)))
+                    {
+                        srcW = pFrame->width;
+                        srcH = pFrame->height;
+                        m_srcPixFmt = AVPixelFormat(pFrame->format);
+                        rebuildVideoSws(srcW, srcH, m_srcPixFmt,
+                                        outW.load(std::memory_order_relaxed),
+                                        outH.load(std::memory_order_relaxed));
+                    }
                     if (!m_sws || !m_outData[0]) continue;
                     sws_scale(m_sws, (const unsigned char * const *)pFrame->data,
                               pFrame->linesize, 0, srcH, m_outData, m_outLinesize);
@@ -805,7 +816,9 @@ void MainWindow::onDecodingFinished(int genId)
                     off += n;
                 }
                 if (off > 0) byteBuf.remove(0, int(off));
-                if (off == 0) qWarning() << "[EOF] 尾部 PCM 未能写入音频设备";
+                if (off < 0) qWarning() << "[EOF] 尾部 PCM 写入音频设备失败";
+                else if (!byteBuf.isEmpty())
+                    qWarning() << "[EOF] 尾部 PCM 部分未写入，丢弃" << byteBuf.size() << "字节";
             }
         }
 
@@ -953,8 +966,15 @@ void MainWindow::stopPlayback()
     // 2s 正常等待失败时继续阻塞到 worker 真正退出，再强制释放上下文。
     if (m_videoWorker && !stopWorkerAndWait(2000))
     {
-        qWarning() << "[Stop] 解码线程 2s 未退出，继续等待直到退出（避免宿主释放映射后 UAF）";
-        if (m_videoThread) m_videoThread->wait();
+        qWarning() << "[Stop] 解码线程 2s 未退出，等待 doDecode 真正返回"
+                      "（不能 QThread::wait：该线程长期运行事件循环）";
+        if (!m_videoWorker->waitForDecodingStopped(30000))
+        {
+            qWarning() << "[Stop] doDecode 30s 仍未退出，拒绝释放上下文"
+                          "（避免宿主释放映射后 UAF）";
+            m_bCleanupPending = true;
+            return;
+        }
     }
     clearFFmpegResources(true);
     qDebug() << "[Stop] stopPlayback (切换文件，停止后台播放)";
@@ -1220,6 +1240,8 @@ void MainWindow::on_stopBtn_clicked(void)
 
     m_nCurrentMs = 0;
     m_nSeekTargetMs = 0;
+    m_nTargetMs = 0;
+    m_bSeekPending = false;
     m_videoWorker->setSeekTarget(0);
     ui->progressSlider->blockSignals(true);
     ui->progressSlider->setValue(0);
@@ -1239,7 +1261,9 @@ void MainWindow::on_stopBtn_clicked(void)
     }
     else if (!workerStopped)
     {
-        m_bCleanupPending = true;
+        // 保留 stop 请求，等 worker 自己退出；不要清上下文/置 pending，
+        // 否则同一文件之后无法重播。
+        qWarning() << "[Stop] worker 未在 2s 内退出，保留上下文等待其退出";
     }
 
     qDebug() << "[Stop] Stopped";
@@ -1283,6 +1307,11 @@ void MainWindow::doSeek(qint64 ms)
         m_bSeekPending = false;
         m_nCurrentMs = previousMs;
         m_bPlaying = wasPlaying;   // 恢复 seek 前的播放状态，UI 不留在“已暂停”
+        if (m_videoWorker)
+        {
+            QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
+            QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
+        }
         updatePlayPauseIcon();
         if (wasPlaying && timer) timer->start(20);
         return;

@@ -21,27 +21,32 @@ constexpr int kMaxXlsxCols = 16384;   // xlsx 列号上限（XFD，1 基），�
 QString odsCellText(const QDomElement &cell)
 {
     QString out;
-    std::function<void(const QDomNode &)> appendNode = [&](const QDomNode &n) {
-        if (n.isText()) { out += n.toText().data(); return; }
+    const int nLimit = kMaxCellLen + 2;   // 给 setCell 的省略号留余量
+    std::function<void(const QDomNode &, int)> appendNode = [&](const QDomNode &n, int depth) {
+        if (out.size() >= nLimit || depth > 64) return;
+        if (n.isText()) {
+            out += n.toText().data().left(nLimit - out.size());
+            return;
+        }
         const QDomElement e = n.toElement();
         if (e.isNull()) return;
         const QString tag = e.tagName();
         if (tag == QLatin1String("text:s")) {
             int nSpaces = e.attribute(QStringLiteral("text:c")).toInt();
             if (nSpaces < 1) nSpaces = 1;
-            out += QString(qMin(nSpaces, 1000), QLatin1Char(' '));
+            out += QString(qMin(qMin(nSpaces, 1000), nLimit - out.size()), QLatin1Char(' '));
             return;
         }
-        if (tag == QLatin1String("text:tab")) { out += QLatin1Char('\t'); return; }
-        if (tag == QLatin1String("text:line-break")) { out += QLatin1Char('\n'); return; }
-        for (QDomNode c = e.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c);
+        if (tag == QLatin1String("text:tab")) { if (out.size() < nLimit) out += QLatin1Char('\t'); return; }
+        if (tag == QLatin1String("text:line-break")) { if (out.size() < nLimit) out += QLatin1Char('\n'); return; }
+        for (QDomNode c = e.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c, depth + 1);
     };
     for (QDomElement p = cell.firstChildElement(); !p.isNull(); p = p.nextSiblingElement())
     {
         if (p.tagName() != QLatin1String("text:p") && p.tagName() != QLatin1String("text:h"))
             continue;
         if (!out.isEmpty()) out += QLatin1Char('\n');
-        for (QDomNode c = p.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c);
+        for (QDomNode c = p.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c, 0);
     }
     return out;
 }
@@ -336,13 +341,15 @@ bool SheetDocument::parseXlsx(QString *error)
             }
         }
 
-        // 合并单元格
+        // 合并单元格：条目数必须有上限，applyMerge 对已存在格仍会遍历整个区域。
+        int nMerges = 0;
         for (QDomElement mc = sheetDoc.documentElement().firstChildElement("mergeCells");
              !mc.isNull(); mc = mc.nextSiblingElement("mergeCells"))
         {
             for (QDomElement m = mc.firstChildElement(QStringLiteral("mergeCell")); !m.isNull();
                  m = m.nextSiblingElement(QStringLiteral("mergeCell")))
             {
+                if (++nMerges > 4096) { m_truncated = true; break; }
                 const QString ref = m.attribute(QStringLiteral("ref"));
                 const QStringList parts = ref.split(QLatin1Char(':'));
                 int c1 = 0, r1 = 0, c2 = 0, r2 = 0;

@@ -38,14 +38,14 @@ all: $(LIB)
 
 $(LIB): $(OBJS)
 	@if not exist "$(LIBDIR)" mkdir "$(LIBDIR)"
-	$(AR) rcs $(LIB) $(OBJS)
+	$(AR) rcs "$(LIB)" $(foreach o,$(OBJS),"$(o)")
 
 $(OBJDIR)/%.o: src/%.c
 	@if not exist "$(OBJDIR)" mkdir "$(OBJDIR)"
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o "$@" "$<"
 
 clean:
-	del /q $(subst /,\,$(OBJS)) $(subst /,\,$(LIB)) 2>nul
+	del /q $(foreach o,$(OBJS),"$(subst /,\,$(o))") "$(subst /,\,$(LIB))" 2>nul
 
 # T-12: header dependency tracking
 CFLAGS += -MMD -MP

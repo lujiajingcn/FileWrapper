@@ -1513,14 +1513,17 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
     // 按下时记住展开状态，松开后（排序已执行）恢复。
     // 注意：表头鼠标事件落在 header 的 viewport 上，过滤器装在那里才收得到。
     QWidget *pHeaderViewport = m_tvFilePath ? m_tvFilePath->header()->viewport() : nullptr;
-    if (pHeaderViewport != nullptr && m_bTreeMode && obj == pHeaderViewport)
+    if (pHeaderViewport != nullptr && obj == pHeaderViewport)
     {
         if (event->type() == QEvent::MouseButtonPress)
         {
             m_setExpandedBeforeSort.clear();
-            for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
-                collectExpandedItems(m_hModelFilePath->index(i, 0), QString(),
-                                     m_setExpandedBeforeSort);
+            if (m_bTreeMode)
+            {
+                for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+                    collectExpandedItems(m_hModelFilePath->index(i, 0), QString(),
+                                         m_setExpandedBeforeSort);
+            }
             m_sSelectedPathBeforeSort.clear();
             const QModelIndex cur = m_tvFilePath->currentIndex();
             if (cur.isValid())
@@ -1533,18 +1536,15 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                 }
             }
         }
-        else if (event->type() == QEvent::MouseButtonRelease
-                 && !m_setExpandedBeforeSort.isEmpty())
+        else if (event->type() == QEvent::MouseButtonRelease)
         {
             QTimer::singleShot(0, this, [this]() {
-                if (!m_bTreeMode)
+                if (m_bTreeMode && !m_setExpandedBeforeSort.isEmpty())
                 {
-                    m_setExpandedBeforeSort.clear();
-                    return;
+                    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+                        restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(),
+                                             m_setExpandedBeforeSort);
                 }
-                for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
-                    restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(),
-                                         m_setExpandedBeforeSort);
                 m_setExpandedBeforeSort.clear();
                 if (!m_sSelectedPathBeforeSort.isEmpty())
                 {
@@ -2098,6 +2098,7 @@ static qint64 finalizeTreeRows(QStandardItem *pParent)
 
 void MainWindow::populateFilePathTree()
 {    // 先记录重建前已展开的目录，重建后恢复，避免增删一个文件导致整棵树被折叠
+    const bool bWasEmpty = (m_hModelFilePath->rowCount() == 0);
     QSet<QString> setExpanded;
     for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
         collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), setExpanded);
@@ -2184,8 +2185,8 @@ void MainWindow::populateFilePathTree()
     // 按表头当前列/方向排序（同级排序、目录优先），再恢复展开状态
     applyCurrentSortToModel();
 
-    // 展开状态：有历史记录则恢复；首次加载只展开根与顶层
-    if (setExpanded.isEmpty())
+    // 展开状态：首次加载展开根与顶层；用户主动全折叠后刷新不得强制展开。
+    if (setExpanded.isEmpty() && bWasEmpty)
     {
         m_tvFilePath->expandToDepth(0);
         if (pRoot != nullptr)
@@ -2413,13 +2414,27 @@ void MainWindow::refreshTabInfosFromManager()
     {
         if (doc.info.sFilePath.isEmpty())
             continue;
+        bool bFound = false;
         for (const FILEINFO &fi : infos)
         {
             if (fi.sFilePath == doc.info.sFilePath)
             {
                 doc.info = fi;
+                bFound = true;
                 break;
             }
+        }
+        if (!bFound)
+        {
+            // pending/跨盘保存后 displayPath 可能变（E:/x -> E/x）；按唯一文件名回填。
+            const FILEINFO *pMatch = nullptr;
+            int nMatches = 0;
+            for (const FILEINFO &fi : infos)
+                if (fi.sFileName == doc.info.sFileName) { pMatch = &fi; ++nMatches; }
+            if (nMatches == 1)
+                doc.info = *pMatch;
+            else
+                doc.needsRender = false;   // 条目已删除/无法唯一定位，禁止用旧偏移重渲染
         }
     }
 }

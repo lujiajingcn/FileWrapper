@@ -34,7 +34,7 @@ static QString joinPath(const QString &base, const QString &rel)
     // 先百分号解码，否则合法 EPUB 会因条目名不匹配而整章/整图跳过。
     const QString relDecoded = QUrl::fromPercentEncoding(rel.toUtf8());
     QStringList parts    = base.split('/', Qt::SkipEmptyParts);
-    QStringList relParts = rel.split('/', Qt::SkipEmptyParts);
+    QStringList relParts = relDecoded.split('/', Qt::SkipEmptyParts);
     for (const QString &r : relParts)
     {
         if (r == ".")  continue;
@@ -493,8 +493,12 @@ bool MainWindow::loadEpub(const QByteArray &data)
 
     const QList<QMap<QString, QString>> rootfiles = findTagsLimited(
         QString::fromUtf8(m_entries.value(containerKey)), QStringLiteral("rootfile"), 4096, nullptr);
-QString opfRel;
-if (!rootfiles.isEmpty()) opfRel = rootfiles.first().value(QStringLiteral("full-path"));
+    QString opfRel;
+    for (const QMap<QString, QString> &rf : rootfiles)
+    {
+        const QString candidate = rf.value(QStringLiteral("full-path"));
+        if (!candidate.isEmpty()) { opfRel = candidate; break; }
+    }
     if (opfRel.isEmpty()) return false;
 
     QString opfKey = opfRel;
@@ -856,8 +860,8 @@ void MainWindow::showMessage(const QString &msg)
 }
 
 // ---------- 缩放 / 翻章 ----------
-void MainWindow::on_actionZoomIn_triggered()  { m_zoomSteps++; m_browser->zoomIn(1); }
-void MainWindow::on_actionZoomOut_triggered() { m_zoomSteps--; m_browser->zoomOut(1); }
+void MainWindow::on_actionZoomIn_triggered()  { if (m_zoomSteps >= 20) return; m_zoomSteps++; m_browser->zoomIn(1); }
+void MainWindow::on_actionZoomOut_triggered() { if (m_zoomSteps <= -20) return; m_zoomSteps--; m_browser->zoomOut(1); }
 void MainWindow::on_actionPrevChapter_triggered()
 {
     if (m_curChapter > 0) loadChapter(m_curChapter - 1);
