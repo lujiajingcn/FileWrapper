@@ -28,7 +28,7 @@ public:
 
     // 先解析到临时结构，全部校验成功后才替换内存状态与句柄；
     // 失败时保留原有归档、视图数据与脏标记不变（P1-6）
-    void QLoadMergedFile(QString sFilePath);
+    bool QLoadMergedFile(QString sFilePath);
     void unLoadMergedFile();
     void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
 

@@ -406,7 +406,7 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
 // 加载 / 卸载 / 状态重置（P1-5 / P1-6）
 // ============================================================
 
-void FileManager::QLoadMergedFile(QString sFilePath)
+bool FileManager::QLoadMergedFile(QString sFilePath)
 {
     // 先在临时结构上做完整解析；任何失败都保持原归档、原视图、原脏状态不变
     FwArc::Meta meta;
@@ -414,16 +414,40 @@ void FileManager::QLoadMergedFile(QString sFilePath)
     if (!parseFile(sFilePath, meta, err))
     {
         setError(QStringLiteral("加载失败: %1").arg(err));
-        return;
+        return false;
+    }
+    // 没有条目的归档对查看器没有意义；必须在切换句柄/清空旧状态之前拒绝，
+    // 否则会出现"提示原有归档保持不变，实际旧内容已被清空"的矛盾状态。
+    if (meta.entries.isEmpty())
+    {
+        setError(QStringLiteral("归档中没有可显示的条目: %1").arg(sFilePath));
+        return false;
+    }
+    // 先确认新文件能打开，避免先关旧句柄后失败导致"原归档打不开也不见了"
+    {
+        QFile probe(sFilePath);
+        if (!probe.open(QIODevice::ReadOnly))
+        {
+            setError(QStringLiteral("打开归档失败: %1 (%2)").arg(sFilePath, probe.errorString()));
+            return false;
+        }
     }
 
     // 解析成功后才切换句柄与内存状态
+    const QString sOldPath = m_qFile.fileName();
+    const bool bOldWasOpen = m_qFile.isOpen();
     if (m_qFile.isOpen()) m_qFile.close();
     m_qFile.setFileName(sFilePath);
     if (!m_qFile.open(QIODevice::ReadOnly))
     {
+        // 回滚到旧句柄，保持"旧归档仍可浏览"的承诺
+        if (bOldWasOpen && !sOldPath.isEmpty())
+        {
+            m_qFile.setFileName(sOldPath);
+            m_qFile.open(QIODevice::ReadOnly);
+        }
         setError(QStringLiteral("打开归档失败: %1 (%2)").arg(sFilePath, m_qFile.errorString()));
-        return;
+        return false;
     }
 
     m_vtFileInfos.clear();
@@ -447,6 +471,7 @@ void FileManager::QLoadMergedFile(QString sFilePath)
     m_bDirty            = false;
     m_bCancelRequested  = false;
     m_sLastError.clear();
+    return true;
 }
 
 void FileManager::unLoadMergedFile()

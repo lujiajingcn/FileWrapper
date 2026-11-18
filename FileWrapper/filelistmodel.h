@@ -22,7 +22,8 @@ public:
     enum ItemRole
     {
         BytesRole = Qt::UserRole,       // 文件：自身字节数；目录：子树合计字节
-        IsDirRole = Qt::UserRole + 1,   // true 表示目录节点
+        InfoRole = Qt::UserRole + 1,    // FILEINFO（显式；Qt 的 data()/setData() 默认角色就是它）
+        IsDirRole = Qt::UserRole + 2,   // true 表示目录节点
     };
 
     explicit FileListModel(QObject *parent = nullptr) : QStandardItemModel(parent) {}

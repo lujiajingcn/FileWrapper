@@ -49,6 +49,9 @@
 #include <QHeaderView>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QLineEdit>
+#include <QRadioButton>
+#include "dlgoutputfile.h"
 #include <QShortcut>
 #include <QStandardItemModel>
 #include <QItemSelectionModel>
@@ -1389,9 +1392,11 @@ static void verifyPluginToggleAndReload()
     const bool bRecorded = !pm->failureFor(sBadDll).isEmpty();
     PluginManager::setPluginEnabled(QStringLiteral("ZZDisabled"), false);
     const int nRetried = pm->retryFailedPlugins();
-    const bool bStillFailed = !pm->failureFor(sBadDll).isEmpty();
-    report(bRecorded && nRetried == 0 && !bStillFailed,
-           QStringLiteral("X6: disabled plugin not resurrected by retry (recorded=%1 retried=%2)")
+    // M-10：禁用项不再重试，但仍保留一条"已禁用（未重试）"记录，
+    // 避免诊断里既不是失败也不是禁用；关键是不能被重新加载。
+    const bool bStillRecorded = !pm->failureFor(sBadDll).isEmpty();
+    report(bRecorded && nRetried == 0 && bStillRecorded,
+           QStringLiteral("X6: disabled plugin not resurrected but failure record kept (recorded=%1 retried=%2)")
                .arg(bRecorded).arg(nRetried));
 
     // 收尾：恢复启用、清掉测试文件
@@ -1693,6 +1698,166 @@ static void verifyMergeDialog()
     report(bExpansionKept,
            QStringLiteral("H11: header-click sort keeps expanded directories expanded"));
 
+    // H12: FILEINFO 用显式 InfoRole，目录不再污染 data() 默认角色（M-01 回归）
+    bool bRoleSeparation = false;
+    if (bMerged)
+    {
+        ProbeTreeWindow mwRole;
+        QMetaObject::invokeMethod(&mwRole, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwRole.loadArchiveFile(sTreeArc);
+        auto *pRoleView = mwRole.findChild<QTreeView *>();
+        auto *pRoleModel = pRoleView ? qobject_cast<QStandardItemModel *>(pRoleView->model())
+                                     : nullptr;
+        QStandardItem *pRoleRoot = pRoleModel ? pRoleModel->item(0, 0) : nullptr;
+        QStandardItem *pRoleFile = nullptr;
+        if (pRoleRoot)
+        {
+            for (int r = 0; r < pRoleRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pRoleRoot->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("top.txt")))
+                    pRoleFile = pChild;
+            }
+        }
+        bRoleSeparation = pRoleRoot != nullptr
+                          && !pRoleRoot->data(FileListModel::InfoRole).isValid()
+                          && pRoleRoot->data(FileListModel::IsDirRole).toBool()
+                          && pRoleFile != nullptr
+                          && pRoleFile->data(FileListModel::InfoRole).isValid()
+                          && pRoleFile->data(FileListModel::InfoRole).value<FILEINFO>().sFileName
+                                 == QStringLiteral("top.txt")
+                          && !pRoleFile->data(FileListModel::IsDirRole).toBool();
+    }
+    report(bRoleSeparation,
+           QStringLiteral("H12: FILEINFO uses InfoRole; dir role no longer aliases default data() role"));
+
+    // H13: 单链目录压缩后不得残留空壳行（M-02 回归）
+    const QString sChainDir = QDir::tempPath() + QStringLiteral("/fw_chain_test");
+    QDir(sChainDir).removeRecursively();
+    QDir().mkpath(sChainDir + QStringLiteral("/sub/deep"));
+    const bool bChainFiles = writeBytes(sChainDir + QStringLiteral("/sub/deep/only.txt"), 100)
+                             && writeBytes(sChainDir + QStringLiteral("/top.txt"), 200);
+    const QString sChainArc = sChainDir + QStringLiteral("/chain.dat");
+    FileManager fmChain;
+    if (bChainFiles)
+        fmChain.QMergeFiles(QVector<QString>{ sChainDir + QStringLiteral("/sub/deep/only.txt"),
+                                             sChainDir + QStringLiteral("/top.txt") },
+                            sChainArc);
+    bool bNoGhost = false;
+    if (bChainFiles && QFileInfo::exists(sChainArc))
+    {
+        ProbeTreeWindow mwChain;
+        QMetaObject::invokeMethod(&mwChain, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwChain.loadArchiveFile(sChainArc);
+        auto *pChainView = mwChain.findChild<QTreeView *>();
+        auto *pChainModel = pChainView ? qobject_cast<QStandardItemModel *>(pChainView->model())
+                                       : nullptr;
+        QStandardItem *pChainRoot = pChainModel ? pChainModel->item(0, 0) : nullptr;
+        QStandardItem *pChainDir = nullptr;
+        if (pChainRoot)
+        {
+            for (int r = 0; r < pChainRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pChainRoot->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("sub/deep")))
+                    pChainDir = pChild;
+            }
+        }
+        // 期望：root 下只有 [sub/deep 目录, top.txt]；sub/deep 下只有 [only.txt]，没有空 "deep" 壳
+        bNoGhost = pChainRoot != nullptr && pChainRoot->rowCount() == 2
+                   && pChainDir != nullptr && pChainDir->rowCount() == 1
+                   && pChainDir->child(0, 0) != nullptr
+                   && pChainDir->child(0, 0)->text().endsWith(QStringLiteral("only.txt"));
+    }
+    report(bNoGhost,
+           QStringLiteral("H13: single-chain dir compaction leaves no empty ghost row"));
+
+    // H14: 树形刷新（筛选变化）后已展开目录保持展开（M-05 回归）
+    bool bRefreshKeepsExpansion = false;
+    if (bMerged)
+    {
+        ProbeTreeWindow mwRefresh;
+        QMetaObject::invokeMethod(&mwRefresh, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwRefresh.loadArchiveFile(sTreeArc);
+        mwRefresh.show();
+        QApplication::processEvents();
+        auto *pRefreshView = mwRefresh.findChild<QTreeView *>();
+        auto *pRefreshModel = pRefreshView ? qobject_cast<QStandardItemModel *>(pRefreshView->model())
+                                           : nullptr;
+        auto *pFilterEdit = mwRefresh.findChild<QLineEdit *>(QStringLiteral("leFilter"));
+        QStandardItem *pRefreshRoot = pRefreshModel ? pRefreshModel->item(0, 0) : nullptr;
+        QStandardItem *pRefreshSub = nullptr;
+        if (pRefreshRoot)
+        {
+            for (int r = 0; r < pRefreshRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pRefreshRoot->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("sub")))
+                    pRefreshSub = pChild;
+            }
+        }
+        if (pRefreshSub && pFilterEdit)
+        {
+            pRefreshView->expand(pRefreshModel->indexFromItem(pRefreshSub));
+            QApplication::processEvents();
+            pFilterEdit->setText(QStringLiteral("fw_tree_sort_test"));   // 匹配全部条目，保持层级
+            QApplication::processEvents();
+            // 筛选会重建模型：必须从新模型重新取根，旧指针已失效
+            QStandardItem *pRefreshRootAfter = pRefreshModel->item(0, 0);
+            QStandardItem *pRefreshSubAfter = nullptr;
+            if (pRefreshRootAfter)
+            {
+                for (int r = 0; r < pRefreshRootAfter->rowCount(); ++r)
+                {
+                    QStandardItem *pChild = pRefreshRootAfter->child(r, 0);
+                    if (pChild && pChild->text().endsWith(QStringLiteral("sub")))
+                        pRefreshSubAfter = pChild;
+                }
+            }
+            bRefreshKeepsExpansion = pRefreshSubAfter != nullptr
+                && pRefreshView->isExpanded(pRefreshModel->indexFromItem(pRefreshSubAfter));
+            pFilterEdit->clear();
+            QApplication::processEvents();
+        }
+    }
+    report(bRefreshKeepsExpansion,
+           QStringLiteral("H14: tree refresh keeps expanded dirs expanded"));
+
+    // H15: 导出对话框——切回"原路径导出"清空旧目录；选择目录模式正常返回
+    bool bOutputDialog = false;
+    {
+        DlgOutputFile dlgOld;
+        auto *pEdit = dlgOld.findChild<QLineEdit *>(QStringLiteral("leOutputFileDir"));
+        auto *pOld = dlgOld.findChild<QRadioButton *>(QStringLiteral("rbOldPath"));
+        auto *pOk = dlgOld.findChild<QPushButton *>(QStringLiteral("btnOk"));
+        if (pEdit && pOld && pOk)
+        {
+            pEdit->setText(QStringLiteral("D:/tmp/export"));
+            pOld->click();     // 切回原路径：应清空文本框
+            pOk->click();      // 确定：输出目录必须为空
+            bOutputDialog = pEdit->text().isEmpty() && dlgOld.getOutputDir().isEmpty();
+        }
+        DlgOutputFile dlgSel;
+        auto *pEdit2 = dlgSel.findChild<QLineEdit *>(QStringLiteral("leOutputFileDir"));
+        auto *pSel = dlgSel.findChild<QRadioButton *>(QStringLiteral("rbSelectDir"));
+        auto *pOk2 = dlgSel.findChild<QPushButton *>(QStringLiteral("btnOk"));
+        if (pEdit2 && pSel && pOk2)
+        {
+            pSel->click();
+            pEdit2->setText(QStringLiteral("D:/tmp/export"));
+            pOk2->click();
+            bOutputDialog = bOutputDialog
+                            && dlgSel.getOutputDir() == QStringLiteral("D:/tmp/export");
+        }
+        else
+        {
+            bOutputDialog = false;
+        }
+    }
+    report(bOutputDialog,
+           QStringLiteral("H15: output dialog clears stale dir on old-path and returns selected dir"));
+
+    QDir(sChainDir).removeRecursively();
 }
 
 // ---------------------------------------------------------------------------

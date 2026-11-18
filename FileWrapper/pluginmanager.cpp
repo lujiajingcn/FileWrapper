@@ -508,10 +508,12 @@ int PluginManager::retryFailedPlugins()
         if (m_mapPluginInterface.contains(f.path))
             continue;                       // 期间已经成功过
 
-        // 用户可能已经把它禁用了：禁用不是"失败"，重试也不应该把它加载回来
+        // 用户可能已经把它禁用了：禁用不是"失败"，重试也不应该把它加载回来，
+        // 但必须保留一条记录，否则诊断里该插件既不是"加载失败"也不是"已禁用"。
         if (!isPluginEnabled(pluginIdFromPath(f.path)))
         {
             qDebug() << "[Plugin] Skip retry (disabled):" << f.path;
+            listStillFailed.append(Failure{ f.path, QStringLiteral("已禁用（未重试）") });
             continue;
         }
 

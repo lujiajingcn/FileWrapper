@@ -147,6 +147,12 @@ void DlgPluginMap::reloadTable()
         m_table->setItem(i, 1, new QTableWidgetItem(mappingFor(exts.at(i))));
     }
     m_table->resizeColumnToContents(0);
+
+    // 重建表格后旧的 currentRow 可能指向"移位后的另一条"，输入框也残留已删后缀；
+    // 统一清空选择与输入，避免再次删除/添加时操作到错误映射。
+    m_table->clearSelection();
+    m_table->setCurrentIndex(QModelIndex());
+    m_ext->clear();
 }
 
 void DlgPluginMap::onAdd()

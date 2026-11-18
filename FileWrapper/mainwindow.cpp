@@ -52,7 +52,7 @@ static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
 {
-    return pItem != nullptr && pItem->data().isValid();
+    return pItem != nullptr && pItem->data(FileListModel::InfoRole).isValid();
 }
 
 // 路径归一化：统一分隔符为 '/'，去掉结尾多余的 '/'（保留盘符根如 "E:/"）
@@ -115,8 +115,8 @@ static void compactSingleChainDirs(QStandardItem *pDir)
     while (pDir->rowCount() == 1)
     {
         QStandardItem *pOnly = pDir->child(0);
-        if (isFileLeafItem(pOnly))
-            break;   // 唯一子节点是文件，链条到底
+        if (pOnly == nullptr || pOnly->rowCount() == 0 || isFileLeafItem(pOnly))
+            break;   // 文件/空目录：链条到底（空目录必须 break，否则内层 while 不收敛会死循环）
 
         pDir->setText(pDir->text() + "/" + pOnly->text());
         pDir->setToolTip(pDir->text());
@@ -127,6 +127,7 @@ static void compactSingleChainDirs(QStandardItem *pDir)
             QList<QStandardItem*> kids = pOnly->takeRow(0);
             pDir->appendRow(kids);
         }
+        pDir->removeRow(0);   // 删掉已空的子目录壳，避免残留幽灵行
     }
 }
 
@@ -238,7 +239,12 @@ MainWindow::~MainWindow()
     cleanupTempFiles();
 
     if (m_tvFilePath)
+    {
         m_tvFilePath->viewport()->removeEventFilter(this);
+        // 排序恢复的过滤器装在表头 viewport 上，析构时一并移除
+        if (QHeaderView *pHeader = m_tvFilePath->header())
+            pHeader->viewport()->removeEventFilter(this);
+    }
     delete m_fileManager;
     delete m_hModelFilePath;
     m_hModelFilePath = nullptr;
@@ -279,7 +285,7 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    m_tvFilePath->setSortingEnabled(false);
+    m_tvFilePath->setSortingEnabled(true);   // 平铺/树形都允许列排序；树形为同级排序
     // 表头的鼠标事件是发到 header 的 viewport 上的，过滤器必须装在 viewport 上，
     // 否则收不到按下列头的事件，排序后无法恢复展开状态。
     m_tvFilePath->header()->viewport()->installEventFilter(this);
@@ -312,6 +318,7 @@ void MainWindow::initWidgetFilePath()
 
     // 筛选框：按路径/文件名过滤列表（树形与平铺模式都生效）
     m_leFilter = new QLineEdit(m_tbFilePath);
+    m_leFilter->setObjectName(QStringLiteral("leFilter"));
     m_leFilter->setPlaceholderText(tr("筛选文件名/路径…"));
     m_leFilter->setClearButtonEnabled(true);
     m_leFilter->setMaximumWidth(200);
@@ -992,11 +999,15 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     ui->tabWidget->removeTab(cur);
 
     QWidget *pOldOwned = nullptr;
+    // 先摘下旧实例的归档映射（不能等到 delete 之后再用悬空指针作哈希键）
+    MappedInput *pOldMapped = doc.interface != nullptr
+                                  ? m_mapMappedInputs.take(doc.interface) : nullptr;
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOldOwned = doc.interface->getPluginWidget();
         delete doc.interface;
     }
+    delete pOldMapped;   // 实例销毁（解码线程已停）后再释放映射
     if (pOldPage != nullptr && pOldPage != pOldOwned && !m_setPluginWidgets.contains(pOldPage))
         delete pOldPage;
 
@@ -1031,15 +1042,15 @@ void MainWindow::destroyTabAt(int index)
 
     // 独占实例：delete 会连带 delete 其内部窗口（即该页面）
     QWidget *pOwnedWidget = nullptr;
+    // 先摘下映射，delete 后不能再拿悬空指针当 QHash 的键
+    MappedInput *pMapped = doc.interface != nullptr
+                               ? m_mapMappedInputs.take(doc.interface) : nullptr;
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOwnedWidget = doc.interface->getPluginWidget();
         delete doc.interface;
     }
-
-    // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
-    if (doc.interface != nullptr)
-        releaseMappedInput(doc.interface);
+    delete pMapped;   // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
 
     // 其余需要删除的页面：自建占位页（不是插件窗口、也不是已随实例销毁的窗口）
     if (pPage != nullptr && pPage != pOwnedWidget && !m_setPluginWidgets.contains(pPage))
@@ -1374,6 +1385,8 @@ void MainWindow::onTreeViewCustomContextMenu(const QPoint &pos)
     if (!m_fileManager->isArchiveLoaded())
         return;
 
+    // 右键可能落在"大小/类型"列：统一取同一行的第 0 列业务项
+    index = index.siblingAtColumn(0);
     QStandardItem *item = m_hModelFilePath->itemFromIndex(index);
     if (!item)
         return;
@@ -1382,7 +1395,7 @@ void MainWindow::onTreeViewCustomContextMenu(const QPoint &pos)
     if (!isFileLeafItem(item))
         return;
 
-    FILEINFO info = item->data().value<FILEINFO>();
+    FILEINFO info = item->data(FileListModel::InfoRole).value<FILEINFO>();
 
     QMenu menu(this);
     QAction *actOpen = menu.addAction("打开");
@@ -1413,16 +1426,18 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
     if (!index.isValid())
         return;
 
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(index);
+    // 双击可能落在"大小/类型"列：统一按第 0 列的业务项判断/取 FILEINFO
+    const QModelIndex itemIndex = index.siblingAtColumn(0);
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(itemIndex);
     // 目录节点：双击仅做展开 / 折叠，不打开文件
     if (!isFileLeafItem(pItem))
     {
-        m_tvFilePath->setExpanded(index, !m_tvFilePath->isExpanded(index));
+        m_tvFilePath->setExpanded(itemIndex, !m_tvFilePath->isExpanded(itemIndex));
         return;
     }
 
     // 双击：在当前激活的标签页打开选中的记录项文件
-    FILEINFO fInfo = pItem->data().value<FILEINFO>();
+    FILEINFO fInfo = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
     openFileInCurrentTab(fInfo);
 }
 
@@ -1555,12 +1570,18 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
         return;
     }
 
-    m_fileManager->QLoadMergedFile(sFileName);
-    if (!m_fileManager->isArchiveLoaded() || m_fileManager->getFileInfos().isEmpty())
+    if (!m_fileManager->QLoadMergedFile(sFileName))
     {
         QMessageBox::critical(this, QStringLiteral("加载失败"),
             QStringLiteral("归档解析失败，原有归档保持不变。\n%1")
                .arg(m_fileManager->lastError()));
+        syncActionStates();
+        return;
+    }
+    if (m_fileManager->getFileInfos().isEmpty())
+    {
+        QMessageBox::critical(this, QStringLiteral("加载失败"),
+            QStringLiteral("归档中没有可显示的条目，原有归档保持不变。"));
         syncActionStates();
         return;
     }
@@ -1843,11 +1864,12 @@ void MainWindow::populateFilePathView(bool bShowPath)
     // 两种模式都支持点列头排序：
     //   * 平铺：全局排序；
     //   * 树形：同级排序、目录优先（FileListModel 实现），不会把层级拍平。
-    m_tvFilePath->setSortingEnabled(true);
-
+    // 排序在初始化时就已启用，这里不再反复 setSortingEnabled(true)：
+    // Qt 每次调用都会立即 sort 当前模型，若发生在捕获展开状态之前，会把
+    // 已展开目录折叠后又被当成"本来就没展开"。
     if (m_bTreeMode)
     {
-        populateFilePathTree();   // 内部完成排序并恢复展开状态
+        populateFilePathTree();   // 内部捕获展开状态 -> 重建/排序 -> 恢复
     }
     else
     {
@@ -1884,7 +1906,7 @@ void MainWindow::populateFilePathList(bool bShowPath)
         hItemName->setToolTip(normalizePath(info.sFilePath));
         QVariant var;
         var.setValue(info);
-        hItemName->setData(var);
+        hItemName->setData(var, FileListModel::InfoRole);
         QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
@@ -2024,7 +2046,7 @@ void MainWindow::populateFilePathTree()
         hFile->setToolTip(normalizePath(info.sFilePath));
         QVariant var;
         var.setValue(info);
-        hFile->setData(var);
+        hFile->setData(var, FileListModel::InfoRole);
         QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
@@ -2332,15 +2354,16 @@ void MainWindow::onActionDelFileTriggered()
         return;
     }
 
-    // 树形模式下目录节点不可删除，需选中具体文件
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(m_tvFilePath->currentIndex());
+    // 树形模式下目录节点不可删除，需选中具体文件；列可能不是第 0 列
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(
+        m_tvFilePath->currentIndex().siblingAtColumn(0));
     if (!isFileLeafItem(pItem))
     {
         QMessageBox::information(this, tr("删除文件"),
                                  tr("请先在列表中选择要删除的文件（目录节点不可删除）。"));
         return;
     }
-    FILEINFO fileInfo = pItem->data().value<FILEINFO>();
+    FILEINFO fileInfo = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
 
     QApplication::setOverrideCursor(Qt::WaitCursor);
     bool bOk = m_fileManager->deleteFile(fileInfo.sFilePath);
@@ -2359,14 +2382,16 @@ void MainWindow::onActionDelFileTriggered()
 
 void MainWindow::onActionOutputFileTriggered()
 {
-    // 树形模式下目录节点不可导出，需选中具体文件
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(m_tvFilePath->currentIndex());    if (!isFileLeafItem(pItem))
+    // 树形模式下目录节点不可导出，需选中具体文件；列可能不是第 0 列
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(
+        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    if (!isFileLeafItem(pItem))
     {
         QMessageBox::information(this, tr("导出文件"),
                                  tr("请先在列表中选择要导出的文件（目录节点不可导出）。"));
         return;
     }
-    FILEINFO fileInfo = pItem->data().value<FILEINFO>();
+    FILEINFO fileInfo = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
 
     DlgOutputFile dlgOutputFile(this);
     if(dlgOutputFile.exec() == QDialog::Accepted)
