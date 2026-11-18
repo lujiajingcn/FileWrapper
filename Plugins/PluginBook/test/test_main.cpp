@@ -11,7 +11,7 @@
 #include <QDir>
 #include <QFileInfo>
 
-#include <QtGui/private/qzipwriter_p.h>
+#include <QtCore/private/qzipwriter_p.h>
 
 #include "mainwindow.h"
 

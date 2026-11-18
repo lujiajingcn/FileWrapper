@@ -22,17 +22,24 @@ CFLAGS  = -O2 -Wall -I src \
 SRCS = src/buffer.c src/compression.c src/debug.c src/index.c src/memory.c \
        src/meta.c src/parse_rawml.c src/read.c src/structure.c src/util.c \
        src/write.c src/opf.c src/xmlwriter.c src/miniz.c
-OBJS = $(SRCS:.c=.o)
-LIB  = libmobi.a
+
+# 每个构建目录用自己的 OBJDIR/LIBDIR，避免 PluginBook 与 PluginBookTest
+# 并行构建时同时写源码树里的同名 .o / libmobi.a（会生成损坏静态库）。
+OBJDIR ?= src
+LIBDIR ?= .
+OBJS = $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRCS))
+LIB  = $(LIBDIR)/libmobi.a
 
 .PHONY: all clean
 
 all: $(LIB)
 
 $(LIB): $(OBJS)
+	@if not exist "$(LIBDIR)" mkdir "$(LIBDIR)"
 	$(AR) rcs $(LIB) $(OBJS)
 
-%.o: %.c
+$(OBJDIR)/%.o: src/%.c
+	@if not exist "$(OBJDIR)" mkdir "$(OBJDIR)"
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

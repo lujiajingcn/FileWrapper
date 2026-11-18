@@ -43,7 +43,7 @@
 ## 前置条件
 
 - Windows + Qt（本工程套件：`Qt 6.9.3 / mingw_64` + `Tools/mingw1310_64`）
-- 可选：Python + `python-docx` + `Pillow`，仅在**重新生成素材**时需要（素材已入库）
+- 可选：Python + `python-docx` + `Pillow` + `openpyxl` + `python-pptx`，仅在**重新生成素材**时需要（素材已入库；脚本会先预检全部依赖）
 
 ## 一键运行
 
@@ -121,7 +121,7 @@ copy ..\..\..\build\Desktop_Qt_6_9_3_MinGW_64_bit_Debug\FileWrapper\debug\plugin
     卸载其一会让插件侧遗留对象的虚表悬空 → 退出期崩溃，V 组踩过）。
 - **改插件接口**：记得 `PLUGIN_API_VERSION +1`（见 `include/plugininterface.h`），
   并同步所有插件 JSON 的 `"apiVersion"`；版本门禁用例 `W8` 会继续守住"旧插件被拒"。
-  **当前接口版本 = 3**（C2 引入 `sendFile(const PluginFile &)`）。
+  **当前接口版本 = 4**（v3 引入 `sendFile(const PluginFile &)`；v4 增加 `sendFileMapped()` 归档内存映射零拷贝通道）。
 - **新插件想吃"零拷贝"通道**：在 `showFile()` 里直接用 `file.memory()`；
   基类的 `sendFile()` 已经把空值/路径/旧通道都适配好了。
 

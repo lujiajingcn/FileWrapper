@@ -87,6 +87,7 @@
 
 static int g_pass = 0;
 static int g_fail = 0;
+static int g_skipped = 0;   // 环境变量显式跳过的断言组（仍需在汇总中可见）
 static QStringList g_log;
 
 static void out(const QString &line)
@@ -912,7 +913,13 @@ static void verifyOtherViewers(const QString &work)
     // 调试开关：FW_VIEWER_ONLY=V1/V2/V3 时只跑其中一组（定位退出期崩溃用）
     const QString sOnly = qEnvironmentVariable("FW_VIEWER_ONLY");
     auto want = [&sOnly](const char *id) {
-        return sOnly.isEmpty() || sOnly == QLatin1String(id);
+        const bool bWanted = sOnly.isEmpty() || sOnly == QLatin1String(id);
+        if (!bWanted)
+        {
+            ++g_skipped;
+            note(QStringLiteral("[SKIP] %1 skipped by FW_VIEWER_ONLY").arg(QLatin1String(id)));
+        }
+        return bWanted;
     };
 
     // 从**本程序自己的 plugins/ 目录**加载（也就是 PluginManager 用的那一份）。
@@ -2054,6 +2061,11 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
                    && !fm5.isCancelRequested(),
                QStringLiteral("K3: duplicate stored paths reject save (%1)").arg(sErr3));
     }
+    else
+    {
+        // 缺素材时不能把整条断言静默吞掉（否则退出码仍可能为 0）
+        report(false, QStringLiteral("K3: missing fixture dup_paths.dat"));
+    }
 
     // K5: 取消标志复位：上一次"取消"不应让后续导出/大文件打开立刻失败
     if (FileManager::inspectArchive(sCross, crossMeta, err1))
@@ -2251,6 +2263,11 @@ int main(int argc, char **argv)
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDir.path());
         note(QStringLiteral("settings isolated to: ") + settingsDir.path());
     }
+    else
+    {
+        // 隔离失败会让测试写进用户真实配置：必须显式失败，不能静默继续
+        report(false, QStringLiteral("settings isolation failed (QTemporaryDir invalid)"));
+    }
 
     const QString work = (argc > 1) ? QString::fromLocal8Bit(argv[1])
                                     : QDir::currentPath() + QStringLiteral("/fixtures");
@@ -2344,7 +2361,12 @@ int main(int argc, char **argv)
     if (!buf) return 1;
 
     // ---------- W5/W6: 真实插件 DLL ----------
-    QPluginLoader loader(plug + QStringLiteral("/PluginWord.dll"));
+    // 必须从 <exe>/plugins 加载（与 PluginManager、V 组同一路径），
+    // 不要用 -plugins 参数指向的构建目录副本：Windows 会当成两个模块双映射，
+    // 正是项目已记录的退出期虚表悬空崩溃模式。
+    const QString sRuntimePlugins =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
+    QPluginLoader loader(sRuntimePlugins + QStringLiteral("/PluginWord.dll"));
     QObject *plugin = loader.instance();
     report(plugin != nullptr,
            QStringLiteral("W13: load PluginWord.dll%1")
@@ -2388,7 +2410,14 @@ int main(int argc, char **argv)
 
     // ---------- V: 其余查看器渲染冒烟 ----------
     if (qEnvironmentVariableIsEmpty("FW_SKIP_VIEWER_SMOKE"))
+    {
         verifyOtherViewers(work);
+    }
+    else
+    {
+        ++g_skipped;
+        note(QStringLiteral("[SKIP] whole V group skipped by FW_SKIP_VIEWER_SMOKE"));
+    }
 
     // ---------- Z: 格式识别（后缀不可靠时的兜底） ----------
     verifyFormatResolver();
@@ -2441,7 +2470,7 @@ int main(int argc, char **argv)
 
     // ---------- 汇总 ----------
     out(QStringLiteral("---------------------------------------------"));
-    out(QStringLiteral("RESULT: %1 PASS, %2 FAIL").arg(g_pass).arg(g_fail));
+    out(QStringLiteral("RESULT: %1 PASS, %2 FAIL, %3 SKIP").arg(g_pass).arg(g_fail).arg(g_skipped));
 
     QFile logFile(logPath);
     if (logFile.open(QIODevice::WriteOnly | QIODevice::Truncate))

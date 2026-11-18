@@ -57,7 +57,7 @@ DESTDIR = $$PLUGIN_OUT_DIR
 !isEmpty(PLUGIN_METADATA_JSON) {
     PLUGIN_SIDECAR_DST = $$shell_path($$PLUGIN_OUT_DIR/$${TARGET}.json)
     PLUGIN_SIDECAR_SRC = $$shell_path($$PLUGIN_METADATA_JSON)
-    QMAKE_POST_LINK = $$QMAKE_COPY \"$$PLUGIN_SIDECAR_SRC\" \"$$PLUGIN_SIDECAR_DST\" || echo sidecar-copy-skipped
+    QMAKE_POST_LINK = $$QMAKE_COPY \"$$PLUGIN_SIDECAR_SRC\" \"$$PLUGIN_SIDECAR_DST\"
 
     # ---- 让元数据 JSON 成为真正的构建输入 ----
     # Q_PLUGIN_METADATA(IID ... FILE ...) 的内容是 **moc 在生成 moc_xxx.cpp 时读取并内嵌** 的，
@@ -75,7 +75,7 @@ DESTDIR = $$PLUGIN_OUT_DIR
         # 反引号/`^|` 转义在双引号参数里会被原样传给 PowerShell 而报错。
         meta_stamp.target   = $$PLUGIN_META_STAMP
         meta_stamp.depends  = $$PLUGIN_METADATA_JSON
-        meta_stamp.commands = $$QMAKE_COPY /b \"$$PLUGIN_HDR\"+,, \"$$PLUGIN_HDR\" >nul 2>&1 || echo touch-skip$$escape_expand(\\n\\t) echo.> \"$$PLUGIN_STAMP\"
+        meta_stamp.commands = $$QMAKE_COPY /b \"$$PLUGIN_HDR\"+,, \"$$PLUGIN_HDR\" >nul 2>&1$$escape_expand(\\n\\t) echo.> \"$$PLUGIN_STAMP\"
         QMAKE_EXTRA_TARGETS += meta_stamp
         PRE_TARGETDEPS      += $$PLUGIN_META_STAMP
     }

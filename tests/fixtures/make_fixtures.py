@@ -17,12 +17,13 @@
   sample.svg     简单矢量图（PluginPicture 的 SVG 解码冒烟素材）
   sample.webp    WebP 位图（PluginPicture 的 WebP 解码冒烟素材）
 
-依赖：python-docx、Pillow。素材已经入库，只有想改排版时才需要重新生成：
-  python tests/fixtures/make_fixtures.py
+依赖：python-docx、Pillow、openpyxl、python-pptx。素材已经入库，只有想改排版时才需要重新生成：
+  python tests/fixtures/make_fixtures.py [输出目录]
 """
 import io
 import os
 import struct
+import sys
 import zipfile
 import zlib
 
@@ -33,7 +34,9 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Inches, Pt, RGBColor
 from PIL import Image, ImageDraw
 
-WORK = os.path.dirname(os.path.abspath(__file__))
+WORK = (os.path.abspath(sys.argv[1]) if len(sys.argv) > 1
+        else os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(WORK, exist_ok=True)
 
 
 def make_png(path):
@@ -668,7 +671,20 @@ def make_broken_files():
     open(os.path.join(WORK, "empty.docx"), "wb").close()
 
 
+def _preflight_deps():
+    missing = []
+    for mod, name in (("docx", "python-docx"), ("PIL", "Pillow"),
+                      ("openpyxl", "openpyxl"), ("pptx", "python-pptx")):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(name)
+    if missing:
+        raise SystemExit("missing dependencies: " + ", ".join(missing) + "; pip install ...")
+
+
 if __name__ == "__main__":
+    _preflight_deps()
     make_png(os.path.join(WORK, "pic.png"))
     for fn in (make_basic, make_chinese):
         path = fn()

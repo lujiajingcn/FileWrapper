@@ -30,6 +30,8 @@
 //   2  增加 stopPlayback / hasBackgroundPlayback / createInstance /
 //      prefersFileByPath / sendFileByPath / setSourceName（C1/B1 时定版）
 //   3  C2：新增 sendFile(const PluginFile &)，统一"内存 / 路径"两种数据载体
+//   4  新增 sendFileMapped(char*, qint64, name)：归档内容区只读内存映射，
+//      媒体插件播放期间直接引用、零拷贝（见 PluginInterface::sendFileMapped）
 // ============================================================================
 #define PLUGIN_API_VERSION 4
 

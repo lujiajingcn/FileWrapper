@@ -96,8 +96,12 @@ foreach ($raw in (Get-Content -LiteralPath $Manifest -Encoding UTF8)) {
     }
 
     if (Test-Path -LiteralPath $srcPath) {
-        Copy-Item -LiteralPath $srcPath -Destination $dstPath -Force
-        $copied++
+        try {
+            Copy-Item -LiteralPath $srcPath -Destination $dstPath -Force
+            $copied++
+        } catch {
+            Fail ("cannot copy '" + $srcPath + "' -> '" + $dstPath + "' (target in use / access denied?): " + $_.Exception.Message)
+        }
     } else {
         Write-Host "[deploy][WARN] source missing, skipped: $srcPath"
         $warned++

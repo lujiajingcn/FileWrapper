@@ -13,12 +13,20 @@ TEMPLATE = app
 TARGET   = pluginbook_test
 
 INCLUDEPATH += $$PWD/..
+INCLUDEPATH += $$PWD/../../common
 INCLUDEPATH += $$PWD/../thirdparty/libmobi/src
+# test_main.cpp 用 Qt 私有 QZipWriter 造样本：Qt 6.9 里它在 QtCore/private，
+# qmake 的 private 模块未自动加入版本化私有头目录，这里显式补上。
+INCLUDEPATH += $$[QT_INSTALL_HEADERS]/QtCore/$$QT_VERSION
 DEFINES     += WITH_LIBMOBI
 
 SOURCES += \
     test_main.cpp \
+    $$PWD/../../common/zipreader.cpp \
     $$PWD/../mainwindow.cpp
+
+# zipreader.cpp 依赖 zlib（与 plugin_common.pri 的 PLUGIN_SHARED_SOURCES 一致）
+LIBS += -lz
 
 HEADERS += \
     $$PWD/../mainwindow.h
@@ -29,9 +37,11 @@ FORMS += \
 # libmobi 静态库：独立 Makefile 编出 libmobi.a，规避 qmake 把 miniz.c 误判为头文件
 # 依赖而丢弃 miniz.o 导致的 mz_uncompress 未定义链接错误。
 LIBMOBI_DIR = $$PWD/../thirdparty/libmobi
-LIBS        += -L$$LIBMOBI_DIR -lmobi
-libmobi.target   = $$LIBMOBI_DIR/libmobi.a
-libmobi.commands = $(MAKE) -C $$LIBMOBI_DIR -f Makefile.mingw
+LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj
+LIBMOBI_LIB = $$OUT_PWD/libmobi
+LIBS        += -L$$LIBMOBI_LIB -lmobi
+libmobi.target   = $$LIBMOBI_LIB/libmobi.a
+libmobi.commands = $(MAKE) -C $$LIBMOBI_DIR -f Makefile.mingw OBJDIR=$$shell_path($$LIBMOBI_OBJ) LIBDIR=$$shell_path($$LIBMOBI_LIB)
 libmobi.depends  = $$files($$LIBMOBI_DIR/src/*.c) $$files($$LIBMOBI_DIR/src/*.h) $$LIBMOBI_DIR/Makefile.mingw
-PRE_TARGETDEPS  += $$LIBMOBI_DIR/libmobi.a
+PRE_TARGETDEPS  += $$LIBMOBI_LIB/libmobi.a
 QMAKE_EXTRA_TARGETS += libmobi

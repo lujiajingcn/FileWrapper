@@ -119,7 +119,8 @@ try {
             if ($cmd) { $py = $cmd.Source }
         }
         if (-not $py) { throw "python not found; pass -Python <path to python.exe>" }
-        & $py (Join-Path $TestsDir 'fixtures\make_fixtures.py')
+        New-Item -ItemType Directory -Force -Path $FixturesDir | Out-Null
+        & $py (Join-Path $TestsDir 'fixtures\make_fixtures.py') $FixturesDir
         if ($LASTEXITCODE -ne 0) { throw "fixture generation failed" }
     }
     if (-not (Test-Path (Join-Path $FixturesDir 'basic.docx'))) {
@@ -153,6 +154,8 @@ try {
     $LogDir = Join-Path $BuildRoot 'logs'
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $LogPath = Join-Path $LogDir 'plugin_tests.log'
+    # 每次运行前清掉旧日志：测试崩溃/提前 return 时不能让上次的 RESULT 冒充本次结果
+    if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
     $ShotsDir = Join-Path $BuildRoot 'shots'
     if (-not $SkipShots) { New-Item -ItemType Directory -Force -Path $ShotsDir | Out-Null }
 
@@ -174,6 +177,8 @@ try {
         Select-String -Path $LogPath -Pattern '\[FAIL\]' | ForEach-Object { Write-Host ("   " + $_.Line) -ForegroundColor Red }
         Select-String -Path $LogPath -Pattern '^RESULT:' | ForEach-Object { Write-Host ("   " + $_.Line) -ForegroundColor Green }
         Write-Host "   log  : $LogPath"
+    } else {
+        Write-Host "   NO RESULT LOG (test crashed or exited early)" -ForegroundColor Red
     }
     if (-not $SkipShots) { Write-Host "   shots: $ShotsDir" }
     Write-Host "   exit : $rc"
