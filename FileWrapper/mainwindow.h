@@ -146,6 +146,25 @@ private:
 
     PluginInterface         *m_pCurrentInterface = nullptr;
 
+    // v4：归档内容区的只读内存映射（交给支持 mapped 通道的插件，播放期间保持有效）
+    struct MappedInput
+    {
+        QFile *pFile = nullptr;
+        uchar *pData = nullptr;
+        qint64 nLen = 0;
+        ~MappedInput()
+        {
+            if (pFile != nullptr)
+            {
+                if (pData != nullptr) pFile->unmap(pData);
+                delete pFile;
+            }
+        }
+    };
+    QHash<PluginInterface*, MappedInput*> m_mapMappedInputs;
+    void releaseMappedInput(PluginInterface *iface);
+    void releaseAllMappedInputs();
+
     QVector<TabDoc>          m_vTabDocs;
     QSet<QWidget*>           m_setPluginWidgets;
     // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗

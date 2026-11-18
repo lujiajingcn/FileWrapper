@@ -3,7 +3,7 @@
     "Version":"0.1.0",
     "Author" : "lujiajing",
     "Date":"2023-07-09",
-    "apiVersion":3,
+    "apiVersion":4,
     "extensionPriority":10,
     "extensions":[
         "txt", "log", "md", "markdown", "csv", "ini", "cfg", "conf",

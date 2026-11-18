@@ -233,6 +233,7 @@ MainWindow::~MainWindow()
     }
     for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
         destroyTabAt(i);
+    releaseAllMappedInputs();   // 兜底：释放不在标签页里的映射
     cleanupTempFiles();
 
     if (m_tvFilePath)
@@ -410,6 +411,7 @@ void MainWindow::closeAllTabs()
 
     // 旧归档的临时副本已无人使用，立即回收磁盘（避免反复加载大归档堆积 GB 级副本）
     discardTempCache();
+    releaseAllMappedInputs();
 
     m_pCurrentInterface = nullptr;
 
@@ -1032,6 +1034,10 @@ void MainWindow::destroyTabAt(int index)
         delete doc.interface;
     }
 
+    // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
+    if (doc.interface != nullptr)
+        releaseMappedInput(doc.interface);
+
     // 其余需要删除的页面：自建占位页（不是插件窗口、也不是已随实例销毁的窗口）
     if (pPage != nullptr && pPage != pOwnedWidget && !m_setPluginWidgets.contains(pPage))
         delete pPage;
@@ -1142,6 +1148,33 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     // —— P1-2：大文件优先走「临时文件 + 路径」通道，插件可自行流式打开 ——
     if (info.nFileLen >= kLargeFileThreshold && iface->prefersFileByPath())
     {
+        // v4：先尝试零拷贝内存映射（媒体插件支持）：直接把归档内容区映射为只读内存，
+        // FFmpeg 按需读页，不必先复制出一整份临时文件（1.59GB 视频不再"准备"1.59GB）。
+        // 注意：新增未保存的文件没有归档内偏移，不能映射。
+        if (!m_fileManager->archivePath().isEmpty()
+            && !m_fileManager->isPendingEntry(info.sFilePath))
+        {
+            auto *pArc = new QFile(m_fileManager->archivePath());
+            if (pArc->open(QIODevice::ReadOnly))
+            {
+                uchar *pMapped = pArc->map(info.nContentPositon, info.nFileLen);
+                if (pMapped != nullptr
+                    && iface->sendFileMapped(reinterpret_cast<char *>(pMapped),
+                                             info.nFileLen, info.sFileName))
+                {
+                    // 插件已接管并在播放期间引用该映射；旧映射可在新播放建立后释放
+                    MappedInput *pOld = m_mapMappedInputs.take(iface);
+                    m_mapMappedInputs.insert(iface, new MappedInput{pArc, pMapped, info.nFileLen});
+                    delete pOld;
+                    return;
+                }
+                if (pMapped != nullptr)
+                    pArc->unmap(pMapped);
+                pArc->close();
+            }
+            delete pArc;
+        }
+
         QString sTemp, sErr;
         bool bNoSpace = false;
         // 大文件抽取可能持续数秒：显示可取消的进度（复用 FileManager 的 progressChanged）
@@ -1163,7 +1196,11 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         if (bExtracted)
         {
             if (iface->sendFile(PluginFile::fromPath(sTemp, info.sFileName)))
+            {
+                // 新的播放已建立（旧后台播放已被插件停止）：释放旧映射
+                releaseMappedInput(iface);
                 return;
+            }
             // 插件拒绝该文件路径，回退到内存通道
         }
         else if (bNoSpace)
@@ -1172,12 +1209,14 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             // 直接给用户一个能照做的提示，并清掉内容区。
             QMessageBox::warning(this, QStringLiteral("打不开文件"), sErr);
             iface->sendFileData(nullptr, 0);
+            releaseMappedInput(iface);
             return;
         }
         else if (sErr.contains(tr("取消")))
         {
             // 用户取消：清空内容区并退出，不要退回内存通道把大文件读进内存
             iface->sendFileData(nullptr, 0);
+            releaseMappedInput(iface);
             syncActionStates();
             return;
         }
@@ -1201,10 +1240,26 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             sErr = QStringLiteral("文件为空（0 字节），没有可显示的内容");
         onFileManagerWarning(QStringLiteral("打开 %1 失败：%2").arg(info.sFileName, sErr));
         iface->sendFileData(nullptr, 0);
+        releaseMappedInput(iface);
         return;
     }
     // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放
     iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName));
+    // 新内容已生效：旧的内存映射不再被插件引用，可以释放（Windows 下不释放会阻止归档重写）
+    releaseMappedInput(iface);
+}
+
+void MainWindow::releaseMappedInput(PluginInterface *iface)
+{
+    if (iface == nullptr)
+        return;
+    delete m_mapMappedInputs.take(iface);
+}
+
+void MainWindow::releaseAllMappedInputs()
+{
+    qDeleteAll(m_mapMappedInputs);
+    m_mapMappedInputs.clear();
 }
 
 // 激活某个标签页：挂载该页独占的插件窗口，并按需渲染其文件
@@ -1426,6 +1481,12 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
 
     if (btn == QMessageBox::Save)
     {
+        // 保存会重写归档：先释放内存映射并停止播放（Windows 下映射中的文件不能改名）
+        if (!m_mapMappedInputs.isEmpty())
+        {
+            stopCurrentPlaybackAndInvalidate();
+            releaseAllMappedInputs();
+        }
         QApplication::setOverrideCursor(Qt::WaitCursor);
         bool bOk = m_fileManager->save();
         QApplication::restoreOverrideCursor();
@@ -2259,6 +2320,20 @@ void MainWindow::onActionSaveFileTriggered()
         QMessageBox::information(this, tr("保存文件"),
                                  tr("没有已加载的归档文件，无法保存。"));
         return;
+    }
+
+    // 有视频/音频正在直接读取归档（内存映射）时，保存需要先停止播放并释放映射：
+    // Windows 下正在映射的文件无法被改名/替换，不释放会直接导致保存失败。
+    if (!m_mapMappedInputs.isEmpty())
+    {
+        const auto btn = QMessageBox::question(this, tr("保存文件"),
+            tr("有视频/音频正在直接读取归档内容。保存需要先停止播放并释放该文件，\n"
+               "播放会中断（可重新双击打开）。是否继续保存？"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (btn != QMessageBox::Yes)
+            return;
+        stopCurrentPlaybackAndInvalidate();
+        releaseAllMappedInputs();
     }
 
     // —— 进度条：保存（重写归档）可能耗时，显示进度并支持取消 ——

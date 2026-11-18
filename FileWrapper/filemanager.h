@@ -51,6 +51,12 @@ public:
     // 当前已加载归档的完整路径（未加载时为空），供分割等对话框预填
     QString archivePath() const;
 
+    // 该条目是否来自"新增未保存"的文件（没有归档内偏移，不能按内容区映射）
+    bool isPendingEntry(const QString &sFilePath) const
+    {
+        return m_setPendingFiles.contains(sFilePath);
+    }
+
     void addFiles(const QVector<QString> &vtNewFiles);
     bool deleteFile(const QString &sFilePath);
     bool save();

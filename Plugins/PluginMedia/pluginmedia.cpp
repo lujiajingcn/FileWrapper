@@ -58,3 +58,11 @@ bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName
     // 临时文件在整个会话期间有效，FFmpeg 的后台解码线程可以持续按路径读取
     return m_wMainWindow->showVideoFile(path) >= 0;
 }
+
+bool PluginMedia::sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName)
+{
+    Q_UNUSED(displayName);
+    if (m_wMainWindow == nullptr || pData == nullptr || nFileLen <= 0)
+        return false;
+    return m_wMainWindow->showVideoMapped(pData, nFileLen) >= 0;
+}

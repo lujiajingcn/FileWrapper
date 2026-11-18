@@ -207,6 +207,8 @@ protected:
 
 public slots:
    int showVideo(char *szFileData, qint64 nFileLen);
+    // v4：归档内存映射入口（直接引用宿主 mmap 的只读内存，不复制整份文件）
+    int showVideoMapped(char *szFileData, qint64 nFileLen);
    // 大文件路径通道：由 PluginMedia::sendFileByPath 调用，复用 showVideo 的通用流程
    int showVideoFile(const QString &sPath);
 
@@ -260,6 +262,7 @@ private:
     unsigned char   *m_avioBuffer = nullptr;          // 完整文件数据（内存 IO 的数据源）
     unsigned char   *m_avioInternalBuffer = nullptr;  // AVIOContext 内部读缓冲，由 avio_context_free 释放
     QString          m_sPendingPath;                   // 大文件按路径打开时暂存的文件路径
+    bool             m_bMappedInput = false;           // 本次 showVideo 使用宿主内存映射（不复制、不释放）
     MemIOData        m_memIO;                        // read / seek 回调使用的游标
     AVIOContext     *m_avioCtx   = nullptr;
     int videoindex = -1;

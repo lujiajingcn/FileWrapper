@@ -1280,6 +1280,18 @@ int MainWindow::showVideoFile(const QString &sPath)
     return showVideo(nullptr, 0);
 }
 
+// v4：宿主内存映射入口。直接复用 showVideo 的通用流程，仅标记数据来自外部映射，
+// 播放期间宿主必须保持映射有效（换文件/stopPlayback 后由宿主释放）。
+int MainWindow::showVideoMapped(char *szFileData, qint64 nFileLen)
+{
+    if (szFileData == nullptr || nFileLen <= 0)
+        return -1;
+    m_bMappedInput = true;
+    const int nRet = showVideo(szFileData, nFileLen);
+    m_bMappedInput = false;
+    return nRet;
+}
+
 int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 {
     const QString byPath = m_sPendingPath;
@@ -1322,18 +1334,29 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     if (byPath.isEmpty())
     {
         // —— 内存播放：整个文件由主程序读入后交给插件 ——
-        // 将传入的数据拷贝为独立的内存数据源
-        m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
-        if (!m_avioBuffer)
+        if (m_bMappedInput)
         {
-            qWarning() << "[ShowVideo] AVIO buffer allocation failed.";
-            clearFFmpegResources();
-            return -1;
+            // v4 内存映射通道：宿主已把归档内容区映射为只读内存，直接作为
+            // AVIO 数据源，不再 av_malloc + memcpy 复制一整份（大视频的关键）。
+            m_memIO.data = reinterpret_cast<unsigned char *>(szFileData);
+            m_memIO.size = nFileLen;
+            m_memIO.pos  = 0;
         }
-        memcpy(m_avioBuffer, szFileData, nFileLen);
-        m_memIO.data = m_avioBuffer;
-        m_memIO.size = nFileLen;
-        m_memIO.pos  = 0;
+        else
+        {
+            // 将传入的数据拷贝为独立的内存数据源
+            m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
+            if (!m_avioBuffer)
+            {
+                qWarning() << "[ShowVideo] AVIO buffer allocation failed.";
+                clearFFmpegResources();
+                return -1;
+            }
+            memcpy(m_avioBuffer, szFileData, nFileLen);
+            m_memIO.data = m_avioBuffer;
+            m_memIO.size = nFileLen;
+            m_memIO.pos  = 0;
+        }
 
         // AVIOContext 的内部读缓冲与数据源分离，并挂上 read / seek 回调。
         // 有了 seek 回调，pb->seekable = AVIO_SEEKABLE_NORMAL 且 avio_size() 可用，

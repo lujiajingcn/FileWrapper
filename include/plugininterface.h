@@ -31,7 +31,7 @@
 //      prefersFileByPath / sendFileByPath / setSourceName（C1/B1 时定版）
 //   3  C2：新增 sendFile(const PluginFile &)，统一"内存 / 路径"两种数据载体
 // ============================================================================
-#define PLUGIN_API_VERSION 3
+#define PLUGIN_API_VERSION 4
 
 // ==================== 文件数据载体（C2） ====================
 //
@@ -148,9 +148,22 @@ public:
         return true;
     }
 
+    // —— v4：归档内存映射通道（零拷贝流式读取）——
+    // 主程序把归档中该条目的内容区 mmap 成只读内存后调用本函数。
+    // 返回 true 表示插件已在后台播放中直接引用这段内存（宿主必须保持映射有效，
+    // 直到 stopPlayback()/换文件/实例销毁）；返回 false 表示不支持，
+    // 宿主会回退到"抽取临时文件"或"整块读入内存"。
+    // 默认返回 false，旧插件无需改动。
+    virtual bool sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName)
+    {
+        Q_UNUSED(pData);
+        Q_UNUSED(nFileLen);
+        Q_UNUSED(displayName);
+        return false;
+    }
+
     // 切换文件时由主程序调用：停止该插件正在进行的后台播放（视频/音频等）。
     virtual void stopPlayback() {}
-
     // 该插件是否存在「后台播放」（音视频解码线程 / 音频输出等持续占用的运行态）。
     virtual bool hasBackgroundPlayback() const { return false; }
 

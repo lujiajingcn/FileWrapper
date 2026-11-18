@@ -24,6 +24,9 @@ public:
     bool prefersFileByPath() const override;
     bool sendFileByPath(const QString &path, const QString &displayName) override;
 
+    // v4：主程序把归档内容区 mmap 后交进来，插件直接引用（播放期间宿主保持映射）
+    bool sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName) override;
+
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
 
