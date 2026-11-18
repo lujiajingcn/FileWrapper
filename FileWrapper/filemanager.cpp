@@ -1667,9 +1667,11 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
             if (pct != nLastPercent)
             {
                 nLastPercent = pct;
+                // 与合并一致：第一行完整输出路径，第二行大小/剩余时间。
+                // 路径过长由进度框只省略第一行路径，第二行保持完整。
                 emit progressChanged(copiedTotal, totalBytes,
-                    tr("正在分割: %1  (%2 / %3)")
-                       .arg(QFileInfo(sOut).fileName(), FwArc::formatSize(copiedTotal),
+                    tr("正在分割: %1\n  (%2 / %3)")
+                       .arg(QFileInfo(sOut).absoluteFilePath(), FwArc::formatSize(copiedTotal),
                             FwArc::formatSize(totalBytes)));
                 QApplication::processEvents();
             }
