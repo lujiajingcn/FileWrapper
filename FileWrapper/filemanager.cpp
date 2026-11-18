@@ -83,6 +83,10 @@ QString FileManager::archivePath() const
     return isArchiveLoaded() ? m_qFile.fileName() : QString();
 }
 bool FileManager::isDirty() const { return m_bDirty; }
+bool FileManager::needsSave() const
+{
+    return isArchiveLoaded() && (m_bDirty || m_meta.version == FwArc::VERSION_V1);
+}
 FwArc::Meta FileManager::archiveMeta() const { return m_meta; }
 QVector<FILEINFO> FileManager::getFileInfos() { return m_vtFileInfos; }
 
@@ -610,26 +614,15 @@ bool FileManager::save()
         setError(QStringLiteral("另有文件操作正在进行，请稍后重试"));
         return false;
     }
-    if (!m_bDirty) return true;
+    // v1 归档即使没有显式改动也需要重写为 v2（校验提示会要求保存）
+    if (!m_bDirty && m_meta.version != FwArc::VERSION_V1) return true;
 
     if (m_vtFileInfos.isEmpty())
     {
-        const QString sArchivePath = m_qFile.fileName();
-        m_qFile.close();
-        if (!QFile::remove(sArchivePath))
-        {
-            setError(QStringLiteral("删除空归档失败: %1（文件可能被占用、只读或权限不足）").arg(sArchivePath));
-            m_qFile.setFileName(sArchivePath);
-            m_qFile.open(QIODevice::ReadOnly);
-            return false;   // m_bDirty 保持 true，改动仍在内存中，可重试
-        }
-        m_vtFileInfos.clear();
-        m_mapFileInfos.clear();
-        m_mapContentCrc.clear();
-        m_setPendingFiles.clear();
-        m_meta = FwArc::Meta();
-        m_bDirty = false;
-        return true;
+        // 不在保存路径里静默删除归档；用户仍可用“卸载文件”或手动删除。
+        setError(QStringLiteral("归档内已无条目，保存会删除归档文件。"
+                                "请使用“卸载文件”，或先添加文件后再保存。"));
+        return false;   // m_bDirty 保持 true，改动仍在内存中
     }
 
     const bool bOk = rewriteArchive();

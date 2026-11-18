@@ -61,6 +61,8 @@ public:
     bool deleteFile(const QString &sFilePath);
     bool save();
     bool isDirty() const;
+    // v1 归档即使用户没改动也需要重写为 v2；保存按钮据此启用
+    bool needsSave() const;
     bool isCancelRequested() const;
 
     // 最近一次失败的具体原因（含路径与系统错误），UI 据此给出可读提示（P2-5 / P1-3）

@@ -2156,7 +2156,7 @@ void MainWindow::syncActionStates()
     const bool bBusy   = m_fileManager->isBusy();
 
     updateViewActionState();
-    m_acSaveFile->setEnabled(bLoaded && m_fileManager->isDirty() && !bBusy);
+    m_acSaveFile->setEnabled(bLoaded && m_fileManager->needsSave() && !bBusy);
     m_acAddFile->setEnabled(bLoaded && !bBusy);
     m_acDelFile->setEnabled(bLoaded && !bBusy);
     m_acOutputFile->setEnabled(bLoaded && !bBusy);
@@ -2181,7 +2181,7 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
     m_acAddFile->setEnabled(bEnabled && bLoaded);
     m_acDelFile->setEnabled(bEnabled && bLoaded);
     m_acOutputFile->setEnabled(bEnabled && bLoaded);
-    m_acSaveFile->setEnabled(bEnabled && bLoaded && m_fileManager->isDirty() && !bBusy);
+    m_acSaveFile->setEnabled(bEnabled && bLoaded && m_fileManager->needsSave() && !bBusy);
 }
 
 // 统一管理进度对话框的三条连接，避免 disconnect(sender, nullptr, ...) 误伤常驻连接
