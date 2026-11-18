@@ -1807,9 +1807,24 @@ void MainWindow::populateFilePathView(bool bShowPath)
     m_bShowPath = bShowPath;
 
     if (m_bTreeMode)
+    {
+        // 树形模式的层级不能被列排序打散
+        m_tvFilePath->setSortingEnabled(false);
         populateFilePathTree();
+    }
     else
+    {
         populateFilePathList(bShowPath);
+        // 平铺模式的排序状态在这里统一启用，而不是只在「平铺显示」动作里：
+        // 若视图模式本来就是平铺（记住的设置 / 加载归档后直接平铺），
+        // 那一步动作会提前 return，排序就永远不会生效。
+        m_tvFilePath->setSortingEnabled(true);
+        QHeaderView *pHeader = m_tvFilePath->header();
+        const int nSection = pHeader->sortIndicatorSection();
+        m_tvFilePath->sortByColumn(nSection >= 0 ? nSection : 0,
+                                   nSection >= 0 ? pHeader->sortIndicatorOrder()
+                                                 : Qt::AscendingOrder);
+    }
 
     updateViewActionState();
 }
@@ -2151,11 +2166,8 @@ void MainWindow::restoreExpandedItems(const QModelIndex &index, const QString &s
 
 void MainWindow::refreshFilePathView()
 {
+    // populateFilePathView 内部会按当前模式启用/停用排序并重新套用当前排序列
     populateFilePathView(m_bShowPath);
-    // 平铺模式下若已启用排序，刷新后重新套用当前排序列，避免恢复成归档顺序
-    if (!m_bTreeMode && m_tvFilePath->isSortingEnabled())
-        m_tvFilePath->sortByColumn(m_tvFilePath->header()->sortIndicatorSection(),
-                                   m_tvFilePath->header()->sortIndicatorOrder());
 }
 
 void MainWindow::onActionViewTreeTriggered()
@@ -2163,7 +2175,6 @@ void MainWindow::onActionViewTreeTriggered()
     if (m_bTreeMode)
         return;
     m_bTreeMode = true;
-    m_tvFilePath->setSortingEnabled(false);
     populateFilePathView(m_bShowPath);
 }
 
@@ -2173,9 +2184,6 @@ void MainWindow::onActionViewFlatTriggered()
         return;
     m_bTreeMode = false;
     populateFilePathView(m_bShowPath);
-    // 平铺模式支持点列头排序（树形模式的层级不应被排序打散）
-    m_tvFilePath->setSortingEnabled(true);
-    m_tvFilePath->sortByColumn(0, Qt::AscendingOrder);
 }
 
 void MainWindow::onActionShowFilePathTriggered()

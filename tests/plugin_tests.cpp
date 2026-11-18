@@ -1480,6 +1480,16 @@ static void verifyMergeDialog()
                   && sizeModel.item(2, 0)->text() == QStringLiteral("a");
     report(bSizeSortOk,
            QStringLiteral("H7: size column sorts numerically (989 < 998 < 99.16KB)"));
+
+    // H8: 平铺模式一进入就启用排序（不依赖"点平铺显示"动作的副作用），树形模式禁用
+    auto *pView = mw.findChild<QTreeView *>();
+    const bool bTreeInitial = pView != nullptr && !pView->isSortingEnabled();
+    QMetaObject::invokeMethod(&mw, "onActionViewFlatTriggered", Qt::DirectConnection);
+    const bool bFlatEnabled = pView != nullptr && pView->isSortingEnabled();
+    QMetaObject::invokeMethod(&mw, "onActionViewTreeTriggered", Qt::DirectConnection);
+    const bool bTreeDisabled = pView != nullptr && !pView->isSortingEnabled();
+    report(pView != nullptr && bTreeInitial && bFlatEnabled && bTreeDisabled,
+           QStringLiteral("H8: flat mode enables sorting directly, tree mode disables"));
 }
 
 // ---------------------------------------------------------------------------

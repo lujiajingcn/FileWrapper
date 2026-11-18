@@ -1,7 +1,7 @@
 # 插件测试（plugin tests）
 
 本目录是**仓库内的可复现测试套件**，覆盖「插件基础设施」与 `PluginWord` 的真实渲染，
-共 **184 项断言**（`-SkipShots` 181 项）。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
+共 **185 项断言**（`-SkipShots` 182 项）。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
 那些探针随机器一起消失，导致同一套验证别人无法跑、也没法回归。
 
 ## 为什么这样设计
@@ -34,7 +34,7 @@
 | `V` | 各查看器渲染冒烟：PluginText（.txt、**.html 富文本**）、PluginPicture（.png、**.svg**、**.webp**）、PluginBook（.epub，覆盖共享 ZipReader 的 deflate 路径）、PluginWord（**.odt/OpenDocument** 的段落/表格、**.rtf 子集**）、PluginSheet（**.xlsx 多表 + 合并单元格**、**.ods**）、PluginSlides（**.pptx**、**.odp** 的逐页静态渲染） |
 | `F` | 格式识别（`FormatResolver`）：PNG/PDF/OLE2/ZIP 家族（docx/xlsx/odt）按内容判断、内容优先于错误后缀、未知格式有可读建议、不支持格式清单非空 |
 | `G` | 合并展开：已有 `.dat` 作为输入时被拆成条目参与合并（不产生嵌套归档）、同目录合并保持短相对路径、不同盘符来源的条目**保留原归属**（`D/testfiles_copy/...` 不会被改挂到另一个盘）、撞名自动改名 |
-| `H` | 合并对话框交互：列表为多选整行选择、删除只移除选中项、Delete 键等价于删除按钮；分割对话框支持预填；大小列按数值字节排序 |
+| `H` | 合并对话框交互：列表为多选整行选择、删除只移除选中项、Delete 键等价于删除按钮；分割对话框支持预填；大小列按数值字节排序；平铺模式一进入就启用列排序（不依赖先点一次"平铺显示"） |
 | `K` | 保存路径规划：跨盘添加后保存仍保留 `E/...`/`D/...` 盘符段、同盘添加后保留子目录层级、归档内重复路径会被拒绝保存；`archivePath()` 供分割预填 |
 
 素材见 [fixtures/](fixtures)：`basic.docx`（常规排版）、`chinese.docx`（中文样式名 +
