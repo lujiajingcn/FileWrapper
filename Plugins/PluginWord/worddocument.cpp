@@ -2076,14 +2076,18 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
         if (m_truncated) break;
         out << QStringLiteral("<tr>");
 
-        for (QDomElement cell = row.firstChildElement(QStringLiteral("table:table-cell"));
-             !cell.isNull(); cell = cell.nextSiblingElement(QStringLiteral("table:table-cell")))
+        for (QDomElement cell = row.firstChildElement(); !cell.isNull();
+             cell = cell.nextSiblingElement())
         {
-            // 被合并覆盖的空单元格不输出
-            if (cell.tagName() == QLatin1String("table:covered-table-cell")) continue;
+            const QString cellTag = cell.tagName();
+            // 被纵向合并覆盖的格子不输出；首格会带 rowspan 自动占位。
+            if (cellTag == QLatin1String("table:covered-table-cell")) continue;
+            if (cellTag != QLatin1String("table:table-cell")) continue;
 
             const int span = qBound(1, cell.attribute(
                 QStringLiteral("table:number-columns-spanned")).toInt(), 50);
+            const int rowSpan = qBound(1, cell.attribute(
+                QStringLiteral("table:number-rows-spanned")).toInt(), 50);
 
             QStringList inner;
             for (QDomElement child = cell.firstChildElement(); !child.isNull();
@@ -2108,6 +2112,7 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
 
             out << QStringLiteral("<td");
             if (span > 1) out << QStringLiteral(" colspan=\"%1\"").arg(span);
+            if (rowSpan > 1) out << QStringLiteral(" rowspan=\"%1\"").arg(rowSpan);
             out << QStringLiteral(">");
             if (inner.isEmpty()) out << QStringLiteral("&#160;");
             else                 out << inner.join(QString());

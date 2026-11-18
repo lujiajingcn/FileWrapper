@@ -329,6 +329,9 @@ void MainWindow::reset()
     m_chapterDirs.clear();
     m_chapterTitles.clear();
     m_curChapter = 0;
+    // 先撤销当前文档上的累计缩放，再清零计数；否则下一本书沿用旧字号。
+    if (m_browser && m_zoomSteps != 0)
+        m_browser->zoomIn(-m_zoomSteps);
     m_zoomSteps  = 0;
     if (m_browser)
     {
@@ -820,10 +823,10 @@ void MainWindow::loadChapter(int idx)
     // 例如 zip://OPS/ 会变成 zip://ops/，导致无法匹配条目名为大写的 OPS/images/... 。
     m_browser->document()->setBaseUrl(QUrl("zip:///" + base));
 
+    // setHtml 不会复位 zoom；这里不能再叠加 zoomIn，否则每翻一章字号继续变大。
+    // 用户缩放已经保存在 QTextEdit 的默认字体里，跨 setHtml 自然保留。
+    m_browser->setProperty(kDecodedImageBytesProperty, QVariant::fromValue<qint64>(0));
     m_browser->setHtml(m_chapterHtml.at(idx));
-
-    // 重新应用累计缩放
-    if (m_zoomSteps != 0) m_browser->zoomIn(m_zoomSteps);
 
     QString info = QString("%1  |  %2 / %3")
                    .arg(m_bookTitle)
