@@ -38,6 +38,8 @@ public:
 
     // 只读取条目开头至多 nMaxBytes 字节（格式嗅探用；不会为了"看文件头"把整块载入内存）
     QByteArray entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr = nullptr);
+    // 校验已映射归档内容区的 CRC（无记录 CRC 的 v1 返回 true）
+    bool verifyMappedCrc(const QString &sFilePath, const char *pData, qint64 nLen) const;
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);

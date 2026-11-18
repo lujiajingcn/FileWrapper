@@ -24,6 +24,7 @@ import io
 import os
 import struct
 import sys
+import re
 import zipfile
 import zlib
 
@@ -675,6 +676,37 @@ def make_broken_files():
     open(os.path.join(WORK, "empty.docx"), "wb").close()
 
 
+def _normalize_zip_time(path):
+    """Rewrite every zip entry with a fixed timestamp and fixed core.xml dates.
+
+    Generated fixtures are checked in; without this, every regeneration changes
+    bytes even when content is identical, making review diffs meaningless.
+    """
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(path, "r") as src, zipfile.ZipFile(tmp, "w") as dst:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename.endswith("docProps/core.xml"):
+                txt = data.decode("utf-8")
+                txt = re.sub(r"(<dcterms:created[^>]*>)[^<]*(</dcterms:created>)",
+                             r"\g<1>2020-01-01T00:00:00Z\g<2>", txt)
+                txt = re.sub(r"(<dcterms:modified[^>]*>)[^<]*(</dcterms:modified>)",
+                             r"\g<1>2020-01-01T00:00:00Z\g<2>", txt)
+                data = txt.encode("utf-8")
+            zi = zipfile.ZipInfo(info.filename, date_time=(2020, 1, 1, 0, 0, 0))
+            zi.compress_type = info.compress_type
+            zi.external_attr = info.external_attr
+            dst.writestr(zi, data)
+    os.replace(tmp, path)
+
+
+def _normalize_all_fixtures():
+    for name in os.listdir(WORK):
+        if name.lower().endswith((".docx", ".xlsx", ".pptx", ".odt", ".ods",
+                                  ".odp", ".epub")):
+            _normalize_zip_time(os.path.join(WORK, name))
+
+
 def _preflight_deps():
     missing = []
     for mod, name in (("docx", "python-docx"), ("PIL", "Pillow"),
@@ -702,4 +734,5 @@ if __name__ == "__main__":
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()
+    _normalize_all_fixtures()
     print("wrote broken fixtures into", WORK)

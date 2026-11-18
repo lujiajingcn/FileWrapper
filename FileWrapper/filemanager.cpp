@@ -1715,6 +1715,15 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 // ============================================================
 
 // 只读条目开头若干字节：格式嗅探只需要文件头，不必把整块内容读进内存。
+bool FileManager::verifyMappedCrc(const QString &sFilePath, const char *pData, qint64 nLen) const
+{
+    if (!m_mapContentCrc.contains(sFilePath)) return true;   // v1 无内容 CRC
+    if (pData == nullptr || nLen < 0) return false;
+    FwArc::Crc32 crc;
+    crc.update(pData, nLen);
+    return crc.value() == m_mapContentCrc.value(sFilePath);
+}
+
 QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr)
 {
     if (psErr) psErr->clear();

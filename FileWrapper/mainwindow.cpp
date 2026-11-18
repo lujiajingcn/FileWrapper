@@ -1193,6 +1193,18 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             {
                 uchar *pMapped = pArc->map(info.nContentPositon, info.nFileLen);
                 if (pMapped != nullptr
+                    && !m_fileManager->verifyMappedCrc(
+                           info.sFilePath, reinterpret_cast<const char *>(pMapped), info.nFileLen))
+                {
+                    pArc->unmap(pMapped);
+                    pArc->close();
+                    delete pArc;
+                    onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
+                                             .arg(info.sFileName));
+                    iface->sendFileData(nullptr, 0);
+                    return;
+                }
+                if (pMapped != nullptr
                     && iface->sendFileMapped(reinterpret_cast<char *>(pMapped),
                                              info.nFileLen, info.sFileName))
                 {
