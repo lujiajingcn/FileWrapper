@@ -1083,6 +1083,9 @@ void MainWindow::stopCurrentPlaybackAndInvalidate()
         return;
 
     pOld->stopPlayback();
+    // M-04 已保证 stopPlayback 返回时 worker 已退出；此时可以安全释放该实例的
+    // mmap，避免后台标签长期持有映射阻止归档重写/保存。
+    releaseMappedInput(pOld);
 
     if (!pOld->hasBackgroundPlayback())
         return;

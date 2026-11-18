@@ -1497,9 +1497,10 @@ static void verifyPluginToggleAndReload()
     // M-10：禁用项不再重试，但仍保留一条"已禁用（未重试）"记录，
     // 避免诊断里既不是失败也不是禁用；关键是不能被重新加载。
     const bool bStillRecorded = !pm->failureFor(sBadDll).isEmpty();
-    report(bRecorded && nRetried == 0 && bStillRecorded,
-           QStringLiteral("X6: disabled plugin not resurrected but failure record kept (recorded=%1 retried=%2)")
-               .arg(bRecorded).arg(nRetried));
+    const bool bDisabledText = pm->failureFor(sBadDll).contains(QStringLiteral("已禁用"));
+    report(bRecorded && nRetried == 0 && bStillRecorded && bDisabledText,
+           QStringLiteral("X6: disabled plugin not resurrected (recorded=%1 retried=%2 disabledText=%3)")
+               .arg(bRecorded).arg(nRetried).arg(bDisabledText));
 
     // 收尾：恢复启用、清掉测试文件
     PluginManager::setPluginEnabled(QStringLiteral("ZZDisabled"), true);
