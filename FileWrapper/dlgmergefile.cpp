@@ -17,12 +17,19 @@
 
 #include <algorithm>
 #include <functional>
+#include "icons.h"
 
 DlgMergeFile::DlgMergeFile(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::DlgMergeFile)
 {
     ui->setupUi(this);
+    ui->btnAddFile->setIcon(FwIcons::get(QStringLiteral("add")));
+    ui->btnDelete->setIcon(FwIcons::get(QStringLiteral("delete")));
+    ui->btnAddDir->setIcon(FwIcons::get(QStringLiteral("add_dir")));
+    ui->btnMergedFilePath->setIcon(FwIcons::get(QStringLiteral("browse")));
+    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
+    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 

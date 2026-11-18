@@ -3,12 +3,17 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QScreen>
+#include "icons.h"
 
 DlgSplitFile::DlgSplitFile(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::DlgSplitFile)
 {
     ui->setupUi(this);
+    ui->btnMergedFilePath->setIcon(FwIcons::get(QStringLiteral("browse")));
+    ui->btnSplittedFileDir->setIcon(FwIcons::get(QStringLiteral("browse")));
+    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
+    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
 
     // 固定 1000px 在 1366@150%/1920@200% 下会超出可用区，右侧按钮被裁。
     int w = 1000;

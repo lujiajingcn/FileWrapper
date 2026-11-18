@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "icons.h"
 #include "ui_mainwindow.h"
 #include "formatresolver.h"
 #include "filelistmodel.h"
@@ -343,6 +344,37 @@ void MainWindow::initWidgetFilePath()
     connect(m_acDelFile, &QAction::triggered, this, &MainWindow::onActionDelFileTriggered);
     connect(m_acOutputFile, &QAction::triggered, this, &MainWindow::onActionOutputFileTriggered);
     connect(m_acSaveFile, &QAction::triggered, this, &MainWindow::onActionSaveFileTriggered);
+
+    // 图标：统一使用 resources/icons（应用图标同款蓝青风格）
+    setWindowIcon(FwIcons::get(QStringLiteral("appicon")));
+    ui->actionLoadFile->setIcon(FwIcons::get(QStringLiteral("load")));
+    ui->actionUnloadFile->setIcon(FwIcons::get(QStringLiteral("unload")));
+    ui->actionMergeFile->setIcon(FwIcons::get(QStringLiteral("merge")));
+    ui->actionSplitFile->setIcon(FwIcons::get(QStringLiteral("split")));
+    ui->actionPluginMap->setIcon(FwIcons::get(QStringLiteral("plugin")));
+    ui->actionAbout->setIcon(FwIcons::get(QStringLiteral("about")));
+    m_acViewTree->setIcon(FwIcons::get(QStringLiteral("view_tree")));
+    m_acViewFlat->setIcon(FwIcons::get(QStringLiteral("view_flat")));
+    m_acShowFilePath->setIcon(FwIcons::get(QStringLiteral("show_path")));
+    m_acShowFileName->setIcon(FwIcons::get(QStringLiteral("show_name")));
+    m_acAddFile->setIcon(FwIcons::get(QStringLiteral("add")));
+    m_acDelFile->setIcon(FwIcons::get(QStringLiteral("delete")));
+    m_acOutputFile->setIcon(FwIcons::get(QStringLiteral("export")));
+    m_acSaveFile->setIcon(FwIcons::get(QStringLiteral("save")));
+
+    // 主工具栏：之前是空的，只保留最常用文件操作
+    ui->mainToolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    ui->mainToolBar->setIconSize(QSize(24, 24));
+    ui->mainToolBar->addAction(ui->actionLoadFile);
+    ui->mainToolBar->addAction(ui->actionUnloadFile);
+    ui->mainToolBar->addSeparator();
+    ui->mainToolBar->addAction(ui->actionMergeFile);
+    ui->mainToolBar->addAction(ui->actionSplitFile);
+    ui->mainToolBar->addSeparator();
+    ui->mainToolBar->addAction(m_acAddFile);
+    ui->mainToolBar->addAction(m_acDelFile);
+    ui->mainToolBar->addAction(m_acOutputFile);
+    ui->mainToolBar->addAction(m_acSaveFile);
 
     // 将工具栏放置在文件列表栏的上头
     QVBoxLayout *vbLytFilePath = new QVBoxLayout();

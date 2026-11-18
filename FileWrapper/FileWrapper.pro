@@ -6,8 +6,7 @@
 
 QT       += core gui
 
-# 插件接口头放在仓库根 include/：主程序与插件都从那里取，接口单一来源
-INCLUDEPATH += $$PWD/../include
+# 閹绘帊娆㈤幒銉ュ經婢跺瓨鏂侀崷銊ょ波鎼存挻鐗?include/閿涙矮瀵岀粙瀣碍娑撳孩褰冩禒鍫曞厴娴犲酣鍋呴柌灞藉絿閿涘本甯撮崣锝呭礋娑撯偓閺夈儲绨?INCLUDEPATH += $$PWD/../include
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -42,6 +41,7 @@ SOURCES += \
         plugindiag.cpp
 
 HEADERS += \
+        icons.h \
         archiveformat.h \
         builtinviewer.h \
         dlgabout.h \
@@ -69,15 +69,13 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
 # ============================================================================
-# 插件运行时依赖部署（2026-11-17 统一）
-#
-# 以前这里单独复制 ffmpeg 的 5 个 DLL，PluginPdf.pro 复制 Qt6Pdf/Qt6Network，
-# PluginWord.pro 复制 Qt6Xml —— 三处零散、责任不清，而且 Qt6Multimedia.dll
-# （PluginMedia 的音频输出依赖）根本没人复制：开发机 PATH 里有 Qt bin 所以看不出来，
-# 换台机器就「插件加载失败」，程序还不给任何提示。
-#
-# 现在：依赖清单一律写在 deploy/plugin-deps.manifest（唯一来源），链接完成后由
-# deploy/deploy-deps.ps1 统一复制到 exe 目录，并生成 plugin-deploy-manifest.txt
-# 供程序自检（见 plugindiag.cpp）。新增插件依赖只改 manifest，不要再写 POST_LINK。
-# ============================================================================
+# 閹绘帊娆㈡潻鎰攽閺冩湹绶风挧鏍劥缂冭绱?026-11-17 缂佺喍绔撮敍?#
+# 娴犮儱澧犳潻娆撳櫡閸楁洜瀚径宥呭煑 ffmpeg 閻?5 娑?DLL閿涘luginPdf.pro 婢跺秴鍩?Qt6Pdf/Qt6Network閿?# PluginWord.pro 婢跺秴鍩?Qt6Xml 閳ユ柡鈧?娑撳顦╅梿鑸垫殠閵嗕浇鐭楁禒璁崇瑝濞撳拑绱濋懓灞肩瑬 Qt6Multimedia.dll
+# 閿涘湧luginMedia 閻ㄥ嫰鐓舵０鎴ｇ翻閸戣桨绶风挧鏍电礆閺嶈婀板▽鈥叉眽婢跺秴鍩楅敍姘磻閸欐垶婧€ PATH 闁插本婀?Qt bin 閹碘偓娴犮儳婀呮稉宥呭毉閺夈儻绱?# 閹广垹褰撮張鍝勬珤鐏忎究鈧本褰冩禒璺哄鏉炶棄銇戠拹銉ｂ偓宥忕礉缁嬪绨潻妯圭瑝缂佹瑤鎹㈡担鏇熷絹缁€鎭掆偓?#
+# 閻滄澘婀敍姘贩鐠ф牗绔婚崡鏇氱瀵板鍟撻崷?deploy/plugin-deps.manifest閿涘牆鏁稉鈧弶銉︾爱閿涘绱濋柧鐐复鐎瑰本鍨氶崥搴ｆ暠
+# deploy/deploy-deps.ps1 缂佺喍绔存径宥呭煑閸?exe 閻╊喖缍嶉敍灞借嫙閻㈢喐鍨?plugin-deploy-manifest.txt
+# 娓氭稓鈻兼惔蹇氬殰濡偓閿涘牐顫?plugindiag.cpp閿涘鈧倹鏌婃晶鐐村絻娴犳湹绶风挧鏍у涧閺€?manifest閿涘奔绗夌憰浣稿晙閸?POST_LINK閵?# ============================================================================
+RESOURCES += $$PWD/../resources/resources.qrc
+win32: RC_FILE += $$PWD/../resources/appicon.rc
+
 include(deploy.pri)

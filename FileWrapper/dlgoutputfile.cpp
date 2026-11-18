@@ -4,12 +4,16 @@
 #include <QMessageBox>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
+#include "icons.h"
 
 DlgOutputFile::DlgOutputFile(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::DlgOutputFile)
 {
     ui->setupUi(this);
+    ui->btnSelectDir->setIcon(FwIcons::get(QStringLiteral("browse")));
+    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
+    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 
