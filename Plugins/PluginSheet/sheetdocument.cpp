@@ -17,6 +17,35 @@ constexpr int kMaxCells   = 30000;
 constexpr int kMaxCellLen = 400;
 constexpr int kMaxXlsxCols = 16384;   // xlsx 列号上限（XFD，1 基），超过视为畸形引用
 
+
+QString odsCellText(const QDomElement &cell)
+{
+    QString out;
+    std::function<void(const QDomNode &)> appendNode = [&](const QDomNode &n) {
+        if (n.isText()) { out += n.toText().data(); return; }
+        const QDomElement e = n.toElement();
+        if (e.isNull()) return;
+        const QString tag = e.tagName();
+        if (tag == QLatin1String("text:s")) {
+            int nSpaces = e.attribute(QStringLiteral("text:c")).toInt();
+            if (nSpaces < 1) nSpaces = 1;
+            out += QString(qMin(nSpaces, 1000), QLatin1Char(' '));
+            return;
+        }
+        if (tag == QLatin1String("text:tab")) { out += QLatin1Char('\t'); return; }
+        if (tag == QLatin1String("text:line-break")) { out += QLatin1Char('\n'); return; }
+        for (QDomNode c = e.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c);
+    };
+    for (QDomElement p = cell.firstChildElement(); !p.isNull(); p = p.nextSiblingElement())
+    {
+        if (p.tagName() != QLatin1String("text:p") && p.tagName() != QLatin1String("text:h"))
+            continue;
+        if (!out.isEmpty()) out += QLatin1Char('\n');
+        for (QDomNode c = p.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c);
+    }
+    return out;
+}
+
 QString esc(const QString &s)
 {
     QString r;
@@ -390,21 +419,13 @@ bool SheetDocument::parseOds(QString *error)
 
                 if (tag == QLatin1String("table:table-cell") && colIdx < kMaxCols)
                 {
-                    QString text;
-                    for (QDomElement p = cell.firstChildElement(); !p.isNull();
-                         p = p.nextSiblingElement())
-                    {
-                        if (p.tagName() == QLatin1String("text:p")
-                            || p.tagName() == QLatin1String("text:h"))
-                        {
-                            if (!text.isEmpty()) text += QLatin1Char('\n');
-                            text += p.text();
-                        }
-                    }
+                    const QString text = odsCellText(cell);
                     if (!text.isEmpty())
                     {
-                        for (int rep = 0; rep < rowRepeat && rowIdx + rep < kMaxRows; ++rep)
-                            setCell(idx, rowIdx + rep, colIdx, text);
+                        // 重复列要把同一文本填到每一列，而不是只填首列再跳过索引。
+                        for (int repRow = 0; repRow < rowRepeat && rowIdx + repRow < kMaxRows; ++repRow)
+                            for (int repCol = 0; repCol < colRepeat && colIdx + repCol < kMaxCols; ++repCol)
+                                setCell(idx, rowIdx + repRow, colIdx + repCol, text);
                     }
                 }
                 colIdx += colRepeat;

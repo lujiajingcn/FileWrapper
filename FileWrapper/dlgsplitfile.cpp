@@ -2,6 +2,7 @@
 #include "ui_dlgsplitfile.h"
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QScreen>
 
 DlgSplitFile::DlgSplitFile(QWidget *parent) :
     QDialog(parent),
@@ -9,7 +10,14 @@ DlgSplitFile::DlgSplitFile(QWidget *parent) :
 {
     ui->setupUi(this);
 
-    resize(1000, size().height());
+    // 固定 1000px 在 1366@150%/1920@200% 下会超出可用区，右侧按钮被裁。
+    int w = 1000;
+    if (screen()) {
+        const QRect avail = screen()->availableGeometry();
+        if (avail.width() > 40 && w > avail.width() - 20)
+            w = qMax(480, avail.width() - 20);
+    }
+    resize(w, size().height());
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 }

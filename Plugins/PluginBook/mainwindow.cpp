@@ -29,6 +29,9 @@
 // ============================================================
 static QString joinPath(const QString &base, const QString &rel)
 {
+    // OPF/ZIP 里的 href 是 URL，目录名可能写成 %20/%E4%B8%AD 等；
+    // 先百分号解码，否则合法 EPUB 会因条目名不匹配而整章/整图跳过。
+    const QString relDecoded = QUrl::fromPercentEncoding(rel.toUtf8());
     QStringList parts    = base.split('/', Qt::SkipEmptyParts);
     QStringList relParts = rel.split('/', Qt::SkipEmptyParts);
     for (const QString &r : relParts)
