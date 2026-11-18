@@ -1371,7 +1371,9 @@ void MainWindow::activateTab(int index)
             statusBar()->showMessage(tr("正在打开 %1…").arg(d.info.sFileName));
             renderFile(d.info, d.interface);
             QApplication::restoreOverrideCursor();
-            statusBar()->clearMessage();
+            // 只清理“正在打开…”；renderFile 失败时写的错误消息要保留。
+            if (statusBar()->currentMessage().startsWith(tr("正在打开 ")))
+                statusBar()->clearMessage();
         });
     }
 }
@@ -1637,7 +1639,7 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
     // 加载成功后重置所有已打开的文件标签页（旧归档的文件路径已失效）
     closeAllTabs();
 
-    populateFilePathView(false);
+    populateFilePathView(m_bShowPath);
     syncActionStates();
 }
 

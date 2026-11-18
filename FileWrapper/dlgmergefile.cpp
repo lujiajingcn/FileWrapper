@@ -31,7 +31,7 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     resize(qMin(1000, qMax(720, avail.width() - 80)),
            qMin(600, qMax(420, avail.height() - 80)));
 
-    m_hModelFilePath = new QStandardItemModel;
+    m_hModelFilePath = new QStandardItemModel(this);
     m_hModelFilePath->setColumnCount(1);
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     ui->treeView->setModel(m_hModelFilePath);

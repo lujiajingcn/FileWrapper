@@ -401,6 +401,12 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
         sErr = QStringLiteral("创建临时文件失败: %1 (%2)").arg(sOutPath, fOut.errorString());
         return false;
     }
+    // 打开成功后的任何提前 return 都要删掉已创建的空/半成品临时文件。
+    struct TempFileGuard {
+        QString path;
+        bool keep = false;
+        ~TempFileGuard() { if (!keep) QFile::remove(path); }
+    } tempGuard{sOutPath};
 
     QFile *pSrc = nullptr;
     QFile diskSrc;
@@ -440,6 +446,7 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
         sErr = QStringLiteral("内容校验失败（CRC32 不匹配）: %1").arg(sDisplayName);
         return false;
     }
+    tempGuard.keep = true;
     return true;
 }
 
