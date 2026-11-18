@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "formatresolver.h"
+#include "filelistmodel.h"
 
 #include <QLabel>
 #include <QApplication>
@@ -268,7 +269,7 @@ void MainWindow::onFileManagerWarning(const QString &sMsg)
 // 初始化【文件列表】窗口
 void MainWindow::initWidgetFilePath()
 {
-    m_hModelFilePath = new QStandardItemModel;
+    m_hModelFilePath = new FileListModel;
     m_hModelFilePath->setColumnCount(3);
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     m_hModelFilePath->setHeaderData(1, Qt::Horizontal, tr("大小"));
@@ -279,7 +280,6 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_tvFilePath->setSortingEnabled(false);
-    m_tvFilePath->header()->installEventFilter(this);
 
     // 添加工具栏
     m_tbFilePath = new QToolBar(ui->dwFilePath);
@@ -1435,21 +1435,6 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
 // 在 viewport 层接管双击可同时绕开这两个问题，且对目录与文件一视同仁。
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
-    // 表头：仅「文件路径」列可排序。大小/类型目前是显示文本，按文本排序会误导
-    // （"9.50 KB" 会排在 "23 B" 前），因此吃掉这两列的点击并给出说明。
-    if (m_tvFilePath && !m_bTreeMode && obj == m_tvFilePath->header()
-        && event->type() == QEvent::MouseButtonRelease)
-    {
-        QMouseEvent *me = static_cast<QMouseEvent *>(event);
-        const int nSection = m_tvFilePath->header()->logicalIndexAt(me->position().toPoint());
-        if (nSection == 1 || nSection == 2)
-        {
-            statusBar()->showMessage(
-                tr("目前仅支持按「文件路径」排序（大小/类型的数值排序尚未实现）"), 3000);
-            return true;
-        }
-    }
-
     if (m_tvFilePath && m_hModelFilePath
         && obj == m_tvFilePath->viewport()
         && event->type() == QEvent::MouseButtonDblClick)
@@ -1846,6 +1831,7 @@ void MainWindow::populateFilePathList(bool bShowPath)
         hItemName->setData(var);
         QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
         QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
         m_hModelFilePath->setItem(nRow, 0, hItemName);
         m_hModelFilePath->setItem(nRow, 1, pSize);
@@ -1937,6 +1923,7 @@ void MainWindow::populateFilePathTree()
         hFile->setData(var);
         QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
         QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
 
         if (pParent != nullptr)

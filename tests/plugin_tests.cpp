@@ -71,6 +71,7 @@
 #include "filemanager.h"
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
+#include "filelistmodel.h"
 #include "formatresolver.h"
 #include "mainwindow.h"
 #include "plugininterface.h"
@@ -1455,6 +1456,30 @@ static void verifyMergeDialog()
     }
     report(bHasOpen && bHasMerge && bHasSave,
            QStringLiteral("H6: window shortcuts registered (Ctrl+O/M/S)"));
+
+    // H7: 大小列按数值排序（"99.16 KB" 不应排在 "989 B" 前）
+    FileListModel sizeModel;
+    sizeModel.setColumnCount(3);
+    auto addSizeRow = [&sizeModel](const QString &sName, qint64 nBytes, const QString &sText) {
+        auto *pName = new QStandardItem(sName);
+        auto *pSize = new QStandardItem(sText);
+        pSize->setData(nBytes, Qt::UserRole);
+        auto *pType = new QStandardItem(QStringLiteral("T"));
+        sizeModel.appendRow(QList<QStandardItem *>() << pName << pSize << pType);
+    };
+    addSizeRow(QStringLiteral("a"), 989, QStringLiteral("989 B"));
+    addSizeRow(QStringLiteral("b"), 101556, QStringLiteral("99.16 KB"));
+    addSizeRow(QStringLiteral("c"), 998, QStringLiteral("998 B"));
+    sizeModel.sort(1, Qt::AscendingOrder);
+    bool bSizeSortOk = sizeModel.item(0, 0)->text() == QStringLiteral("a")
+                       && sizeModel.item(1, 0)->text() == QStringLiteral("c")
+                       && sizeModel.item(2, 0)->text() == QStringLiteral("b");
+    sizeModel.sort(1, Qt::DescendingOrder);
+    bSizeSortOk = bSizeSortOk
+                  && sizeModel.item(0, 0)->text() == QStringLiteral("b")
+                  && sizeModel.item(2, 0)->text() == QStringLiteral("a");
+    report(bSizeSortOk,
+           QStringLiteral("H7: size column sorts numerically (989 < 998 < 99.16KB)"));
 }
 
 // ---------------------------------------------------------------------------
