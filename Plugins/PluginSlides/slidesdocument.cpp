@@ -45,7 +45,10 @@ QString fmtNum(double v)
 // 相对路径归一化："ppt/slides/" + "../media/image1.png" -> "ppt/media/image1.png"
 QString joinPath(const QString &baseDir, const QString &rel)
 {
-    const QString full = baseDir + QLatin1Char('/') + rel;
+    // OPC 允许以 / 开头的包根绝对部件名；此时不能再拼 baseDir。
+    const QString full = rel.startsWith(QLatin1Char('/'))
+        ? rel
+        : (baseDir + QLatin1Char('/') + rel);
     QStringList parts = full.split(QLatin1Char('/'), Qt::SkipEmptyParts);
     QStringList out;
     for (const QString &p : parts)

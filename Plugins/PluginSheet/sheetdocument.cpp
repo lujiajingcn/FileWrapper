@@ -288,19 +288,31 @@ bool SheetDocument::parseXlsx(QString *error)
         for (QDomElement rowEl = sheetDoc.documentElement().firstChildElement("sheetData");
              !rowEl.isNull(); rowEl = rowEl.nextSiblingElement("sheetData"))
         {
+            int nextRow = 0;
             for (QDomElement row = rowEl.firstChildElement(QStringLiteral("row")); !row.isNull();
                  row = row.nextSiblingElement(QStringLiteral("row")))
             {
-                int rowIdx = row.attribute(QStringLiteral("r")).toInt() - 1;
+                // ECMA-376 的 row/@r、c/@r 都是可选属性；缺省时按顺序推断，
+                // 不能直接丢行/丢格。
+                int rowIdx = nextRow;
+                if (!row.attribute(QStringLiteral("r")).isEmpty())
+                    rowIdx = row.attribute(QStringLiteral("r")).toInt() - 1;
                 if (rowIdx < 0) rowIdx = 0;
                 if (rowIdx >= kMaxRows) { m_truncated = true; break; }
+                int nextCol = 0;
 
                 for (QDomElement c = row.firstChildElement(QStringLiteral("c")); !c.isNull();
                      c = c.nextSiblingElement(QStringLiteral("c")))
                 {
-                    int colIdx = 0;
-                    if (!parseCellRef(c.attribute(QStringLiteral("r")), &colIdx, &rowIdx))
-                        continue;
+                    int colIdx = nextCol;
+                    int cellRow = rowIdx;
+                    if (!c.attribute(QStringLiteral("r")).isEmpty())
+                    {
+                        if (!parseCellRef(c.attribute(QStringLiteral("r")), &colIdx, &cellRow))
+                            continue;
+                        rowIdx = cellRow;
+                    }
+                    nextCol = colIdx + 1;
 
                     const QString type = c.attribute(QStringLiteral("t"));
                     QString text;
@@ -320,6 +332,7 @@ bool SheetDocument::parseXlsx(QString *error)
                     }
                     if (!text.isEmpty()) setCell(idx, rowIdx, colIdx, text);
                 }
+                nextRow = rowIdx + 1;
             }
         }
 

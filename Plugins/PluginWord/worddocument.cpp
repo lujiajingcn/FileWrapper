@@ -396,9 +396,12 @@ QString normalizePart(const QString &p)
 // 相对主文档目录解析部件路径（"media/image1.png" -> "word/media/image1.png"）
 QString resolvePart(const QString &baseDir, const QString &target)
 {
+    const bool bAbsolute = target.trimmed().startsWith(QLatin1Char('/'))
+                           || target.trimmed().startsWith(QLatin1Char('\\'));
     QString t = normalizePart(target);
     if (t.contains(QLatin1String("://"))) return QString();   // 外部链接
-    QStringList parts = baseDir.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    QStringList parts = bAbsolute ? QStringList()
+                                  : baseDir.split(QLatin1Char('/'), Qt::SkipEmptyParts);
     const QStringList segs = t.split(QLatin1Char('/'), Qt::SkipEmptyParts);
     for (const QString &seg : segs)
     {
@@ -2127,16 +2130,25 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
     if (href.contains(QLatin1String("://"))) return QString();   // 外链图片不联网
 
+    // 先查缓存，再决定是否解压；重复引用/缩放重渲染不再重复 inflate。
     QString key = href;
-    QByteArray bytes = m_zip.entry(href);
-    if (bytes.isEmpty())
+    QString url = m_targetToUrl.value(key);
+    if (url.isEmpty())
     {
         key = QStringLiteral("Pictures/") + href;
-        bytes = m_zip.entry(key);
+        url = m_targetToUrl.value(key);
     }
-    if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) return QString();
-
-    QString url = m_targetToUrl.value(key);
+    QByteArray bytes;
+    if (url.isEmpty())
+    {
+        bytes = m_zip.entry(href);
+        if (bytes.isEmpty())
+        {
+            key = QStringLiteral("Pictures/") + href;
+            bytes = m_zip.entry(key);
+        }
+        if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) return QString();
+    }
     if (url.isEmpty())
     {
         const QImage im = QImage::fromData(bytes);
