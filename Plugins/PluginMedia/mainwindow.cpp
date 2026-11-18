@@ -318,7 +318,71 @@ void VideoWorker::doDecode()
         int ret = av_read_frame(pFormatCtx, pkt);
         if (ret < 0)
         {
-            // 播放结束或 EOF
+            // 播放结束或 EOF：flush 解码器/重采样器，把内部缓存的尾帧/尾 PCM
+            // 取出来；否则帧级多线程/B 帧下的最后若干帧会丢失。
+            auto appendPcm = [&](const uint8_t *pcm, int nSamples) {
+                const int bytes = av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS,
+                                                             nSamples, AUDIO_OUT_FORMAT, 1);
+                if (bytes <= 0) return;
+                QMutexLocker locker(m_audioMutex);
+                const int buffered = m_audioByteBuf->size();
+                if (buffered + bytes <= AUDIO_BUFFER_LIMIT_BYTES
+                    || (bytes > AUDIO_BUFFER_LIMIT_BYTES && buffered == 0))
+                    m_audioByteBuf->append(reinterpret_cast<const char *>(pcm), bytes);
+            };
+            auto drainVideo = [&]() {
+                if (!pCodecCtx) return;
+                avcodec_send_packet(pCodecCtx, nullptr);
+                while (true)
+                {
+                    const int r = avcodec_receive_frame(pCodecCtx, pFrame);
+                    if (r < 0) break;
+                    if (!m_sws || !m_outData[0]) continue;
+                    sws_scale(m_sws, (const unsigned char * const *)pFrame->data,
+                              pFrame->linesize, 0, srcH, m_outData, m_outLinesize);
+                    QImage img((uchar *)m_outData[0],
+                               outW.load(std::memory_order_relaxed),
+                               outH.load(std::memory_order_relaxed),
+                               QImage::Format_RGB32);
+                    img = img.copy();
+                    qint64 ptsMs = 0;
+                    if (pFrame->pts != AV_NOPTS_VALUE && videoindex >= 0)
+                    {
+                        ptsMs = qint64(pFrame->pts
+                                       * av_q2d(pFormatCtx->streams[videoindex]->time_base) * 1000);
+                        if (ptsMs < 0) ptsMs = 0;
+                    }
+                    emit frameDecoded(img, ptsMs, m_genId);
+                    if (ptsMs > 0) m_lastPtsMs = ptsMs;
+                }
+            };
+            auto drainAudio = [&]() {
+                if (!aCodecCtx) return;
+                avcodec_send_packet(aCodecCtx, nullptr);
+                while (true)
+                {
+                    const int r = avcodec_receive_frame(aCodecCtx, pAudioFrame);
+                    if (r < 0) break;
+                    if (!swr_ctx) continue;
+                    int outCount = swr_get_out_samples(swr_ctx, pAudioFrame->nb_samples);
+                    if (outCount <= 0 || outCount > m_audioOutBufCapacity)
+                        outCount = m_audioOutBufCapacity;
+                    const int len = swr_convert(swr_ctx, &audio_out_buffer, outCount,
+                                                (const uint8_t **)pAudioFrame->data,
+                                                pAudioFrame->nb_samples);
+                    if (len > 0) appendPcm(audio_out_buffer, len);
+                }
+                if (swr_ctx)
+                {
+                    int outCount = swr_get_out_samples(swr_ctx, 0);
+                    if (outCount <= 0 || outCount > m_audioOutBufCapacity)
+                        outCount = m_audioOutBufCapacity;
+                    const int len = swr_convert(swr_ctx, &audio_out_buffer, outCount, nullptr, 0);
+                    if (len > 0) appendPcm(audio_out_buffer, len);
+                }
+            };
+            drainVideo();
+            drainAudio();
             break;
         }
 

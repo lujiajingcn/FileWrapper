@@ -32,6 +32,7 @@
 #include <QAbstractItemModel>
 #include <QAction>
 #include <QApplication>
+#include <QProcess>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -621,15 +622,23 @@ static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
                .arg(sBrokenError.left(40)));
 
     // ---- D6: 把坏文件换成真插件后「重试加载」能恢复 ----
-    // 用 PluginPdf.dll 当替身：它只声明 1 个后缀，注册表冲突告警最少
-    // （用 PluginText.dll 会刷 37 条 "后缀被多个插件声明" 的告警）。
+    // 放到独立子进程：PluginPdf 副本一旦在本进程加载，Windows 会一直映射
+    // ZZBroken.dll，QFile::remove 永远失败并留下第 9 个模块。子进程退出后
+    // 映射自然释放，父进程再清理文件。
     const QString sPath = brokenProbePluginPath();
+    QProcess d6Child;
+    d6Child.start(QCoreApplication::applicationFilePath(),
+                  QStringList{QStringLiteral("--d6-child")});
+    const bool bChildFinished = d6Child.waitForFinished(60000);
+    const bool bD6 = bChildFinished && d6Child.exitStatus() == QProcess::NormalExit
+                     && d6Child.exitCode() == 0;
+    report(bD6, QStringLiteral("D6: retry recovered in isolated process (exit %1)")
+                    .arg(bChildFinished ? d6Child.exitCode() : -999));
+    if (!bD6)
+        note(QStringLiteral("D6 child stderr: ")
+             + QString::fromLocal8Bit(d6Child.readAllStandardError()).left(400));
     QFile::remove(sPath);
-    QFile::copy(appPluginsDir + QStringLiteral("/PluginPdf.dll"), sPath);
-    const int recovered = pm->retryFailedPlugins();
-    report(recovered == 1 && pm->failures().isEmpty()
-               && pm->getInterface(sPath) != nullptr,
-           QStringLiteral("D6: retry recovered %1 plugin").arg(recovered));
+    QFile::remove(sPath.left(sPath.size() - 4) + QStringLiteral(".json"));
 
     // ---- D7: 文件损坏时重试不会假装成功 ----
     // 注意必须换一个"本进程从未加载过"的文件名：同一个路径在 D6 已被成功加载，
@@ -2344,9 +2353,48 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
 }
 
 // ---------------------------------------------------------------------------
+
+// D6 的独立子进程：加载坏插件→换成真插件→重试→进程退出后模块自然卸载，
+// 父进程才能删除 ZZBroken.dll，避免同一进程留下第 9 个重复模块。
+static int runBrokenRetryChild()
+{
+    QTemporaryDir childSettings;
+    if (childSettings.isValid())
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, childSettings.path());
+    const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
+    const QString dll = dir + QStringLiteral("/ZZBroken.dll");
+    const QString json = dir + QStringLiteral("/ZZBroken.json");
+    QFile::remove(dll);
+    QFile::remove(json);
+    {
+        QFile f(dll);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return 1;
+        f.write("not a plugin");
+    }
+    {
+        QFile f(json);
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write("{\"Name\":\"zzBrokenChild\",\"apiVersion\":3,\"extensions\":[\"zzc\"]}");
+    }
+
+    PluginManager *pm = PluginManager::getInstance();
+    pm->loadAllPlugins();
+    const bool bRecorded = !pm->failureFor(dll).isEmpty();
+
+    QFile::remove(dll);
+    if (!QFile::copy(dir + QStringLiteral("/PluginPdf.dll"), dll)) return 1;
+    const int nRecovered = pm->retryFailedPlugins();
+    const bool bOk = bRecorded && nRecovered == 1 && pm->getInterface(dll) != nullptr;
+    return bOk ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
+
+    for (int i = 1; i < argc; ++i)
+        if (QString::fromLocal8Bit(argv[i]) == QLatin1String("--d6-child"))
+            return runBrokenRetryChild();
 
     // 测试必须与用户真实配置隔离：插件映射（QSettings PluginMap）与插件启停
     // （PluginEnabled）都会读写 ini，若用默认路径，一次测试就会改动用户设置。
