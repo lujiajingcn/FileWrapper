@@ -79,7 +79,8 @@ bool isSkippedDestination(const QString &w)
         QStringLiteral("footer"),   QStringLiteral("footerl"),
         QStringLiteral("footerr"),  QStringLiteral("footerf"),
         QStringLiteral("footnote"), QStringLiteral("annotation"),
-        QStringLiteral("field"),    QStringLiteral("fldinst"),
+        /* field 组不跳过：fldinst 指令组仍跳过，fldrslt 的结果文字应显示 */
+        QStringLiteral("fldinst"),
         QStringLiteral("filetbl"),  QStringLiteral("listtable"),
         QStringLiteral("listoverridetable"), QStringLiteral("rsidtbl"),
         QStringLiteral("generator"), QStringLiteral("xmlnstbl"),

@@ -1565,6 +1565,13 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
 
 void MainWindow::on_actionLoadFile_triggered()
 {
+    if (m_fileManager->isBusy())
+    {
+        QMessageBox::information(this, tr("操作进行中"),
+            tr("正在保存/合并归档，请等待完成后再执行其它文件操作。"));
+        return;
+    }
+
     if (!confirmDiscardOrSaveIfDirty())
         return;
 
@@ -1636,6 +1643,13 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
 
 void MainWindow::on_actionMergeFile_triggered()
 {
+    if (m_fileManager->isBusy())
+    {
+        QMessageBox::information(this, tr("操作进行中"),
+            tr("正在保存/合并归档，请等待完成后再执行其它文件操作。"));
+        return;
+    }
+
     DlgMergeFile dlgMergeFile(this);
     if(dlgMergeFile.exec() == QDialog::Accepted)
     {
@@ -2615,6 +2629,13 @@ void MainWindow::on_actionPluginMap_triggered()
 
 void MainWindow::on_actionUnloadFile_triggered()
 {
+    if (m_fileManager->isBusy())
+    {
+        QMessageBox::information(this, tr("操作进行中"),
+            tr("正在保存/合并归档，请等待完成后再执行其它文件操作。"));
+        return;
+    }
+
     if (!confirmDiscardOrSaveIfDirty())
         return;
 

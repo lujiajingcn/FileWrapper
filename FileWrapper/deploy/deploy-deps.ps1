@@ -55,9 +55,7 @@ foreach ($raw in (Get-Content -LiteralPath $Manifest -Encoding UTF8)) {
 
     $parts = $line.Split('|')
     if ($parts.Count -lt 3) {
-        Write-Host "[deploy][WARN] malformed manifest line (need kind|src|dst): $line"
-        $warned++
-        continue
+        Fail "malformed manifest line (need kind|src|dst): $line"
     }
 
     $kind = $parts[0].Trim()
@@ -66,9 +64,7 @@ foreach ($raw in (Get-Content -LiteralPath $Manifest -Encoding UTF8)) {
     $hint = ''
     if ($parts.Count -ge 4) { $hint = $parts[3].Trim() }
     if ($kind.Length -eq 0 -or $src.Length -eq 0 -or $dst.Length -eq 0) {
-        Write-Host "[deploy][WARN] empty field in manifest line: $line"
-        $warned++
-        continue
+        Fail "empty field in manifest line: $line"
     }
 
     $srcPath = $null
@@ -78,9 +74,7 @@ foreach ($raw in (Get-Content -LiteralPath $Manifest -Encoding UTF8)) {
         'ffmpeg'  { $srcPath = Join-Path $FfmpegBin $src }
         'repo'    { $srcPath = Join-Path $RepoRoot  $src }
         default   {
-            Write-Host "[deploy][WARN] unknown source kind '$kind': $line"
-            $warned++
-            continue
+            Fail "unknown source kind '$kind': $line"
         }
     }
 

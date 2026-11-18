@@ -714,6 +714,8 @@ bool MainWindow::loadMobi(const QByteArray &data)
     for (MOBIPart *p = rawml->flow; p; p = p->next)
     {
         if (!p->data || p->size == 0) continue;
+        // flow 里除正文 HTML 外还有 T_CSS/T_SVG 等附加部件，不能当正文拼接。
+        if (p->type != T_HTML) continue;
         // p->size 是 size_t，直接 static_cast<int> 会在超过 INT_MAX 时截断成负数，
         // 进而给 QString::fromUtf8 传入负长度；这里先做防御性检查。
         if (p->size > static_cast<size_t>(std::numeric_limits<int>::max()))
