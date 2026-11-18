@@ -37,11 +37,16 @@ FORMS += \
 # libmobi 静态库：独立 Makefile 编出 libmobi.a，规避 qmake 把 miniz.c 误判为头文件
 # 依赖而丢弃 miniz.o 导致的 mz_uncompress 未定义链接错误。
 LIBMOBI_DIR = $$PWD/../thirdparty/libmobi
-LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj
-LIBMOBI_LIB = $$OUT_PWD/libmobi
+CONFIG(debug, debug|release) {
+    LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj-debug
+    LIBMOBI_LIB = $$OUT_PWD/libmobi-lib-debug
+} else {
+    LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj-release
+    LIBMOBI_LIB = $$OUT_PWD/libmobi-lib-release
+}
 LIBS        += -L$$LIBMOBI_LIB -lmobi
 libmobi.target   = $$LIBMOBI_LIB/libmobi.a
-libmobi.commands = $(MAKE) -C $$LIBMOBI_DIR -f Makefile.mingw OBJDIR=$$shell_path($$LIBMOBI_OBJ) LIBDIR=$$shell_path($$LIBMOBI_LIB)
+libmobi.commands = $(MAKE) -C \"$$shell_path($$LIBMOBI_DIR)\" -f Makefile.mingw OBJDIR=\"$$shell_path($$LIBMOBI_OBJ)\" LIBDIR=\"$$shell_path($$LIBMOBI_LIB)\"
 libmobi.depends  = $$files($$LIBMOBI_DIR/src/*.c) $$files($$LIBMOBI_DIR/src/*.h) $$LIBMOBI_DIR/Makefile.mingw
 PRE_TARGETDEPS  += $$LIBMOBI_LIB/libmobi.a
 QMAKE_EXTRA_TARGETS += libmobi

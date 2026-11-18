@@ -27,12 +27,16 @@ import sys
 import zipfile
 import zlib
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.opc.constants import RELATIONSHIP_TYPE as RT
-from docx.shared import Inches, Pt, RGBColor
-from PIL import Image, ImageDraw
+try:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.shared import Inches, Pt, RGBColor
+    from PIL import Image, ImageDraw
+except ImportError:
+    # 缺依赖时让 _preflight_deps() 在 __main__ 里给出可读提示，而不是先抛 traceback。
+    pass
 
 WORK = (os.path.abspath(sys.argv[1]) if len(sys.argv) > 1
         else os.path.dirname(os.path.abspath(__file__)))

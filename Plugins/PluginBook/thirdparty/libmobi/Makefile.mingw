@@ -46,3 +46,7 @@ $(OBJDIR)/%.o: src/%.c
 
 clean:
 	del /q $(subst /,\,$(OBJS)) $(subst /,\,$(LIB)) 2>nul
+
+# T-12: header dependency tracking
+CFLAGS += -MMD -MP
+-include $(OBJS:.o=.d)

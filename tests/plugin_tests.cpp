@@ -1654,7 +1654,7 @@ static void verifyMergeDialog()
            QStringLiteral("H9: tree sort is per-level, directories first, size numeric/recursive"));
 
     // H10: 真实 MainWindow 树形填充——目录"合计大小/文件夹"、同级目录优先排序
-    const QString sTreeDir = QDir::tempPath() + QStringLiteral("/fw_tree_sort_test");
+    const QString sTreeDir = QDir::tempPath() + QStringLiteral("/fw_tree_sort_test_%1").arg(QCoreApplication::applicationPid());
     QDir(sTreeDir).removeRecursively();
     QDir().mkpath(sTreeDir + QStringLiteral("/sub"));
     auto writeBytes = [](const QString &sPath, int n) {
@@ -1830,7 +1830,7 @@ static void verifyMergeDialog()
            QStringLiteral("H12: FILEINFO uses InfoRole; dir role no longer aliases default data() role"));
 
     // H13: 单链目录压缩后不得残留空壳行（M-02 回归）
-    const QString sChainDir = QDir::tempPath() + QStringLiteral("/fw_chain_test");
+    const QString sChainDir = QDir::tempPath() + QStringLiteral("/fw_chain_test_%1").arg(QCoreApplication::applicationPid());
     QDir(sChainDir).removeRecursively();
     QDir().mkpath(sChainDir + QStringLiteral("/sub/deep"));
     const bool bChainFiles = writeBytes(sChainDir + QStringLiteral("/sub/deep/only.txt"), 100)
@@ -2021,14 +2021,16 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     // K2: 同一盘内添加"归档公共根之外"的文件后保存：
     //     公共根应上移且各条目保留子目录层级（fixtures/...），不能拍平成文件名。
     const QString sSame = scratchDir + QStringLiteral("/save_same.dat");
-    // 用规范化的真实路径（QFileDialog 返回的就是这种），避免 ".." 影响路径规划
-    const QString sUp   = QFileInfo(work + QStringLiteral("/../run-plugin-tests.ps1"))
-                              .canonicalFilePath();
-    if (!QFileInfo::exists(sUp))
+    // 用 fixtures 的上一级目录里自建文件作为“公共根之外”的来源，
+    // 不再依赖 work/../run-plugin-tests.ps1 的存在（-FixturesDir 可指向任意目录）。
+    const QString sUp = QFileInfo(work + QStringLiteral("/../k2_sibling.txt"))
+                            .absoluteFilePath();
     {
-        report(false, QStringLiteral("K2: skipped (missing %1)").arg(sUp));
+        QFile fUp(sUp);
+        fUp.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        fUp.write("k2 sibling");
     }
-    else
+    if (true)
     {
         FileManager fm3;
         fm3.QMergeFiles(QVector<QString>{ work + QStringLiteral("/basic.docx"),

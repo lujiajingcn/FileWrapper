@@ -26,13 +26,18 @@ CONFIG += c++11
 LIBMOBI_DIR = $$PWD/thirdparty/libmobi
 INCLUDEPATH += $$LIBMOBI_DIR/src
 DEFINES     += WITH_LIBMOBI
-LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj
-LIBMOBI_LIB = $$OUT_PWD/libmobi
+CONFIG(debug, debug|release) {
+    LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj-debug
+    LIBMOBI_LIB = $$OUT_PWD/libmobi-lib-debug
+} else {
+    LIBMOBI_OBJ = $$OUT_PWD/libmobi-obj-release
+    LIBMOBI_LIB = $$OUT_PWD/libmobi-lib-release
+}
 LIBS        += -L$$LIBMOBI_LIB -lmobi
 
 # 链接 PluginBook.dll 前，先用独立 Makefile 构建 libmobi.a
 libmobi.target    = $$LIBMOBI_LIB/libmobi.a
-libmobi.commands  = $(MAKE) -C $$LIBMOBI_DIR -f Makefile.mingw OBJDIR=$$shell_path($$LIBMOBI_OBJ) LIBDIR=$$shell_path($$LIBMOBI_LIB)
+libmobi.commands  = $(MAKE) -C \"$$shell_path($$LIBMOBI_DIR)\" -f Makefile.mingw OBJDIR=\"$$shell_path($$LIBMOBI_OBJ)\" LIBDIR=\"$$shell_path($$LIBMOBI_LIB)\"
 libmobi.depends   = $$files($$LIBMOBI_DIR/src/*.c) $$files($$LIBMOBI_DIR/src/*.h) $$LIBMOBI_DIR/Makefile.mingw
 PRE_TARGETDEPS   += $$LIBMOBI_LIB/libmobi.a
 QMAKE_EXTRA_TARGETS += libmobi
