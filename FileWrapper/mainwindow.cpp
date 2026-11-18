@@ -167,15 +167,19 @@ MainWindow::MainWindow(QWidget *parent) :
     m_acOutputFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
     ui->actionUnloadFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_U));
 
+    ui->menu_2->setIcon(FwIcons::get(QStringLiteral("plugin")));
+
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
     m_acVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
     m_acVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
+    m_acVerify->setIcon(FwIcons::get(QStringLiteral("diagnose")));
     connect(m_acVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
     ui->menu->addAction(m_acVerify);
 
     // 「插件诊断」加入插件设置菜单：插件加载失败时用户能自己看到原因与缺哪个依赖
     QAction *actPluginDiag = new QAction(QStringLiteral("插件诊断"), ui->menu_2);
     actPluginDiag->setToolTip(QStringLiteral("查看已加载插件、加载失败原因与缺失的运行依赖"));
+    actPluginDiag->setIcon(FwIcons::get(QStringLiteral("diagnose")));
     connect(actPluginDiag, &QAction::triggered, this,
             &MainWindow::onActionPluginDiagnosticsTriggered);
     ui->menu_2->addAction(actPluginDiag);
@@ -183,17 +187,20 @@ MainWindow::MainWindow(QWidget *parent) :
     // 「插件管理」勾选启用/禁用、「重新加载插件」让修改生效（C5）
     QAction *actPluginMgr = new QAction(QStringLiteral("插件管理"), ui->menu_2);
     actPluginMgr->setToolTip(QStringLiteral("勾选启用/禁用插件；禁用的插件不加载，也不接手它的文件后缀"));
+    actPluginMgr->setIcon(FwIcons::get(QStringLiteral("manage")));
     connect(actPluginMgr, &QAction::triggered, this, &MainWindow::onActionPluginManagerTriggered);
     ui->menu_2->addAction(actPluginMgr);
 
     QAction *actReloadPlugins = new QAction(QStringLiteral("重新加载插件"), ui->menu_2);
     actReloadPlugins->setToolTip(QStringLiteral("重新扫描 plugins/ 目录（会先关闭所有标签页）"));
+    actReloadPlugins->setIcon(FwIcons::get(QStringLiteral("reload")));
     connect(actReloadPlugins, &QAction::triggered, this, &MainWindow::onActionReloadPluginsTriggered);
     ui->menu_2->addAction(actReloadPlugins);
 
     // 「支持的格式」：告诉用户能打开什么、遇到不支持的格式该怎么办（比"插件映射"更直接）
     QAction *actFormats = new QAction(QStringLiteral("支持的格式…"), ui->menu_2);
     actFormats->setToolTip(QStringLiteral("查看已安装插件能打开哪些格式，以及常见不支持格式的处理建议"));
+    actFormats->setIcon(FwIcons::get(QStringLiteral("formats")));
     connect(actFormats, &QAction::triggered, this, &MainWindow::onActionSupportedFormatsTriggered);
     ui->menu_2->addAction(actFormats);
 
