@@ -703,10 +703,12 @@ void MainWindow::showSupportedFormats()
         if (sPath.isEmpty()) continue;
         QStringList exts = pMgr->extensionsOf(sPath);
         exts.sort();
+        const bool bLoaded = pMgr->getInterface(sPath) != nullptr;
         QStringList dotted;
         for (const QString &e : exts) dotted << (QStringLiteral(".") + e);
-        lines << QStringLiteral("  · %1：%2")
+        lines << QStringLiteral("  · %1%2：%3")
                      .arg(PluginDiagnostics::pluginDisplayName(sPath),
+                          bLoaded ? QString() : QStringLiteral("（未加载：已禁用或依赖缺失）"),
                           dotted.isEmpty() ? QStringLiteral("（未声明后缀）")
                                            : dotted.join(QStringLiteral(" ")));
     }

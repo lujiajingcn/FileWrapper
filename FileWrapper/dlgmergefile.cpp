@@ -28,8 +28,12 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
     // 自适应尺寸：固定 1000×600 在小屏/高缩放下可能超出可用区域（4K@150% 实测 1500×900）
     const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 800);
-    resize(qMin(1000, qMax(720, avail.width() - 80)),
-           qMin(600, qMax(420, avail.height() - 80)));
+    // 小屏/高缩放下不能再用 qMax(720/420) 兜底，否则可用区 <720 时必然越界。
+    int w = qMin(1000, qMax(320, avail.width() - 80));
+    int h = qMin(600,  qMax(260, avail.height() - 80));
+    if (avail.width()  > 40 && w > avail.width()  - 20) w = qMax(200, avail.width()  - 20);
+    if (avail.height() > 40 && h > avail.height() - 20) h = qMax(180, avail.height() - 20);
+    resize(w, h);
 
     m_hModelFilePath = new QStandardItemModel(this);
     m_hModelFilePath->setColumnCount(1);
