@@ -280,7 +280,9 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_tvFilePath->setSortingEnabled(false);
-    m_tvFilePath->header()->installEventFilter(this);
+    // 表头的鼠标事件是发到 header 的 viewport 上的，过滤器必须装在 viewport 上，
+    // 否则收不到按下列头的事件，排序后无法恢复展开状态。
+    m_tvFilePath->header()->viewport()->installEventFilter(this);
 
     // 添加工具栏
     m_tbFilePath = new QToolBar(ui->dwFilePath);
@@ -1438,7 +1440,9 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
     // 树形模式下点列头排序会 takeRow/appendRow 重建行，导致已展开目录被折叠：
     // 按下时记住展开状态，松开后（排序已执行）恢复。
-    if (m_tvFilePath && m_bTreeMode && obj == m_tvFilePath->header())
+    // 注意：表头鼠标事件落在 header 的 viewport 上，过滤器装在那里才收得到。
+    QWidget *pHeaderViewport = m_tvFilePath ? m_tvFilePath->header()->viewport() : nullptr;
+    if (pHeaderViewport != nullptr && m_bTreeMode && obj == pHeaderViewport)
     {
         if (event->type() == QEvent::MouseButtonPress)
         {

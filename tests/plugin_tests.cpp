@@ -46,6 +46,8 @@
 #include <QSettings>
 #include <QStatusBar>
 #include <QTreeView>
+#include <QHeaderView>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QShortcut>
 #include <QStandardItemModel>
@@ -1628,6 +1630,68 @@ static void verifyMergeDialog()
     }
     report(bTreeUi,
            QStringLiteral("H10: real tree view shows dir totals and sorts dirs-first per level"));
+
+    // H11: 树形点头列头排序不改变目录的展开/收起状态
+    bool bExpansionKept = false;
+    if (bMerged)
+    {
+        ProbeTreeWindow mwExp;
+        QMetaObject::invokeMethod(&mwExp, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwExp.loadArchiveFile(sTreeArc);
+        mwExp.show();
+        QApplication::processEvents();
+        auto *pExpView = mwExp.findChild<QTreeView *>();
+        auto *pExpModel = pExpView ? qobject_cast<QStandardItemModel *>(pExpView->model())
+                                   : nullptr;
+        QStandardItem *pExpRoot = pExpModel ? pExpModel->item(0, 0) : nullptr;
+        QStandardItem *pExpSub = nullptr;
+        if (pExpRoot)
+        {
+            for (int r = 0; r < pExpRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pExpRoot->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("sub")))
+                    pExpSub = pChild;
+            }
+        }
+        if (pExpSub)
+        {
+            const QModelIndex subIdx = pExpModel->indexFromItem(pExpSub);
+            pExpView->expand(subIdx);
+            QApplication::processEvents();
+            const bool bExpandedBefore = pExpView->isExpanded(subIdx);
+
+            // 点击"大小"列头：按下捕获展开状态，松开后排序，再恢复
+            QHeaderView *pHeader = pExpView->header();
+            pHeader->resizeSection(1, 120);
+            QApplication::processEvents();
+            const QPoint pos(pHeader->sectionViewportPosition(1) + 20,
+                             pHeader->height() / 2);
+            const QPoint globalPos = pHeader->viewport()->mapToGlobal(pos);
+            QMouseEvent press(QEvent::MouseButtonPress, pos, globalPos,
+                              Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(pHeader->viewport(), &press);
+            QMouseEvent release(QEvent::MouseButtonRelease, pos, globalPos,
+                                Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+            QApplication::sendEvent(pHeader->viewport(), &release);
+            QApplication::processEvents();
+
+            // 排序会移动行；按名称重新找到 sub 再检查展开状态
+            QStandardItem *pExpSubAfter = nullptr;
+            for (int r = 0; r < pExpRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pExpRoot->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("sub")))
+                    pExpSubAfter = pChild;
+            }
+            const bool bExpandedAfter = pExpSubAfter != nullptr
+                && pExpView->isExpanded(pExpModel->indexFromItem(pExpSubAfter));
+            bExpansionKept = bExpandedBefore && bExpandedAfter
+                             && pHeader->sortIndicatorSection() == 1;
+        }
+    }
+    report(bExpansionKept,
+           QStringLiteral("H11: header-click sort keeps expanded directories expanded"));
 
 }
 
