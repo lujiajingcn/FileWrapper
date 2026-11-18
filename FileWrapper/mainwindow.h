@@ -19,6 +19,8 @@
 #include <QVector>
 #include <QMetaObject>
 #include <QElapsedTimer>
+#include <QSharedPointer>
+#include <QPointer>
 
 class QProgressDialog;
 class QCloseEvent;
@@ -166,7 +168,10 @@ private:
             }
         }
     };
-    QHash<PluginInterface*, MappedInput*> m_mapMappedInputs;
+    QHash<PluginInterface*, QSharedPointer<MappedInput>> m_mapMappedInputs;
+    QSet<QString> m_setMappedCrcPending;
+    QSet<QString> m_setMappedCrcVerified;
+    void checkMappedCrcAsync(const QString &sPath, const QSharedPointer<MappedInput> &mapped, quint32 nExpected);
     void releaseMappedInput(PluginInterface *iface);
     void releaseAllMappedInputs();
 

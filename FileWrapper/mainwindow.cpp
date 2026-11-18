@@ -5,6 +5,7 @@
 
 #include <QLabel>
 #include <QApplication>
+#include <thread>
 #include <QFileDialog>
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
@@ -1017,14 +1018,14 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
 
     QWidget *pOldOwned = nullptr;
     // 先摘下旧实例的归档映射（不能等到 delete 之后再用悬空指针作哈希键）
-    MappedInput *pOldMapped = doc.interface != nullptr
-                                  ? m_mapMappedInputs.take(doc.interface) : nullptr;
+    QSharedPointer<MappedInput> pOldMapped = doc.interface != nullptr
+                                  ? m_mapMappedInputs.take(doc.interface) : QSharedPointer<MappedInput>();
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOldOwned = doc.interface->getPluginWidget();
         delete doc.interface;
     }
-    delete pOldMapped;   // 实例销毁（解码线程已停）后再释放映射
+    pOldMapped.clear();   // 实例销毁（解码线程已停）后再释放映射
     if (pOldPage != nullptr && pOldPage != pOldOwned && !m_setPluginWidgets.contains(pOldPage))
         delete pOldPage;
 
@@ -1060,14 +1061,14 @@ void MainWindow::destroyTabAt(int index)
     // 独占实例：delete 会连带 delete 其内部窗口（即该页面）
     QWidget *pOwnedWidget = nullptr;
     // 先摘下映射，delete 后不能再拿悬空指针当 QHash 的键
-    MappedInput *pMapped = doc.interface != nullptr
-                               ? m_mapMappedInputs.take(doc.interface) : nullptr;
+    QSharedPointer<MappedInput> pMapped = doc.interface != nullptr
+                               ? m_mapMappedInputs.take(doc.interface) : QSharedPointer<MappedInput>();
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOwnedWidget = doc.interface->getPluginWidget();
         delete doc.interface;
     }
-    delete pMapped;   // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
+    pMapped.clear();   // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
 
     // 其余需要删除的页面：自建占位页（不是插件窗口、也不是已随实例销毁的窗口）
     if (pPage != nullptr && pPage != pOwnedWidget && !m_setPluginWidgets.contains(pPage))
@@ -1194,25 +1195,24 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             {
                 uchar *pMapped = pArc->map(info.nContentPositon, info.nFileLen);
                 if (pMapped != nullptr
-                    && !m_fileManager->verifyMappedCrc(
-                           info.sFilePath, reinterpret_cast<const char *>(pMapped), info.nFileLen))
-                {
-                    pArc->unmap(pMapped);
-                    pArc->close();
-                    delete pArc;
-                    onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
-                                             .arg(info.sFileName));
-                    iface->sendFileData(nullptr, 0);
-                    return;
-                }
-                if (pMapped != nullptr
                     && iface->sendFileMapped(reinterpret_cast<char *>(pMapped),
                                              info.nFileLen, info.sFileName))
                 {
-                    // 插件已接管并在播放期间引用该映射；旧映射可在新播放建立后释放
-                    MappedInput *pOld = m_mapMappedInputs.take(iface);
-                    m_mapMappedInputs.insert(iface, new MappedInput{pArc, pMapped, info.nFileLen});
-                    delete pOld;
+                    // 先交给插件开始播放；CRC 改为后台校验，不阻塞首帧。
+                    auto sp = QSharedPointer<MappedInput>::create();
+                    sp->pFile = pArc;
+                    sp->pData = pMapped;
+                    sp->nLen = info.nFileLen;
+                    m_mapMappedInputs.insert(iface, sp);
+
+                    quint32 nExpected = 0;
+                    if (m_fileManager->contentCrcFor(info.sFilePath, &nExpected)
+                        && !m_setMappedCrcVerified.contains(info.sFilePath)
+                        && !m_setMappedCrcPending.contains(info.sFilePath))
+                    {
+                        m_setMappedCrcPending.insert(info.sFilePath);
+                        checkMappedCrcAsync(info.sFilePath, sp, nExpected);
+                    }
                     return;
                 }
                 if (pMapped != nullptr)
@@ -1318,18 +1318,39 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     releaseMappedInput(iface);
 }
 
+void MainWindow::checkMappedCrcAsync(const QString &sPath,
+                                     const QSharedPointer<MappedInput> &mapped,
+                                     quint32 nExpected)
+{
+    QPointer<MainWindow> self(this);
+    std::thread([self, sPath, mapped, nExpected]() {
+        FwArc::Crc32 crc;
+        crc.update(reinterpret_cast<const char *>(mapped->pData), mapped->nLen);
+        const bool bOk = (crc.value() == nExpected);
+        if (self.isNull()) return;
+        QMetaObject::invokeMethod(self.data(), [self, sPath, bOk]() {
+            if (self.isNull()) return;
+            self->m_setMappedCrcPending.remove(sPath);
+            if (bOk)
+                self->m_setMappedCrcVerified.insert(sPath);
+            else
+                self->onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
+                                               .arg(QFileInfo(sPath).fileName()));
+        }, Qt::QueuedConnection);
+    }).detach();
+}
+
 void MainWindow::releaseMappedInput(PluginInterface *iface)
 {
     if (iface == nullptr)
         return;
-    delete m_mapMappedInputs.take(iface);
+    m_mapMappedInputs.remove(iface);
 }
 
 void MainWindow::releaseAllMappedInputs()
 {
     // 只在关闭/析构路径调用：此时标签页实例已或即将销毁，不能再解引用
     // 插件指针；正常切页的安全释放由 stopCurrentPlaybackAndInvalidate 负责。
-    qDeleteAll(m_mapMappedInputs);
     m_mapMappedInputs.clear();
 }
 

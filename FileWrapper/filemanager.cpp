@@ -1731,6 +1731,13 @@ bool FileManager::verifyMappedCrc(const QString &sFilePath, const char *pData, q
     return crc.value() == m_mapContentCrc.value(sFilePath);
 }
 
+bool FileManager::contentCrcFor(const QString &sFilePath, quint32 *pCrc) const
+{
+    if (pCrc == nullptr || !m_mapContentCrc.contains(sFilePath)) return false;
+    *pCrc = m_mapContentCrc.value(sFilePath);
+    return true;
+}
+
 QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr)
 {
     if (psErr) psErr->clear();

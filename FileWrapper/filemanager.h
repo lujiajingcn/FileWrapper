@@ -40,6 +40,8 @@ public:
     QByteArray entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr = nullptr);
     // 校验已映射归档内容区的 CRC（无记录 CRC 的 v1 返回 true）
     bool verifyMappedCrc(const QString &sFilePath, const char *pData, qint64 nLen) const;
+    // 取加载时记录的内容 CRC；v1/无记录返回 false
+    bool contentCrcFor(const QString &sFilePath, quint32 *pCrc) const;
     QVector<FILEINFO> getFileInfos();
 
     void outputFile(QString sFilePath, QString sOutputDir);
