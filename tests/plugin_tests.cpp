@@ -227,6 +227,14 @@ public:
     using MainWindow::choosePlugin;
 };
 
+// 树形列表测试：直接加载归档（loadArchiveFile 为 protected）
+class ProbeTreeWindow : public MainWindow
+{
+public:
+    ProbeTreeWindow() : MainWindow(nullptr) {}
+    using MainWindow::loadArchiveFile;
+};
+
 static void checkExtensionMapping()
 {
     struct Case { const char *ext; const char *dll; };
@@ -1481,15 +1489,146 @@ static void verifyMergeDialog()
     report(bSizeSortOk,
            QStringLiteral("H7: size column sorts numerically (989 < 998 < 99.16KB)"));
 
-    // H8: 平铺模式一进入就启用排序（不依赖"点平铺显示"动作的副作用），树形模式禁用
+    // H8: 平铺/树形都启用列排序（树形为"同级排序、目录优先"，不会拍平）
     auto *pView = mw.findChild<QTreeView *>();
-    const bool bTreeInitial = pView != nullptr && !pView->isSortingEnabled();
     QMetaObject::invokeMethod(&mw, "onActionViewFlatTriggered", Qt::DirectConnection);
     const bool bFlatEnabled = pView != nullptr && pView->isSortingEnabled();
     QMetaObject::invokeMethod(&mw, "onActionViewTreeTriggered", Qt::DirectConnection);
-    const bool bTreeDisabled = pView != nullptr && !pView->isSortingEnabled();
-    report(pView != nullptr && bTreeInitial && bFlatEnabled && bTreeDisabled,
-           QStringLiteral("H8: flat mode enables sorting directly, tree mode disables"));
+    const bool bTreeEnabled = pView != nullptr && pView->isSortingEnabled();
+    report(pView != nullptr && bFlatEnabled && bTreeEnabled,
+           QStringLiteral("H8: both flat and tree modes enable column sorting"));
+
+    // H9: 树形排序——同级排序、目录优先、大小按子树合计字节、递归到子目录
+    FileListModel treeModel;
+    treeModel.setColumnCount(3);
+    auto makeRow = [](const QString &sName, qint64 nBytes, bool bDir) -> QList<QStandardItem *> {
+        auto *pName = new QStandardItem(sName);
+        if (bDir)
+            pName->setData(true, FileListModel::IsDirRole);
+        auto *pSize = new QStandardItem(QString::number(nBytes));
+        pSize->setData(nBytes, FileListModel::BytesRole);
+        auto *pType = new QStandardItem(bDir ? QStringLiteral("文件夹") : QStringLiteral("TXT"));
+        return QList<QStandardItem *>() << pName << pSize << pType;
+    };
+    QList<QStandardItem *> rootRow = makeRow(QStringLiteral("root"), 3159, true);
+    treeModel.appendRow(rootRow);
+    QStandardItem *pRootItem = rootRow.at(0);
+    pRootItem->appendRow(makeRow(QStringLiteral("a.txt"), 50, false));
+    pRootItem->appendRow(makeRow(QStringLiteral("b.txt"), 999, false));
+    QList<QStandardItem *> zdirRow = makeRow(QStringLiteral("zdir"), 100, true);
+    pRootItem->appendRow(zdirRow);
+    zdirRow.at(0)->appendRow(makeRow(QStringLiteral("z.txt"), 100, false));
+    QList<QStandardItem *> adirRow = makeRow(QStringLiteral("adir"), 2010, true);
+    pRootItem->appendRow(adirRow);
+    adirRow.at(0)->appendRow(makeRow(QStringLiteral("d1.txt"), 2000, false));
+    adirRow.at(0)->appendRow(makeRow(QStringLiteral("d0.txt"), 10, false));
+
+    treeModel.sort(1, Qt::AscendingOrder);
+    QStringList treeTopAsc;
+    for (int r = 0; r < pRootItem->rowCount(); ++r)
+        treeTopAsc << pRootItem->child(r, 0)->text();
+    const QStandardItem *pAdirItem = pRootItem->child(1, 0);
+    bool bTreeSortOk = (treeTopAsc == QStringList{ QStringLiteral("zdir"),
+                                                   QStringLiteral("adir"),
+                                                   QStringLiteral("a.txt"),
+                                                   QStringLiteral("b.txt") });
+    bTreeSortOk = bTreeSortOk && pAdirItem != nullptr
+                  && pAdirItem->text() == QStringLiteral("adir")
+                  && pAdirItem->child(0, 0)->text() == QStringLiteral("d0.txt")
+                  && pAdirItem->child(1, 0)->text() == QStringLiteral("d1.txt");
+
+    treeModel.sort(1, Qt::DescendingOrder);
+    QStringList treeTopDesc;
+    for (int r = 0; r < pRootItem->rowCount(); ++r)
+        treeTopDesc << pRootItem->child(r, 0)->text();
+    bTreeSortOk = bTreeSortOk && (treeTopDesc == QStringList{ QStringLiteral("adir"),
+                                                              QStringLiteral("zdir"),
+                                                              QStringLiteral("b.txt"),
+                                                              QStringLiteral("a.txt") });
+    report(bTreeSortOk,
+           QStringLiteral("H9: tree sort is per-level, directories first, size numeric/recursive"));
+
+    // H10: 真实 MainWindow 树形填充——目录"合计大小/文件夹"、同级目录优先排序
+    const QString sTreeDir = QDir::tempPath() + QStringLiteral("/fw_tree_sort_test");
+    QDir(sTreeDir).removeRecursively();
+    QDir().mkpath(sTreeDir + QStringLiteral("/sub"));
+    auto writeBytes = [](const QString &sPath, int n) {
+        QFile f(sPath);
+        if (!f.open(QIODevice::WriteOnly))
+            return false;
+        return f.write(QByteArray(n, 'x')) == n;
+    };
+    const bool bFiles = writeBytes(sTreeDir + QStringLiteral("/sub/a.bin"), 50)
+                        && writeBytes(sTreeDir + QStringLiteral("/sub/b.bin"), 999)
+                        && writeBytes(sTreeDir + QStringLiteral("/top.txt"), 1234);
+    const QString sTreeArc = sTreeDir + QStringLiteral("/tree.dat");
+    FileManager fmTree;
+    if (bFiles)
+    {
+        fmTree.QMergeFiles(QVector<QString>{ sTreeDir + QStringLiteral("/sub/a.bin"),
+                                            sTreeDir + QStringLiteral("/sub/b.bin"),
+                                            sTreeDir + QStringLiteral("/top.txt") },
+                           sTreeArc);
+    }
+    const bool bMerged = bFiles && QFileInfo::exists(sTreeArc);
+    bool bTreeUi = false;
+    if (bMerged)
+    {
+        ProbeTreeWindow mwTree;
+        // 测试环境可能沿用用户上次保存的平铺模式：先显式切到树形再加载
+        QMetaObject::invokeMethod(&mwTree, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwTree.loadArchiveFile(sTreeArc);
+        auto *pTreeView = mwTree.findChild<QTreeView *>();
+        auto *pModel = pTreeView ? qobject_cast<QStandardItemModel *>(pTreeView->model())
+                                 : nullptr;
+        QStandardItem *pRootItem = pModel ? pModel->item(0, 0) : nullptr;
+        QStandardItem *pSubItem = nullptr;
+        if (pRootItem)
+        {
+            for (int r = 0; r < pRootItem->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pRootItem->child(r, 0);
+                if (pChild && pChild->text().endsWith(QStringLiteral("sub")))
+                    pSubItem = pChild;
+            }
+        }
+        bTreeUi = pRootItem != nullptr
+                  && pRootItem->data(FileListModel::IsDirRole).toBool()
+                  && pModel->item(0, 1) != nullptr
+                  && pModel->item(0, 1)->data(FileListModel::BytesRole).toLongLong() == 2283
+                  && pModel->item(0, 2) != nullptr
+                  && pModel->item(0, 2)->text() == QStringLiteral("文件夹")
+                  && pSubItem != nullptr
+                  && pSubItem->data(FileListModel::IsDirRole).toBool();
+
+        if (bTreeUi)
+        {
+            // 按大小降序：目录永远在前（sub 1049 在 top.txt 1234 之前），目录内 999 > 50
+            pModel->sort(1, Qt::DescendingOrder);
+            const QString sFirst = pRootItem->child(0, 0) ? pRootItem->child(0, 0)->text() : QString();
+            const QString sSecond = pRootItem->child(1, 0) ? pRootItem->child(1, 0)->text() : QString();
+            int nSubRow = -1;
+            for (int r = 0; r < pRootItem->rowCount(); ++r)
+                if (pRootItem->child(r, 0) == pSubItem)
+                    nSubRow = r;
+            const bool bSubSize = nSubRow >= 0
+                                  && pRootItem->child(nSubRow, 1) != nullptr
+                                  && pRootItem->child(nSubRow, 1)->data(FileListModel::BytesRole).toLongLong() == 1049;
+            const bool bSubType = nSubRow >= 0
+                                  && pRootItem->child(nSubRow, 2) != nullptr
+                                  && pRootItem->child(nSubRow, 2)->text() == QStringLiteral("文件夹");
+            const QString sSubFirst = pSubItem->child(0, 0) ? pSubItem->child(0, 0)->text() : QString();
+            const QString sSubSecond = pSubItem->child(1, 0) ? pSubItem->child(1, 0)->text() : QString();
+            bTreeUi = sFirst.endsWith(QStringLiteral("sub"))
+                      && sSecond.endsWith(QStringLiteral("top.txt"))
+                      && bSubSize && bSubType
+                      && sSubFirst.endsWith(QStringLiteral("b.bin"))
+                      && sSubSecond.endsWith(QStringLiteral("a.bin"));
+        }
+    }
+    report(bTreeUi,
+           QStringLiteral("H10: real tree view shows dir totals and sorts dirs-first per level"));
+
 }
 
 // ---------------------------------------------------------------------------

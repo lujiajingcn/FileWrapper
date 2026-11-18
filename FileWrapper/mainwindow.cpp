@@ -280,6 +280,7 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_tvFilePath->setSortingEnabled(false);
+    m_tvFilePath->header()->installEventFilter(this);
 
     // 添加工具栏
     m_tbFilePath = new QToolBar(ui->dwFilePath);
@@ -1435,6 +1436,35 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
 // 在 viewport 层接管双击可同时绕开这两个问题，且对目录与文件一视同仁。
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
+    // 树形模式下点列头排序会 takeRow/appendRow 重建行，导致已展开目录被折叠：
+    // 按下时记住展开状态，松开后（排序已执行）恢复。
+    if (m_tvFilePath && m_bTreeMode && obj == m_tvFilePath->header())
+    {
+        if (event->type() == QEvent::MouseButtonPress)
+        {
+            m_setExpandedBeforeSort.clear();
+            for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+                collectExpandedItems(m_hModelFilePath->index(i, 0), QString(),
+                                     m_setExpandedBeforeSort);
+        }
+        else if (event->type() == QEvent::MouseButtonRelease
+                 && !m_setExpandedBeforeSort.isEmpty())
+        {
+            QTimer::singleShot(0, this, [this]() {
+                if (!m_bTreeMode)
+                {
+                    m_setExpandedBeforeSort.clear();
+                    return;
+                }
+                for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+                    restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(),
+                                         m_setExpandedBeforeSort);
+                m_setExpandedBeforeSort.clear();
+            });
+        }
+        // 不消费事件：让 QHeaderView/QTreeView 正常完成排序
+    }
+
     if (m_tvFilePath && m_hModelFilePath
         && obj == m_tvFilePath->viewport()
         && event->type() == QEvent::MouseButtonDblClick)
@@ -1806,27 +1836,34 @@ void MainWindow::populateFilePathView(bool bShowPath)
 {
     m_bShowPath = bShowPath;
 
+    // 两种模式都支持点列头排序：
+    //   * 平铺：全局排序；
+    //   * 树形：同级排序、目录优先（FileListModel 实现），不会把层级拍平。
+    m_tvFilePath->setSortingEnabled(true);
+
     if (m_bTreeMode)
     {
-        // 树形模式的层级不能被列排序打散
-        m_tvFilePath->setSortingEnabled(false);
-        populateFilePathTree();
+        populateFilePathTree();   // 内部完成排序并恢复展开状态
     }
     else
     {
         populateFilePathList(bShowPath);
-        // 平铺模式的排序状态在这里统一启用，而不是只在「平铺显示」动作里：
-        // 若视图模式本来就是平铺（记住的设置 / 加载归档后直接平铺），
-        // 那一步动作会提前 return，排序就永远不会生效。
-        m_tvFilePath->setSortingEnabled(true);
-        QHeaderView *pHeader = m_tvFilePath->header();
-        const int nSection = pHeader->sortIndicatorSection();
-        m_tvFilePath->sortByColumn(nSection >= 0 ? nSection : 0,
-                                   nSection >= 0 ? pHeader->sortIndicatorOrder()
-                                                 : Qt::AscendingOrder);
+        applyCurrentSortToModel();
     }
 
     updateViewActionState();
+}
+
+// 按表头当前的排序列/方向排序（树形模式下为同级排序、目录优先）
+void MainWindow::applyCurrentSortToModel()
+{
+    if (m_tvFilePath == nullptr || m_hModelFilePath == nullptr)
+        return;
+    QHeaderView *pHeader = m_tvFilePath->header();
+    const int nSection = pHeader->sortIndicatorSection();
+    m_hModelFilePath->sort(nSection >= 0 ? nSection : 0,
+                           nSection >= 0 ? pHeader->sortIndicatorOrder()
+                                         : Qt::AscendingOrder);
 }
 
 // 平铺模式：每个文件一行，文本为完整路径或文件名
@@ -1873,9 +1910,57 @@ QString MainWindow::typeLabel(const QString &sFileName)
 //   根节点 = 所有条目的最长公共父目录（如 E:/study/docs）
 //   根下按各条目去掉前缀后的目录段逐级建节点，文件作为叶子
 //   只有唯一子目录的链条会被压缩成一行（a -> b -> c 显示为 "a/b/c"）
-void MainWindow::populateFilePathTree()
+// 目录节点补齐列：大小=子树合计字节（BytesRole），类型="文件夹"，并标记 IsDirRole。
+// 返回本目录下所有文件的字节合计，供父目录继续累加。
+static qint64 finalizeTreeRows(QStandardItem *pParent)
 {
-    // 先记录重建前已展开的目录，重建后恢复，避免增删一个文件导致整棵树被折叠
+    if (pParent == nullptr)
+        return 0;
+
+    qint64 nTotal = 0;
+    for (int r = 0; r < pParent->rowCount(); ++r)
+    {
+        QStandardItem *pItem = pParent->child(r, 0);
+        if (pItem == nullptr)
+            continue;
+
+        if (pItem->rowCount() > 0)   // 目录
+        {
+            pItem->setData(true, FileListModel::IsDirRole);
+            const qint64 nSub = finalizeTreeRows(pItem);
+
+            QStandardItem *pSize = pParent->child(r, 1);
+            if (pSize == nullptr)
+            {
+                pSize = new QStandardItem;
+                pParent->setChild(r, 1, pSize);
+            }
+            pSize->setText(FwArc::formatSize(nSub));
+            pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            pSize->setData(nSub, FileListModel::BytesRole);
+
+            QStandardItem *pType = pParent->child(r, 2);
+            if (pType == nullptr)
+            {
+                pType = new QStandardItem;
+                pParent->setChild(r, 2, pType);
+            }
+            pType->setText(QStringLiteral("文件夹"));
+            nTotal += nSub;
+        }
+        else                          // 文件
+        {
+            // 文件字节数存在第 1 列（大小列）的 BytesRole 上，不是第 0 列
+            QStandardItem *pSize = pParent->child(r, 1);
+            if (pSize != nullptr)
+                nTotal += pSize->data(FileListModel::BytesRole).toLongLong();
+        }
+    }
+    return nTotal;
+}
+
+void MainWindow::populateFilePathTree()
+{    // 先记录重建前已展开的目录，重建后恢复，避免增删一个文件导致整棵树被折叠
     QSet<QString> setExpanded;
     for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
         collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), setExpanded);
@@ -1955,6 +2040,12 @@ void MainWindow::populateFilePathTree()
     // 单链目录压缩
     for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
         compactSingleChainDirs(m_hModelFilePath->item(i, 0));
+
+    // 目录节点补上"子树合计大小 / 文件夹类型"，并标记 IsDirRole（树形排序用）
+    finalizeTreeRows(m_hModelFilePath->invisibleRootItem());
+
+    // 按表头当前列/方向排序（同级排序、目录优先），再恢复展开状态
+    applyCurrentSortToModel();
 
     // 展开状态：有历史记录则恢复；首次加载只展开根与顶层
     if (setExpanded.isEmpty())

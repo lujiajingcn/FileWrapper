@@ -83,6 +83,7 @@ protected:
     void refreshFilePathView();
     void populateFilePathList(bool bShowPath);
     void populateFilePathTree();
+    void applyCurrentSortToModel();
     void updateViewActionState();
 
     // 统一刷新所有工具栏 / 菜单动作（含保存按钮），消除「列表空了但保存可用」的状态错乱
@@ -94,7 +95,9 @@ protected:
     // 取消 / 保存
     bool confirmDiscardOrSaveIfDirty();
     // 校验并加载归档（加载文件与"打开合并结果"共用；失败时保持当前归档不变）
-    void loadArchiveFile(const QString &sFileName);
+protected:
+    void loadArchiveFile(const QString &sFileName);   // 测试派生类需要直接加载归档
+private:
     // 文件列表筛选（按路径/文件名，大小写不敏感）
     bool matchesFilter(const FILEINFO &info) const;
     static QString typeLabel(const QString &sFileName);
@@ -170,6 +173,7 @@ private:
     // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗
     QSet<QString>            m_setWarnedPlugins;
     QSet<QString>            m_setTempFiles;
+    QSet<QString>            m_setExpandedBeforeSort;   // 树形点列头排序前记住的展开目录
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用
     QStringList              m_listTempOrder;   // 创建顺序，用于上限淘汰
     quint64                  m_uTempSerial = 0; // 单调递增，保证临时文件名不重复

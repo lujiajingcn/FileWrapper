@@ -6,29 +6,59 @@
 #include <QVector>
 #include <algorithm>
 
-// 文件列表模型：第 1 列（"大小"）按数值字节排序，其余列仍按文本排序。
+// 文件列表模型：排序语义
+//   * 平铺模式：所有行按所选列排序；"大小"列按数值字节排序，其余列按显示文本。
+//   * 树形模式：**同级排序、目录优先**——
+//       - 目录永远排在文件前面（不随升/降序反转）；
+//       - 目录之间、文件之间各自按所选列排序：
+//           路径 = 名称文本；大小 = 子树合计字节；类型 = 显示文本（目录为"文件夹"）；
+//       - 递归应用到每一级子目录，树结构不会被拍平。
 //
 // 为什么需要它：QStandardItemModel 默认按 DisplayRole 文本排序，
-// 大小列显示的是 "99.16 KB"/"989 B" 这类格式化字符串，
-// 文本序会把 "99.16 KB" 排到 "989 B" 前面（用户看到的"按大小排序不正确"）。
-// 这里改为读第 1 列 Qt::UserRole 里存的字节数做数值比较；格式化文本只用于显示。
+// "99.16 KB" 会排在 "989 B" 前面；而且默认排序不区分目录/文件。
 class FileListModel : public QStandardItemModel
 {
 public:
+    enum ItemRole
+    {
+        BytesRole = Qt::UserRole,       // 文件：自身字节数；目录：子树合计字节
+        IsDirRole = Qt::UserRole + 1,   // true 表示目录节点
+    };
+
     explicit FileListModel(QObject *parent = nullptr) : QStandardItemModel(parent) {}
 
     void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override
     {
-        if (column != 1)
-        {
-            QStandardItemModel::sort(column, order);
+        if (column < 0)
             return;
-        }
-        sortNumericChildren(invisibleRootItem(), qMax(columnCount(), 1), order);
+        sortLevel(invisibleRootItem(), qMax(columnCount(), 1), column, order);
     }
 
 private:
-    static void sortNumericChildren(QStandardItem *pParent, int nCols, Qt::SortOrder order)
+    static bool isDirRow(const QList<QStandardItem *> &row)
+    {
+        return !row.isEmpty() && row.at(0) != nullptr
+               && row.at(0)->data(IsDirRole).toBool();
+    }
+
+    static qint64 bytesOfRow(const QList<QStandardItem *> &row)
+    {
+        const QStandardItem *pSize = row.size() > 1 ? row.at(1) : nullptr;
+        return pSize != nullptr ? pSize->data(BytesRole).toLongLong() : -1;
+    }
+
+    static QString textOfRow(const QList<QStandardItem *> &row, int column)
+    {
+        const QStandardItem *pItem = column < row.size() ? row.at(column) : nullptr;
+        return pItem != nullptr ? pItem->text() : QString();
+    }
+
+    static QString nameOfRow(const QList<QStandardItem *> &row)
+    {
+        return textOfRow(row, 0);
+    }
+
+    static void sortLevel(QStandardItem *pParent, int nCols, int column, Qt::SortOrder order)
     {
         if (pParent == nullptr)
             return;
@@ -36,36 +66,51 @@ private:
         const int nRows = pParent->rowCount();
         if (nRows > 1)
         {
+            // 用 takeRow 移动原行（不 clone），保留 QStandardItem 的子树与所有 data；
+            // 视图的展开状态由调用方（MainWindow）在排序前后捕获/恢复。
             QVector<QList<QStandardItem *>> rows;
             rows.reserve(nRows);
-            for (int r = 0; r < nRows; ++r)
-            {
-                QList<QStandardItem *> row;
-                for (int c = 0; c < nCols; ++c)
-                {
-                    QStandardItem *pChild = pParent->child(r, c);
-                    row << (pChild != nullptr ? pChild->clone() : new QStandardItem());
-                }
-                rows << row;
-            }
+            for (int r = nRows - 1; r >= 0; --r)
+                rows.prepend(pParent->takeRow(r));
 
             std::stable_sort(rows.begin(), rows.end(),
-                [order](const QList<QStandardItem *> &a, const QList<QStandardItem *> &b) {
-                    const qint64 x = a.size() > 1 ? a.at(1)->data(Qt::UserRole).toLongLong() : -1;
-                    const qint64 y = b.size() > 1 ? b.at(1)->data(Qt::UserRole).toLongLong() : -1;
-                    return order == Qt::AscendingOrder ? x < y : x > y;
+                [column, order](const QList<QStandardItem *> &a, const QList<QStandardItem *> &b) {
+                    // 目录优先：与升/降序无关，目录永远在文件前
+                    const bool bDirA = isDirRow(a);
+                    const bool bDirB = isDirRow(b);
+                    if (bDirA != bDirB)
+                        return bDirA;
+
+                    int nCmp = 0;
+                    if (column == 1)
+                    {
+                        const qint64 x = bytesOfRow(a);
+                        const qint64 y = bytesOfRow(b);
+                        nCmp = (x < y) ? -1 : ((x > y) ? 1 : 0);
+                    }
+                    else
+                    {
+                        nCmp = QString::compare(textOfRow(a, column),
+                                                textOfRow(b, column),
+                                                Qt::CaseInsensitive);
+                    }
+                    if (nCmp == 0)
+                        nCmp = QString::compare(nameOfRow(a), nameOfRow(b),
+                                                Qt::CaseInsensitive);
+                    if (nCmp == 0)
+                        return false;
+                    return order == Qt::AscendingOrder ? nCmp < 0 : nCmp > 0;
                 });
 
-            pParent->removeRows(0, nRows);
             for (const QList<QStandardItem *> &row : rows)
                 pParent->appendRow(row);
         }
 
-        // 递归到子目录：树形模式若开启排序也保持数值口径
+        // 递归：每一级目录内部同样排序
         for (int r = 0; r < pParent->rowCount(); ++r)
         {
             if (QStandardItem *pChild = pParent->child(r, 0))
-                sortNumericChildren(pChild, nCols, order);
+                sortLevel(pChild, nCols, column, order);
         }
     }
 };
