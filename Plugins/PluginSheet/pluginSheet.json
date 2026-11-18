@@ -3,7 +3,7 @@
     "Version":"0.1.0",
     "Author" : "lujiajing",
     "Date":"2026-11-17",
-    "apiVersion":4,
+    "apiVersion":5,
     "extensions":["xlsx", "xlsm", "ods"],
     "Dependency":"Qt6Xml.dll（见 FileWrapper/deploy/plugin-deps.manifest）",
     "Description":"表格预览插件：只读显示 .xlsx/.xlsm（OOXML SpreadsheetML）与 .ods（OpenDocument Spreadsheet）的首层数据（单元格文本、共享字符串、合并单元格），不计算公式与样式。"
