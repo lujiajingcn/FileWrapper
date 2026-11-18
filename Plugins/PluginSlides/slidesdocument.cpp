@@ -2,7 +2,7 @@
 
 #include <QDomDocument>
 #include <QDomElement>
-#include <QRegularExpression>
+#include <QHash>
 #include <QStringList>
 #include <algorithm>
 #include <functional>
@@ -13,6 +13,7 @@ constexpr int    kMaxSlides   = 200;
 constexpr int    kMaxBlocks   = 2000;
 constexpr double kEmuPerPt    = 12700.0;      // 1pt = 12700 EMU
 constexpr qint64 kMaxImageBytes = 32LL * 1024 * 1024;
+constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;   // 整份文档累计解码预算
 
 QString esc(const QString &s)
 {
@@ -54,17 +55,30 @@ QString joinPath(const QString &baseDir, const QString &rel)
     return out.join(QLatin1Char('/'));
 }
 
-QString relTarget(const QByteArray &relsXml, const QString &relId)
+// rels 只解析一次：Relationship Id -> Target。
+// 原实现每个 sldId / 每张图片都重新 setContent 解析整份 rels，畸形文档可借此拖死 UI。
+QHash<QString, QString> parseRels(const QByteArray &relsXml)
 {
+    QHash<QString, QString> targets;
     QDomDocument doc;
-    if (!doc.setContent(relsXml)) return QString();
+    if (!doc.setContent(relsXml)) return targets;
     for (QDomElement e = doc.documentElement().firstChildElement(QStringLiteral("Relationship"));
          !e.isNull(); e = e.nextSiblingElement(QStringLiteral("Relationship")))
     {
-        if (e.attribute(QStringLiteral("Id")) == relId)
-            return e.attribute(QStringLiteral("Target"));
+        targets.insert(e.attribute(QStringLiteral("Id")), e.attribute(QStringLiteral("Target")));
     }
-    return QString();
+    return targets;
+}
+
+// 整份文档累计解码字节（QImage 像素按 4 字节估算）。累计值由解析函数内的局部变量保存：
+// addImage 没有额外参数，一份文档也只会走 pptx 或 odp 其中一条路径，作用域恰好就是整份文档。
+bool chargeDecodeBudget(qint64 *used, const QImage &img)
+{
+    if (used == nullptr || img.isNull()) return false;
+    const qint64 need = qint64(img.width()) * img.height() * 4;
+    if (*used + need > kMaxDecodedImageBytes) return false;
+    *used += need;
+    return true;
 }
 
 QString attrOf(const QDomElement &el, const QString &name)
@@ -144,6 +158,7 @@ bool SlidesDocument::parsePptx(QString *error)
         return fail(QStringLiteral("无法解析 ppt/presentation.xml。"));
 
     const QByteArray presRels = m_zip.entry(QStringLiteral("ppt/_rels/presentation.xml.rels"));
+    const QHash<QString, QString> presRelTargets = parseRels(presRels);
 
     // 页序：p:sldIdLst/p:sldId r:id
     QStringList slidePaths;
@@ -156,10 +171,13 @@ bool SlidesDocument::parsePptx(QString *error)
     };
     findList(pres.documentElement());
 
+    // 先按 kMaxSlides 截断再查表：畸形文档的 sldId 数量不受限，逐个处理会拖死 UI
+    int sldIdCount = 0;
     for (QDomElement e = sldIdLst.firstChildElement(QStringLiteral("p:sldId")); !e.isNull();
          e = e.nextSiblingElement(QStringLiteral("p:sldId")))
     {
-        const QString target = relTarget(presRels, e.attribute(QStringLiteral("r:id")));
+        if (++sldIdCount > kMaxSlides) { m_truncated = true; break; }
+        const QString target = presRelTargets.value(e.attribute(QStringLiteral("r:id")));
         if (target.isEmpty()) continue;
         QString path = normalizePath(QStringLiteral("ppt"), target);
         if (!path.startsWith(QLatin1String("ppt/"))) path = QStringLiteral("ppt/") + path;
@@ -167,6 +185,9 @@ bool SlidesDocument::parsePptx(QString *error)
     }
     if (slidePaths.isEmpty())
         return fail(QStringLiteral("演示文稿里没有任何幻灯片。"));
+
+    // 整份文档的累计解码预算（像素估算）：超预算的图片不再加入文档
+    qint64 decodedBytes = 0;
 
     for (int si = 0; si < slidePaths.size() && si < kMaxSlides; ++si)
     {
@@ -178,6 +199,7 @@ bool SlidesDocument::parsePptx(QString *error)
         const QString slideDir = path.left(path.lastIndexOf(QLatin1Char('/')));
         const QByteArray slideRels = m_zip.entry(slideDir + QStringLiteral("/_rels/")
                     + path.mid(path.lastIndexOf(QLatin1Char('/')) + 1) + QStringLiteral(".rels"));
+        const QHash<QString, QString> slideRelTargets = parseRels(slideRels);
 
         // 收集所有 p:sp / p:pic（含图片）
         std::function<void(const QDomElement &)> walk = [&](const QDomElement &el) {
@@ -225,13 +247,21 @@ bool SlidesDocument::parsePptx(QString *error)
                         if (e.tagName() == QLatin1String("a:blip"))
                         {
                             const QString rid = e.attribute(QStringLiteral("r:embed"));
-                            const QString target = relTarget(slideRels, rid);
+                            const QString target = slideRelTargets.value(rid);
                             if (!target.isEmpty())
                             {
                                 const QString mediaPath = normalizePath(slideDir, target);
                                 Block b;
                                 b.order = y * 100000.0 + x;
                                 addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt, &b);
+                                if (!b.imageUrl.isEmpty()
+                                    && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
+                                {
+                                    // 超整份文档的累计解码预算：丢弃该图，文档其余内容照常显示
+                                    m_images.remove(b.imageUrl);
+                                    b.imageUrl.clear();
+                                    m_truncated = true;
+                                }
                                 if (!b.imageUrl.isEmpty()) slide.blocks.append(b);
                             }
                             return;
@@ -332,6 +362,9 @@ bool SlidesDocument::parseOdp(QString *error)
     if (pages.isEmpty())
         return fail(QStringLiteral("ODP 里找不到 draw:page。"));
 
+    // 整份文档的累计解码预算（像素估算）：超预算的图片不再加入文档
+    qint64 decodedBytes = 0;
+
     for (const QDomElement &page : pages)
     {
         Slide slide;
@@ -342,14 +375,29 @@ bool SlidesDocument::parseOdp(QString *error)
             if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
 
             double wPt = 0.0, hPt = 0.0;
-            // svg:width/height 是长度值；这里只按 pt/cm/in 粗略换算
+            // svg:width/height 是长度值（数字 + 可选单位）。先把单位后缀摘下来再解析数字，
+            // 再按单位换算成 pt；原实现先剥后缀再 endsWith 判断，换算分支恒假（10cm 被当 10pt）。
             auto lenPt = [](const QString &v) -> double {
                 QString s = v.trimmed().toLower();
-                double n = s.remove(QRegularExpression(QStringLiteral("[a-z%]+$"))).toDouble();
-                if (s.endsWith(QLatin1String("cm"))) return n * 72.0 / 2.54;
-                if (s.endsWith(QLatin1String("mm"))) return n * 72.0 / 25.4;
-                if (s.endsWith(QLatin1String("in"))) return n * 72.0;
-                return n;
+                qsizetype unitStart = s.size();
+                while (unitStart > 0)
+                {
+                    const QChar ch = s.at(unitStart - 1);
+                    if (!ch.isLetter() && ch != QLatin1Char('%')) break;
+                    --unitStart;
+                }
+                const QString unit = s.mid(unitStart);
+                s.truncate(unitStart);
+
+                bool ok = false;
+                const double n = s.trimmed().toDouble(&ok);
+                if (!ok || !qIsFinite(n)) return 0.0;              // 非法/空值交给调用方回退
+                if (unit == QLatin1String("cm")) return n * 72.0 / 2.54;
+                if (unit == QLatin1String("mm")) return n * 72.0 / 25.4;
+                if (unit == QLatin1String("in")) return n * 72.0;
+                if (unit == QLatin1String("px")) return n * 72.0 / 96.0;
+                if (unit.isEmpty() || unit == QLatin1String("pt")) return n;
+                return 0.0;                                        // 未知单位（% / em 等）按非法处理
             };
             wPt = lenPt(frame.attribute(QStringLiteral("svg:width")));
             hPt = lenPt(frame.attribute(QStringLiteral("svg:height")));
@@ -363,6 +411,14 @@ bool SlidesDocument::parseOdp(QString *error)
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
                 addImage(m_zip.entry(href), wPt, hPt, &b);
+                if (!b.imageUrl.isEmpty()
+                    && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
+                {
+                    // 超整份文档的累计解码预算：丢弃该图，文档其余内容照常显示
+                    m_images.remove(b.imageUrl);
+                    b.imageUrl.clear();
+                    m_truncated = true;
+                }
                 if (!b.imageUrl.isEmpty()) slide.blocks.append(b);
             }
 

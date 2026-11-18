@@ -12,6 +12,9 @@ namespace {
 // 体量上限（防御畸形/超大文件把 UI 卡死）
 constexpr int kMaxParagraphs = 50000;
 constexpr int kMaxChars      = 20000000;   // 2000 万字符
+// 控制字参数上限：畸形文件可能给出几千位数字，累加超过这个量级就饱和处理，
+// 避免 param*10 触发有符号整数溢出（UB）（P-12）
+constexpr int kMaxControlParam = 1000000000;   // 1e9
 
 // Qt 富文本的 margin-* / text-indent 只认 px（详见 worddocument.cpp 的说明）
 constexpr double kPtToPx = 96.0 / 72.0;
@@ -33,12 +36,35 @@ QString esc(const QString &s)
     return r;
 }
 
+// HTML 属性值转义：字体名等来自文件的字符串要拼进 style="..."，引号必须转义（P-08）
+QString escAttr(const QString &s)
+{
+    QString r = esc(s);
+    r.replace(QLatin1Char('"'), QLatin1String("&quot;"));
+    r.replace(QLatin1Char('\''), QLatin1String("&#39;"));
+    return r;
+}
+
 QString fmtNum(double v)
 {
     QString s = QString::number(v, 'f', 2);
     while (s.endsWith(QLatin1Char('0'))) s.chop(1);
     if (s.endsWith(QLatin1Char('.'))) s.chop(1);
     return s;
+}
+
+// 字体名只保留安全字符，避免内容里的怪字符破坏 style 属性（与 worddocument.cpp 同口径）
+QString sanitizeFontFamily(const QString &f)
+{
+    QString r;
+    const QString t = f.trimmed();
+    for (const QChar ch : t)
+    {
+        if (ch.isLetterOrNumber() || ch == QLatin1Char(' ') || ch == QLatin1Char('-')
+            || ch == QLatin1Char('_') || ch.isMark() || ch.unicode() > 0x2000)
+            r += ch;
+    }
+    return r.trimmed();
 }
 
 // 这些控制字标记的分组是"不显示的内容"，解析时整组跳过
@@ -161,6 +187,7 @@ static void parseFontTable(const QByteArray &data, QHash<int, QString> *fonts)
         name.remove(QRegularExpression(QStringLiteral("\\\\[a-zA-Z]+-?\\d* ?")));
         name = name.trimmed();
         name.remove(QLatin1Char('{'));
+        name = sanitizeFontFamily(name);        // 字体名会进 style 属性，先净化（P-08）
         if (!name.isEmpty()) fonts->insert(idx, name);
     }
 }
@@ -373,6 +400,14 @@ void RtfDocument::parse()
                 const int lo = hexVal(m_data.at(i + 2));
                 if (hi >= 0 && lo >= 0)
                 {
+                    // \uN 后面紧跟的 \'hh 是 ANSI 回退，不属于正文：
+                    // 命中标志时整组跳过（只清标志，不写回退字节）（P-07）
+                    if (m_skipUnicodeFallback)
+                    {
+                        m_skipUnicodeFallback = false;
+                        i += 3;
+                        continue;
+                    }
                     if (bSkip) { /* 跳过组内字节 */ }
                     else appendByte(static_cast<unsigned char>(hi * 16 + lo));
                     i += 3;
@@ -424,7 +459,13 @@ void RtfDocument::parse()
         if (i < n && m_data.at(i) == '-') { neg = true; ++i; }
         while (i < n && std::isdigit(static_cast<unsigned char>(m_data.at(i))))
         {
-            param = param * 10 + (m_data.at(i) - '0');
+            const int digit = m_data.at(i) - '0';
+            // 累加前先检查上界：畸形超长数字饱和在 kMaxControlParam，
+            // 后续数字照常跳过（解析位置不变），避免 param*10 有符号溢出 UB（P-12）
+            if (param > (kMaxControlParam - digit) / 10)
+                param = kMaxControlParam;
+            else
+                param = param * 10 + digit;
             hasParam = true;
             ++i;
         }
@@ -483,17 +524,19 @@ QString RtfDocument::render(double fontScale) const
             const double sz = (r.sizePt > 0.0 ? r.sizePt : m_defaultSizePt) * fontScale;
             css2 << QStringLiteral("font-size:%1pt").arg(fmtNum(sz));
             if (!r.color.isEmpty())  css2 << QStringLiteral("color:") + r.color;
-            if (!r.family.isEmpty()) css2 << QStringLiteral("font-family:") + r.family;
+            // 字体名来自文件：先净化，拼进 style 时再按 HTML 属性值转义（P-08）
+            const QString family = sanitizeFontFamily(r.family);
+            if (!family.isEmpty())   css2 << QStringLiteral("font-family:") + family;
 
-            runs << QStringLiteral("<span style=\"") + css2.join(QLatin1Char(';'))
+            runs << QStringLiteral("<span style=\"") + escAttr(css2.join(QLatin1Char(';')))
                     + QStringLiteral("\">") + s + QStringLiteral("</span>");
         }
 
         if (runs.isEmpty())
             runs << QStringLiteral("&#160;");
 
-        out << QStringLiteral("<p style=\"") + css.join(QLatin1Char(';')) + QStringLiteral("\">")
-            + runs.join(QString()) + QStringLiteral("</p>");
+        out << QStringLiteral("<p style=\"") + escAttr(css.join(QLatin1Char(';')))
+               + QStringLiteral("\">") + runs.join(QString()) + QStringLiteral("</p>");
     }
     return out.join(QString());
 }

@@ -221,6 +221,7 @@ private:
     QString m_urlPrefix = QStringLiteral("wimg://img/");   // 图片 URL 前缀（见 setUrlPrefix）
     QMap<QString, QString> m_targetToUrl;   // zip 内图片路径 -> wimg:// URL（去重）
     QMap<QString, QImage>  m_imageCache;    // URL -> 已解码图像（缩放重排时复用）
+    qint64                 m_nDecodedImageBytes = 0;   // P-14：本文档累计解码图片字节预算
     bool   m_ok = false;
 };
 

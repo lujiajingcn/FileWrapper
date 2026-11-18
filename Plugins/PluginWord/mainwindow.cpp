@@ -67,6 +67,7 @@ void MainWindow::reset()
     m_doc.reset();
     m_scale = 1.0;
     m_images.clear();
+    m_emptyDocument = false;
     ui->textBrowser->clear();
     ui->statusBar->clearMessage();
 
@@ -127,24 +128,32 @@ void MainWindow::showWord(const QByteArray &data)
 
     m_scale = 1.0;
 
-    ui->actionZoomIn->setEnabled(true);
-    ui->actionZoomOut->setEnabled(true);
-    ui->actionZoomReset->setEnabled(true);
-
+    // 先渲染一次（stats 只有在 render() 之后才准确），再决定是否启用缩放：
+    // 空正文文档保持动作禁用，提示文字才能留在界面上（P-11）
     renderDocument();
 
     const WordDocument::Stats &now = m_doc.stats();
     if (now.paragraphs == 0 && now.tables == 0)
     {
+        m_emptyDocument = true;
+        ui->actionZoomIn->setEnabled(false);
+        ui->actionZoomOut->setEnabled(false);
+        ui->actionZoomReset->setEnabled(false);
         showMessage(QStringLiteral("这个文档里没有可显示的正文内容"
                                    "（可能只有页眉页脚、文本框或图片之外的嵌入对象）。"));
         return;
     }
+
+    ui->actionZoomIn->setEnabled(true);
+    ui->actionZoomOut->setEnabled(true);
+    ui->actionZoomReset->setEnabled(true);
 }
 
 void MainWindow::renderDocument()
 {
     if (!m_doc.isOpen()) return;
+    // 空正文文档：保留 showMessage() 留下的提示，不要用空 HTML 覆盖成空白（P-11）
+    if (m_emptyDocument) return;
 
     QScrollBar *bar = ui->textBrowser->verticalScrollBar();
     const int oldMax = bar->maximum();
@@ -196,6 +205,8 @@ void MainWindow::showMessage(const QString &text)
 void MainWindow::applyZoom(double scale)
 {
     if (!m_doc.isOpen()) return;
+    // 空正文文档没有可缩放的内容：保持提示文字不动（P-11）
+    if (m_emptyDocument) return;
 
     const double clamped = qBound(kMinScale, scale, kMaxScale);
     if (qAbs(clamped - m_scale) < 0.0001) return;

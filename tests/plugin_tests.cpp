@@ -1256,6 +1256,31 @@ static void verifyOtherViewers(const QString &work)
         report(bOpen && bPlayingIcon && bStopIcon && bReplayIcon && bBadReset,
                QStringLiteral("V13: media stop/replay button and failure reset"));
     }
+
+    // V14: RTF \uN 后紧跟 \'hh 回退时不得把回退字节写进正文（P-07 回归）
+    if (want("V14"))
+    {
+        QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
+        PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
+        PluginInterface *p = templ ? templ->createInstance() : nullptr;
+        bool bOk = false;
+        if (p != nullptr)
+        {
+            p->setSourceName(QStringLiteral("audit.rtf"));
+            const QByteArray rtf("{\\rtf1\\ansi\\u2032\\'27}");
+            p->sendFile(PluginFile::fromMemory(rtf, QStringLiteral("audit.rtf")));
+            QWidget *w = p->getPluginWidget();
+            auto *pBrowser = w ? w->findChild<QTextBrowser *>() : nullptr;
+            auto *pEdit = w ? w->findChild<QTextEdit *>() : nullptr;
+            const QString sText = pBrowser ? pBrowser->toPlainText()
+                                           : (pEdit ? pEdit->toPlainText() : QString());
+            // RTF 的 \uN 是十进制（\u2032 = U+07F0），不是十六进制；
+            // 关键是 \'27 回退字节不能再被写进正文。
+            bOk = sText.contains(QChar(2032)) && !sText.contains(QLatin1Char('\''));
+        }
+        delete p;
+        report(bOk, QStringLiteral("V14: RTF unicode fallback byte is skipped"));
+    }
 }
 
 // ---------------------------------------------------------------------------

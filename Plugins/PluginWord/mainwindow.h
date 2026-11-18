@@ -53,6 +53,9 @@ private:
     // 于是不必关心 setHtml 与 addResource 的先后顺序。
     QMap<QString, QImage> m_images;
     double          m_scale = 1.0;
+    // 正文为空（0 段 0 表）：此时界面显示的是提示文字，缩放动作禁用、
+    // renderDocument() 不再 setHtml 空内容覆盖提示（P-11）
+    bool            m_emptyDocument = false;
     quint64         m_generation = 0;   // 每打开一个文件 +1，用于生成不复用的图片 URL
 };
 

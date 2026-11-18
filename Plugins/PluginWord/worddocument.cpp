@@ -29,6 +29,10 @@ constexpr int    kMaxBlockCount   = 100000;          // 段落 + 表格总量上
 constexpr int    kMaxDepth        = 6;               // 表格 / AlternateContent 递归深度上限
 constexpr qint64 kMaxImageBytes   = 32 * 1024 * 1024; // 单张内嵌图片上限
 constexpr double kMaxImageDisplayW = 1400.0;          // 图片显示宽度上限（px）
+constexpr double kMaxImageDisplayH = 10000.0;         // 图片显示高度上限（px，防止超长图撑爆布局）
+// 整个文档累计的图片解码预算（按 width*height*4 估算常驻内存）：
+// 单图上限只挡压缩字节，多张接近上限的图仍会累计占用数 GB（P-14）
+constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;
 constexpr double kListIndentPt    = 18.0;             // 列表每级缩进（pt）
 constexpr double kTwipsPerPt      = 20.0;
 constexpr double kEmuPerPx        = 9525.0;
@@ -77,6 +81,38 @@ QString cssColor(const QString &v)
     return QLatin1Char('#') + t.toUpper();
 }
 
+// ODT/ODF 的颜色直接写在 fo:color / fo:background-color 里，可能带引号、函数表达式
+// 甚至分号：只放行 #RRGGBB（8 位 alpha 忽略 alpha）与常见命名色，其余一律丢弃（P-09）
+QString odtCssColor(const QString &v)
+{
+    const QString t = v.trimmed();
+    if (t.isEmpty() || t.compare(QLatin1String("transparent"), Qt::CaseInsensitive) == 0)
+        return QString();
+
+    if (t.startsWith(QLatin1Char('#')))
+    {
+        const QString hex = t.mid(1);
+        if (hex.size() != 6 && hex.size() != 8) return QString();
+        for (const QChar ch : hex)
+        {
+            const ushort c = ch.toLower().unicode();
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return QString();
+        }
+        return QLatin1Char('#') + hex.left(6).toUpper();
+    }
+
+    static const QSet<QString> kNames = {
+        QStringLiteral("black"),  QStringLiteral("silver"), QStringLiteral("gray"),
+        QStringLiteral("white"),  QStringLiteral("maroon"), QStringLiteral("red"),
+        QStringLiteral("purple"), QStringLiteral("fuchsia"), QStringLiteral("green"),
+        QStringLiteral("lime"),   QStringLiteral("olive"),  QStringLiteral("yellow"),
+        QStringLiteral("navy"),   QStringLiteral("blue"),   QStringLiteral("teal"),
+        QStringLiteral("aqua"),   QStringLiteral("orange"),
+    };
+    const QString lower = t.toLower();
+    return kNames.contains(lower) ? lower : QString();
+}
+
 // twips（1/20 pt）字符串 -> pt
 double twipsToPt(const QString &v)
 {
@@ -99,7 +135,9 @@ double parseLengthPx(const QString &v)
     else if (s.endsWith(QLatin1String("em"))) { factor = 16.0;        s.chop(2); }
     bool ok = false;
     const double n = s.trimmed().toDouble(&ok);
-    return ok ? n * factor : 0.0;
+    if (!ok || !qIsFinite(n)) return 0.0;      // "1e999" 之类溢出值按未指定处理（P-13）
+    const double px = n * factor;
+    return qIsFinite(px) ? px : 0.0;
 }
 
 // 数字 -> 去掉多余小数位的字符串（用于 CSS）
@@ -159,6 +197,52 @@ QString sanitizeFontFamily(const QString &f)
     }
     return r.trimmed();
 }
+
+// 图片显示尺寸只接受有限正数：NaN / inf（"1e999"）/ 负数一律按未指定处理，
+// 否则后续 int(px + 0.5) 的转换属于 UB（P-13）
+double safeImageSpan(double v)
+{
+    if (!qIsFinite(v) || v <= 0.0) return 0.0;
+    return v;
+}
+
+// 计算最终的图片显示尺寸（P-13）：
+//   1) 缺省的一边用图片自身的像素尺寸补全，避免“未声明尺寸的超长图”绕过上限；
+//   2) 宽、高分别按上限等比缩小，两个方向都封顶且保持纵横比不变形。
+void clampImageDisplaySize(double *wpx, double *hpx, const QImage &natural)
+{
+    if ((*wpx <= 0.0 || *hpx <= 0.0)
+        && !natural.isNull() && natural.width() > 0 && natural.height() > 0)
+    {
+        const double nw = safeImageSpan(natural.width());
+        const double nh = safeImageSpan(natural.height());
+        if (*wpx <= 0.0 && *hpx <= 0.0)     { *wpx = nw; *hpx = nh; }
+        else if (*wpx > 0.0 && *hpx <= 0.0) *hpx = *wpx * nh / nw;
+        else if (*hpx > 0.0 && *wpx <= 0.0) *wpx = *hpx * nw / nh;
+    }
+
+    if (*wpx > kMaxImageDisplayW)
+    {
+        if (*hpx > 0.0) *hpx = *hpx * kMaxImageDisplayW / *wpx;
+        *wpx = kMaxImageDisplayW;
+    }
+    if (*hpx > kMaxImageDisplayH)
+    {
+        if (*wpx > 0.0) *wpx = *wpx * kMaxImageDisplayH / *hpx;
+        *hpx = kMaxImageDisplayH;
+    }
+}
+
+// 一张已解码图片按 32 位/像素估算的常驻内存
+qint64 decodedImageBytes(const QImage &img)
+{
+    if (img.isNull()) return 0;
+    return qint64(img.width()) * qint64(img.height()) * 4;
+}
+
+// 本次 render() 已经解码进 m_imageCache 的字节合计（每次 render 开头清零）。
+// 渲染在 GUI 线程里同步完成，同一时刻只会渲染一个文档；用文件内静态量记账，
+// 既不必为 P-14 改头文件，也不会像「每张图都遍历整个缓存」那样退化成 O(n^2)。
 
 // 只放行常见协议，避免 docx 里的 javascript: 之类链接被点击执行
 QString safeHref(const QString &target)
@@ -524,6 +608,7 @@ void WordDocument::reset()
     m_imageSeq = 0;
     m_targetToUrl.clear();
     m_imageCache.clear();
+    m_nDecodedImageBytes = 0;    // P-14：图片缓存清空，累计解码预算同步归零
     m_rtf.reset();
     m_isRtf = false;
     m_isOdt = false;
@@ -964,6 +1049,7 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     m_numCounters.clear();
     m_truncated = false;
     m_blockBudget = 0;
+    m_nDecodedImageBytes = 0;    // P-14：每次渲染重新统计本次解码进缓存的图片字节
 
     // RTF 走自己的轻量解析器：直接产出 HTML，不需要 ZipReader / 样式表
     if (m_isRtf)
@@ -1280,8 +1366,15 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
         if (extent.isNull()) extent = findDescendant(container, QStringLiteral("a:ext"));
         if (!extent.isNull())
         {
-            wpx = extent.attribute(QStringLiteral("cx")).toDouble() / kEmuPerPx;
-            hpx = extent.attribute(QStringLiteral("cy")).toDouble() / kEmuPerPx;
+            // EMU -> px：非法数值（"1e999" / NaN / 空）按未指定处理，不让 inf 流下去（P-13）
+            auto emuToPx = [](const QDomElement &el, const char *attr) -> double {
+                bool ok = false;
+                const double v = el.attribute(QString::fromLatin1(attr)).toDouble(&ok);
+                if (!ok || !qIsFinite(v)) return 0.0;
+                return safeImageSpan(v / kEmuPerPx);
+            };
+            wpx = emuToPx(extent, "cx");
+            hpx = emuToPx(extent, "cy");
         }
     }
     else
@@ -1301,8 +1394,8 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
                 if (colon <= 0) continue;
                 const QString key = part.left(colon).trimmed().toLower();
                 const QString val = part.mid(colon + 1).trimmed();
-                if (key == QLatin1String("width"))       wpx = parseLengthPx(val);
-                else if (key == QLatin1String("height")) hpx = parseLengthPx(val);
+                if (key == QLatin1String("width"))       wpx = safeImageSpan(parseLengthPx(val));
+                else if (key == QLatin1String("height")) hpx = safeImageSpan(parseLengthPx(val));
             }
         }
     }
@@ -1322,17 +1415,20 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
         const QImage img = QImage::fromData(bytes);
         if (img.isNull()) return QString();      // WMF/EMF 等 Qt 不支持的格式
 
+        // 整个文档的累计解码预算（P-14）：超出预算的图片不再缓存，
+        // 避免多张接近单图上限的图片叠加占用数 GB 内存；QImage 随作用域释放。
+        const qint64 decoded = decodedImageBytes(img);
+        if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
+            return QString();
+
         url = m_urlPrefix + QString::number(++m_imageSeq);
         m_targetToUrl.insert(part, url);
         m_imageCache.insert(url, img);
+        m_nDecodedImageBytes += decoded;
     }
 
-    // 超大图按显示宽度上限等比缩小，避免一张几万像素的图把版面撑爆
-    if (wpx > kMaxImageDisplayW)
-    {
-        if (hpx > 0.0) hpx = hpx * kMaxImageDisplayW / wpx;
-        wpx = kMaxImageDisplayW;
-    }
+    // 补全/钳制显示尺寸（P-13）：缺省的一边用解码后的图片尺寸补，宽高都封顶
+    clampImageDisplaySize(&wpx, &hpx, m_imageCache.value(url));
 
     QString tag = QStringLiteral("<img src=\"") + url + QLatin1Char('"');
     if (wpx >= 1.0) tag += QStringLiteral(" width=\"%1\"").arg(int(wpx + 0.5));
@@ -1471,16 +1567,20 @@ double WordDocument::odtLenToPt(const QString &value)
     const QRegularExpressionMatch m = re.match(value);
     if (!m.hasMatch()) return 0.0;
 
-    const double n = m.captured(1).toDouble();
+    bool ok = false;
+    const double n = m.captured(1).toDouble(&ok);
+    if (!ok || !qIsFinite(n)) return 0.0;      // "1e999" 等溢出值按未指定处理（P-13）
     const QString unit = m.captured(2).toLower();
-    if (unit.isEmpty() || unit == QLatin1String("pt")) return n;
-    if (unit == QLatin1String("px")) return n * 72.0 / 96.0;
-    if (unit == QLatin1String("cm")) return n * 72.0 / 2.54;
-    if (unit == QLatin1String("mm")) return n * 72.0 / 25.4;
-    if (unit == QLatin1String("in")) return n * 72.0;
-    if (unit == QLatin1String("pc")) return n * 12.0;
-    if (unit == QLatin1String("em")) return n * 10.5;   // 近似：按默认字号
-    return 0.0;
+    double pt = 0.0;
+    if (unit.isEmpty() || unit == QLatin1String("pt")) pt = n;
+    else if (unit == QLatin1String("px")) pt = n * 72.0 / 96.0;
+    else if (unit == QLatin1String("cm")) pt = n * 72.0 / 2.54;
+    else if (unit == QLatin1String("mm")) pt = n * 72.0 / 25.4;
+    else if (unit == QLatin1String("in")) pt = n * 72.0;
+    else if (unit == QLatin1String("pc")) pt = n * 12.0;
+    else if (unit == QLatin1String("em")) pt = n * 10.5;   // 近似：按默认字号
+    else return 0.0;
+    return qIsFinite(pt) ? pt : 0.0;           // 乘系数后溢出同样丢弃
 }
 
 WordDocument::OdtRun WordDocument::odtMergeRun(const OdtRun &base, const OdtRun &over)
@@ -1529,15 +1629,16 @@ WordDocument::OdtRun WordDocument::odtRunProps(const QString &styleName) const
                 if (pt > 0.0) r.sizePt = pt;
             }
 
-            const QString col = tp.attribute(QStringLiteral("fo:color"));
-            if (!col.isEmpty() && col != QLatin1String("transparent")) r.color = col;
+            // 颜色来自 XML 属性：白名单校验后再拼 style（P-09）
+            const QString col = odtCssColor(tp.attribute(QStringLiteral("fo:color")));
+            if (!col.isEmpty()) r.color = col;
 
-            const QString bg = tp.attribute(QStringLiteral("fo:background-color"));
-            if (!bg.isEmpty() && bg != QLatin1String("transparent")) r.fill = bg;
+            const QString bg = odtCssColor(tp.attribute(QStringLiteral("fo:background-color")));
+            if (!bg.isEmpty()) r.fill = bg;
 
             const QString fn = tp.attribute(QStringLiteral("style:font-name"));
             if (!fn.isEmpty() && m_odtFontFaces.contains(fn))
-                r.family = m_odtFontFaces.value(fn);
+                r.family = sanitizeFontFamily(m_odtFontFaces.value(fn));
         }
         cur = st.attribute(QStringLiteral("style:parent-style-name"));
     }
@@ -1577,8 +1678,8 @@ WordDocument::OdtPar WordDocument::odtParProps(const QString &styleName) const
             takeLen("fo:margin-top",   &p.beforePt);
             takeLen("fo:margin-bottom", &p.afterPt);
 
-            const QString bg = pp.attribute(QStringLiteral("fo:background-color"));
-            if (!bg.isEmpty() && bg != QLatin1String("transparent")) p.fill = bg;
+            const QString bg = odtCssColor(pp.attribute(QStringLiteral("fo:background-color")));
+            if (!bg.isEmpty()) p.fill = bg;
         }
         cur = st.attribute(QStringLiteral("style:parent-style-name"));
     }
@@ -1599,9 +1700,11 @@ QString WordDocument::odtWrapRun(const OdtRun &r, double scale, const QString &h
     css << QStringLiteral("font-size:%1pt").arg(fmtNum(sz));
     if (!r.color.isEmpty())  css << QStringLiteral("color:") + r.color;
     if (!r.fill.isEmpty())   css << QStringLiteral("background-color:") + r.fill;
-    if (!r.family.isEmpty()) css << QStringLiteral("font-family:") + r.family;
+    // 字体名来自文档，先按安全字符集净化，再按 HTML 属性值转义（P-09）
+    const QString family = sanitizeFontFamily(r.family);
+    if (!family.isEmpty()) css << QStringLiteral("font-family:") + family;
 
-    return QStringLiteral("<span style=\"") + css.join(QLatin1Char(';'))
+    return QStringLiteral("<span style=\"") + escAttr(css.join(QLatin1Char(';')))
            + QStringLiteral("\">") + s + QStringLiteral("</span>");
 }
 
@@ -1638,7 +1741,7 @@ bool WordDocument::loadOdt(const QByteArray &data, QString *error)
             QString family = ff.attribute(QStringLiteral("svg:font-family")).trimmed();
             family.remove(QLatin1Char('\''));
             family.remove(QLatin1Char('"'));
-            family = family.simplified();
+            family = sanitizeFontFamily(family.simplified());   // 字体名会进 style 属性（P-09）
             if (!name.isEmpty() && !family.isEmpty() && !m_odtFontFaces.contains(name))
                 m_odtFontFaces.insert(name, family);
         }
@@ -2010,18 +2113,23 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     {
         const QImage im = QImage::fromData(bytes);
         if (im.isNull()) return QString();      // SVG/WMF 等 Qt 不能直接解码的格式
+
+        // 与 docx 共用同一份累计解码预算（P-14）：超预算的图片忽略，不缓存
+        const qint64 decoded = decodedImageBytes(im);
+        if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
+            return QString();
+
         url = m_urlPrefix + QString::number(++m_imageSeq);
         m_targetToUrl.insert(key, url);
         m_imageCache.insert(url, im);
+        m_nDecodedImageBytes += decoded;
     }
 
-    double wpx = odtLenToPt(frame.attribute(QStringLiteral("svg:width"))) * kPtToPx;
-    double hpx = odtLenToPt(frame.attribute(QStringLiteral("svg:height"))) * kPtToPx;
-    if (wpx > kMaxImageDisplayW)
-    {
-        if (hpx > 0.0) hpx = hpx * kMaxImageDisplayW / wpx;
-        wpx = kMaxImageDisplayW;
-    }
+    // 宽高补全并分别钳制（P-13）：非法/溢出尺寸按 0（未指定）处理，
+    // 缺省的一边用图片像素尺寸补，最后两个方向都封顶、保持纵横比。
+    double wpx = safeImageSpan(odtLenToPt(frame.attribute(QStringLiteral("svg:width"))) * kPtToPx);
+    double hpx = safeImageSpan(odtLenToPt(frame.attribute(QStringLiteral("svg:height"))) * kPtToPx);
+    clampImageDisplaySize(&wpx, &hpx, m_imageCache.value(url));
 
     QString tag = QStringLiteral("<img src=\"") + url + QLatin1Char('"');
     if (wpx >= 1.0) tag += QStringLiteral(" width=\"%1\"").arg(int(wpx + 0.5));

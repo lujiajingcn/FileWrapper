@@ -2,6 +2,7 @@
 
 #include <QDomDocument>
 #include <QDomElement>
+#include <QHash>
 #include <QStringList>
 #include <QRegularExpression>
 
@@ -13,6 +14,7 @@ constexpr int kMaxRows    = 500;
 constexpr int kMaxCols    = 120;
 constexpr int kMaxCells   = 30000;
 constexpr int kMaxCellLen = 400;
+constexpr int kMaxXlsxCols = 16384;   // xlsx 列号上限（XFD，1 基），超过视为畸形引用
 
 QString esc(const QString &s)
 {
@@ -46,7 +48,11 @@ bool parseCellRef(const QString &ref, int *col, int *row)
     int c = 0;
     while (i < ref.size() && ref.at(i).isLetter())
     {
-        c = c * 26 + (ref.at(i).toUpper().unicode() - 'A' + 1);
+        const int digit = ref.at(i).toUpper().unicode() - 'A' + 1;
+        if (digit < 1 || digit > 26) return false;           // isLetter() 也接受非 ASCII 字母
+        // 累加前先判上界：畸形超长列字母（AAAA...）会在 c * 26 + digit 处 int 溢出（UB）
+        if (c > (kMaxXlsxCols - digit) / 26) return false;
+        c = c * 26 + digit;
         ++i;
     }
     if (i == 0 || i >= ref.size()) return false;
@@ -57,18 +63,19 @@ bool parseCellRef(const QString &ref, int *col, int *row)
     return true;
 }
 
-// xlsx 的 rels：<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
-QString relTarget(const QByteArray &relsXml, const QString &relId)
+// xlsx 的 rels 只解析一次：<Relationship Id="rId1" Target="worksheets/sheet1.xml"/> -> Id -> Target。
+// 原实现每个 <sheet> 都重新 setContent 解析整份 rels，畸形工作簿可借此拖死 UI。
+QHash<QString, QString> parseRels(const QByteArray &relsXml)
 {
+    QHash<QString, QString> targets;
     QDomDocument doc;
-    if (!doc.setContent(relsXml)) return QString();
+    if (!doc.setContent(relsXml)) return targets;
     for (QDomElement e = doc.documentElement().firstChildElement(QStringLiteral("Relationship"));
          !e.isNull(); e = e.nextSiblingElement(QStringLiteral("Relationship")))
     {
-        if (e.attribute(QStringLiteral("Id")) == relId)
-            return e.attribute(QStringLiteral("Target"));
+        targets.insert(e.attribute(QStringLiteral("Id")), e.attribute(QStringLiteral("Target")));
     }
-    return QString();
+    return targets;
 }
 
 QString firstTextOf(const QDomElement &el, const QString &tag)
@@ -172,6 +179,7 @@ bool SheetDocument::parseXlsx(QString *error)
         return fail(QStringLiteral("无法解析 xl/workbook.xml。"));
 
     const QByteArray wbRels = m_zip.entry(QStringLiteral("xl/_rels/workbook.xml.rels"));
+    const QHash<QString, QString> wbRelTargets = parseRels(wbRels);
 
     // 共享字符串表
     QStringList sharedStrings;
@@ -196,23 +204,27 @@ bool SheetDocument::parseXlsx(QString *error)
         }
     }
 
-    // 工作表列表（按 workbook 里的顺序）
+    // 工作表列表（按 workbook 里的顺序）；先按 kMaxSheets 截断再查表：
+    // 畸形工作簿的 <sheet> 数量不受限，逐个解析整份 rels 会拖死 UI
     QVector<QPair<QString, QString>> sheetList;   // (name, target)
+    bool sheetListCapped = false;
     for (QDomElement s = wb.documentElement().firstChildElement("sheets");
-         !s.isNull(); s = s.nextSiblingElement("sheets"))
+         !s.isNull() && !sheetListCapped; s = s.nextSiblingElement("sheets"))
     {
         for (QDomElement e = s.firstChildElement(QStringLiteral("sheet")); !e.isNull();
              e = e.nextSiblingElement(QStringLiteral("sheet")))
         {
+            if (sheetList.size() >= kMaxSheets) { sheetListCapped = true; break; }
             const QString name = e.attribute(QStringLiteral("name"));
             const QString rid  = e.attribute(QStringLiteral("r:id"));
-            QString target = relTarget(wbRels, rid);
+            QString target = wbRelTargets.value(rid);
             while (target.startsWith(QLatin1Char('/'))) target.remove(0, 1);
             if (!target.isEmpty() && !target.startsWith(QLatin1String("xl/")))
                 target = QStringLiteral("xl/") + target;
             sheetList.append(qMakePair(name, target));
         }
     }
+    if (sheetListCapped) m_truncated = true;
     if (sheetList.isEmpty())
         return fail(QStringLiteral("工作簿里没有任何工作表。"));
 
