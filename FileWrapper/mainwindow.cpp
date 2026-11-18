@@ -1277,11 +1277,19 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         // 区分「0 字节空文件」与「读取失败」，并给出可读提示（P3-2 / P1-2）
         // 区分「0 字节空文件」与「读取失败」：entryContent 失败时会给 sReadErr，
         // 为空就说明确实是 0 字节（不要再去看 lastError()，那是别的操作留下的陈旧信息）。
-        QString sErr = sReadErr;
-        if (sErr.isEmpty())
-            sErr = QStringLiteral("文件为空（0 字节），没有可显示的内容");
-        onFileManagerWarning(QStringLiteral("打开 %1 失败：%2").arg(info.sFileName, sErr));
-        iface->sendFileData(nullptr, 0);
+        if (sReadErr.isEmpty())
+        {
+            // 真正的 0 字节文件不是“读取失败”：传一个非空指针的 0 长度缓冲，
+            // 内置查看器显示空内容，状态栏明确提示“文件为空”。
+            char cEmpty = 0;
+            iface->sendFileData(&cEmpty, 0);
+            statusBar()->showMessage(tr("文件为空（0 字节）：%1").arg(info.sFileName), 5000);
+        }
+        else
+        {
+            onFileManagerWarning(QStringLiteral("打开 %1 失败：%2").arg(info.sFileName, sReadErr));
+            iface->sendFileData(nullptr, 0);
+        }
         releaseMappedInput(iface);
         return;
     }

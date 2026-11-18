@@ -2,6 +2,8 @@
 #include "ui_dlgoutputfile.h"
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
 
 DlgOutputFile::DlgOutputFile(QWidget *parent) :
     QDialog(parent),
@@ -10,6 +12,28 @@ DlgOutputFile::DlgOutputFile(QWidget *parent) :
     ui->setupUi(this);
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
+
+    // .ui 原本全是绝对坐标，系统字体放大后标签/按钮会被裁切。
+    // 这里按控件重建布局，保持原有控件与信号连接。
+    auto *pMain = new QVBoxLayout(this);
+    auto *pRadios = new QHBoxLayout;
+    pRadios->addWidget(ui->rbOldPath);
+    pRadios->addWidget(ui->rbSelectDir);
+    pRadios->addStretch(1);
+    pMain->addLayout(pRadios);
+
+    auto *pDir = new QHBoxLayout;
+    pDir->addWidget(ui->label);
+    pDir->addWidget(ui->leOutputFileDir, 1);
+    pDir->addWidget(ui->btnSelectDir);
+    pMain->addLayout(pDir);
+
+    auto *pButtons = new QHBoxLayout;
+    pButtons->addStretch(1);
+    pButtons->addWidget(ui->btnOk);
+    pButtons->addWidget(ui->btnCancel);
+    pMain->addLayout(pButtons);
+    setMinimumWidth(520);
 
     // 按 .ui 的初始选中项同步启用状态（默认"原路径导出"）
     if (ui->rbOldPath->isChecked())
