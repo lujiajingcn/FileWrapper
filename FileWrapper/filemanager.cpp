@@ -481,6 +481,22 @@ bool FileManager::QLoadMergedFile(QString sFilePath)
         }
     }
 
+    // 重复 displayPath 会让 QMap 单值覆盖、两行显示同一内容，删一条后幸存条目
+    // 还会变成“归档内未找到”。在切换句柄前直接拒绝整个归档。
+    {
+        QSet<QString> seenPaths;
+        for (const FwArc::Entry &e : meta.entries)
+        {
+            const QString key = e.displayPath.toLower();
+            if (seenPaths.contains(key))
+            {
+                setError(QStringLiteral("归档包含重复路径，拒绝加载：%1").arg(e.displayPath));
+                return false;
+            }
+            seenPaths.insert(key);
+        }
+    }
+
     // 解析成功后才切换句柄与内存状态
     const QString sOldPath = m_qFile.fileName();
     const bool bOldWasOpen = m_qFile.isOpen();
@@ -1428,7 +1444,15 @@ bool FileManager::rewriteArchive()
             bOk = streamCopy(m_qFile, fi.nContentPositon, fi.nFileLen, fTmp, eCrc,
                              copiedTotal, totalBytes,
                              tr("正在保存: %1").arg(fi.sFileName), err);
+            // 保存时不能把已损坏的内容重新盖章；与加载时记录的 CRC 比对。
+            if (bOk && m_mapContentCrc.contains(fi.sFilePath)
+                && eCrc.value() != m_mapContentCrc.value(fi.sFilePath))
+            {
+                err = tr("内容 CRC 与加载时不一致，归档可能已损坏：%1").arg(fi.sFilePath);
+                bOk = false;
+            }
         }
+        if (!bOk) break;
         contentCrcs.append(eCrc.value());
     }
     if (bOk) bOk = finalizeV2Header(fTmp, headerSize, crcFieldPos, contentCrcs, err);

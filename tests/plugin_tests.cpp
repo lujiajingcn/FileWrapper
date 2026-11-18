@@ -2057,13 +2057,12 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     if (QFileInfo::exists(sDup))
     {
         FileManager fm5;
-        fm5.QLoadMergedFile(sDup);
-        fm5.addFiles(QVector<QString>{ sAdded });   // 变脏，同时保留两条同名条目
-        const bool bSave3 = fm5.save();
+        // A-03 后改为在加载阶段直接拒绝重复路径，避免 QMap 单值覆盖后两行同内容、
+        // 删一条让幸存条目变成“归档内未找到”。
+        const bool bLoad3 = fm5.QLoadMergedFile(sDup);
         const QString sErr3 = fm5.lastError();
-        report(!bSave3 && sErr3.contains(QStringLiteral("重复路径"))
-                   && !fm5.isCancelRequested(),
-               QStringLiteral("K3: duplicate stored paths reject save (%1)").arg(sErr3));
+        report(!bLoad3 && sErr3.contains(QStringLiteral("重复路径")),
+               QStringLiteral("K3: duplicate stored paths reject load (%1)").arg(sErr3));
     }
     else
     {
