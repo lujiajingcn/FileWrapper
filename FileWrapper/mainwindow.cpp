@@ -1503,6 +1503,17 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
             for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
                 collectExpandedItems(m_hModelFilePath->index(i, 0), QString(),
                                      m_setExpandedBeforeSort);
+            m_sSelectedPathBeforeSort.clear();
+            const QModelIndex cur = m_tvFilePath->currentIndex();
+            if (cur.isValid())
+            {
+                if (QStandardItem *it = m_hModelFilePath->itemFromIndex(cur))
+                {
+                    const QVariant v = it->data(FileListModel::InfoRole);
+                    if (v.canConvert<FILEINFO>())
+                        m_sSelectedPathBeforeSort = v.value<FILEINFO>().sFilePath;
+                }
+            }
         }
         else if (event->type() == QEvent::MouseButtonRelease
                  && !m_setExpandedBeforeSort.isEmpty())
@@ -1517,6 +1528,30 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                     restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(),
                                          m_setExpandedBeforeSort);
                 m_setExpandedBeforeSort.clear();
+                if (!m_sSelectedPathBeforeSort.isEmpty())
+                {
+                    std::function<QModelIndex(const QModelIndex &)> findItem =
+                        [&](const QModelIndex &parent) -> QModelIndex {
+                        for (int r = 0; r < m_hModelFilePath->rowCount(parent); ++r)
+                        {
+                            const QModelIndex idx = m_hModelFilePath->index(r, 0, parent);
+                            if (QStandardItem *it = m_hModelFilePath->itemFromIndex(idx))
+                            {
+                                const QVariant v = it->data(FileListModel::InfoRole);
+                                if (v.canConvert<FILEINFO>()
+                                    && v.value<FILEINFO>().sFilePath == m_sSelectedPathBeforeSort)
+                                    return idx;
+                            }
+                            const QModelIndex child = findItem(idx);
+                            if (child.isValid()) return child;
+                        }
+                        return QModelIndex();
+                    };
+                    const QModelIndex hit = findItem(QModelIndex());
+                    if (hit.isValid())
+                        m_tvFilePath->setCurrentIndex(hit);
+                    m_sSelectedPathBeforeSort.clear();
+                }
             });
         }
         // 不消费事件：让 QHeaderView/QTreeView 正常完成排序

@@ -39,11 +39,15 @@ win32 {
 
     DEPLOY_CMD = powershell -NoProfile -ExecutionPolicy Bypass -File \"$$DEPLOY_SCRIPT\" $$DEPLOY_PS_ARGS
 
-    # 主程序链接完成后自动部署（与原 ffmpeg 复制的时机一致）
+    # 主程序链接完成后自动部署（与原 ffmpeg 复制的时机一致）。
+    # manifest/脚本也是构建输入：只改清单时 make 必须重链接并重新部署，
+    # 否则运行时清单会停留在旧版本。
+    PRE_TARGETDEPS += $$DEPLOY_MANIFEST $$DEPLOY_SCRIPT
     QMAKE_POST_LINK = $$DEPLOY_CMD
 
     # 也可以单独执行：mingw32-make deploydeps
     deploydeps.target   = deploydeps
     deploydeps.commands = $$DEPLOY_CMD
+    deploydeps.depends  += $$DEPLOY_MANIFEST $$DEPLOY_SCRIPT
     QMAKE_EXTRA_TARGETS += deploydeps
 }
