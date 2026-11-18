@@ -1094,7 +1094,7 @@ static void verifyOtherViewers(const QString &work)
                 const QString plain = doc->toPlainText();
                 bText = plain.contains(QString::fromUtf8("第一章 RTF 冒烟"))
                         && plain.contains(QString::fromUtf8("粗体"));
-                bBold = doc->toHtml().contains(QStringLiteral("font-weight"));
+                bBold = formatOfFragment(doc, QString::fromUtf8("粗体")).fontWeight() >= QFont::Bold;
             }
         }
         delete p;

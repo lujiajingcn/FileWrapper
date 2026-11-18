@@ -692,8 +692,9 @@ bool MainWindow::loadMobi(const QByteArray &data)
         m_bookTitle = QString::fromUtf8(title);
     else
     {
-        char fn[256];
-        if (mobi_get_fullname(m, fn, sizeof(fn)) == MOBI_SUCCESS && fn[0])
+        char fn[257];
+        // libmobi 的 len 不含 NUL，库内写 fn[len]；多留 1 字节并传 256。
+        if (mobi_get_fullname(m, fn, sizeof(fn) - 1) == MOBI_SUCCESS && fn[0])
             m_bookTitle = QString::fromUtf8(fn);
     }
     if (title) ::free(title);

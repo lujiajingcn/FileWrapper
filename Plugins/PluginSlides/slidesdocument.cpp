@@ -114,8 +114,13 @@ void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, B
     const QString url = m_urlPrefix + QString::number(++m_imageSeq);
     m_images.insert(url, img);
     block->imageUrl = url;
-    block->imgW = wPt > 0.0 ? wPt : 240.0;
-    block->imgH = hPt > 0.0 ? hPt : (block->imgW * img.height() / qMax(1, img.width()));
+    // 文档属性里的显示尺寸不可信：必须有上限，否则 2e8pt 会把页面撑成超宽布局。
+    const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
+    const double h = qBound(1.0, hPt > 0.0 ? hPt
+                                           : (w * img.height() / qMax(1, img.width())),
+                            10000.0);
+    block->imgW = w;
+    block->imgH = h;
 }
 
 bool SlidesDocument::open(const QByteArray &data, QString *error)

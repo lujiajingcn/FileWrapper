@@ -595,7 +595,7 @@ bool FileManager::save()
         m_qFile.close();
         if (!QFile::remove(sArchivePath))
         {
-            setError(QStringLiteral("删除空归档失败: %1 (%2)").arg(sArchivePath, QFile(sArchivePath).errorString()));
+            setError(QStringLiteral("删除空归档失败: %1（文件可能被占用、只读或权限不足）").arg(sArchivePath));
             m_qFile.setFileName(sArchivePath);
             m_qFile.open(QIODevice::ReadOnly);
             return false;   // m_bDirty 保持 true，改动仍在内存中，可重试
@@ -1090,8 +1090,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     {
         if (QFileInfo::exists(sBak)) QFile::rename(sBak, sOutputFile);
         QFile::remove(sTmp);
-        finish(false, tr("替换输出文件失败：%1 (%2)")
-               .arg(sOutputFile, QFile(sTmp).errorString()));
+        finish(false, tr("替换输出文件失败：%1（目标可能被占用、只读或权限不足）")
+               .arg(sOutputFile));
         return;
     }
     QFile::remove(sBak);

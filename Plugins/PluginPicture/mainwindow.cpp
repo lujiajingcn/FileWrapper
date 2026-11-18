@@ -1,6 +1,8 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QDebug>
+#include <QBuffer>
+#include <QImageReader>
 #include <QTransform>
 #include <limits>
 #include <cmath>
@@ -54,8 +56,19 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
         return;
     }
 
-    QPixmap pix;
-    if (!pix.loadFromData(reinterpret_cast<const uchar*>(szBuf), static_cast<uint>(nFileLen)))
+    // QPixmap::loadFromData 不会应用 EXIF Orientation（Qt 6.9 默认
+    // autoTransform=false）；手机竖拍照片会横躺/镜像。用 QImageReader 显式转正。
+    QImage img;
+    {
+        QBuffer buf;
+        buf.setData(szBuf, static_cast<int>(nFileLen));
+        buf.open(QIODevice::ReadOnly);
+        QImageReader reader(&buf);
+        reader.setAutoTransform(true);
+        img = reader.read();
+    }
+    QPixmap pix = QPixmap::fromImage(img);
+    if (img.isNull())
     {
         // 图片解码失败：给出提示，避免静默显示空白。
         // 注意顺序：QLabel::setPixmap() 会清除已设置的文本，
