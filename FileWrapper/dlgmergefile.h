@@ -44,6 +44,7 @@ protected:
 private:
     void addPathItem(const QString &sPath, bool bUpdateSummary = true);
     void updateSummary();                        // 刷新"共 N 个文件 / X MB"摘要
+    void updateButtonStates();                   // 无文件/无选中/无输出时禁用对应按钮
     void addDroppedUrls(const QList<QUrl> &urls);
 
     QStandardItemModel      *m_hModelFilePath;

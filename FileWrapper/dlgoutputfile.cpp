@@ -44,6 +44,22 @@ DlgOutputFile::DlgOutputFile(QWidget *parent) :
         on_rbOldPath_clicked();
     else
         on_rbSelectDir_clicked();
+    connect(ui->leOutputFileDir, &QLineEdit::textChanged, this,
+            [this](const QString &) { updateButtonStates(); });
+    connect(ui->rbOldPath, &QRadioButton::toggled, this,
+            [this](bool) { updateButtonStates(); });
+    connect(ui->rbSelectDir, &QRadioButton::toggled, this,
+            [this](bool) { updateButtonStates(); });
+    updateButtonStates();
+}
+
+void DlgOutputFile::updateButtonStates()
+{
+    const bool bOld = ui->rbOldPath->isChecked();
+    const bool bHasDir = !ui->leOutputFileDir->text().trimmed().isEmpty();
+    ui->btnOk->setEnabled(bOld || bHasDir);
+    ui->btnSelectDir->setEnabled(!bOld);
+    ui->leOutputFileDir->setEnabled(!bOld);
 }
 
 DlgOutputFile::~DlgOutputFile()
@@ -70,12 +86,14 @@ void DlgOutputFile::on_rbOldPath_clicked()
     ui->leOutputFileDir->clear();
     ui->leOutputFileDir->setEnabled(false);
     ui->btnSelectDir->setEnabled(false);
+    updateButtonStates();
 }
 
 void DlgOutputFile::on_rbSelectDir_clicked()
 {
     ui->leOutputFileDir->setEnabled(true);
     ui->btnSelectDir->setEnabled(true);
+    updateButtonStates();
 }
 
 void DlgOutputFile::on_btnOk_clicked()

@@ -147,6 +147,7 @@ private:
     QAction                 *m_acDelFile;
     QAction                 *m_acOutputFile;
     QAction                 *m_acSaveFile;
+    QAction                 *m_acVerify = nullptr;
 
     bool                    m_bTreeMode = true;
     bool                    m_bShowPath = false;

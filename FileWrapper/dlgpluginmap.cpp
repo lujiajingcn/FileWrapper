@@ -107,12 +107,12 @@ DlgPluginMap::DlgPluginMap(QWidget *parent)
     m_ext->setMaximumWidth(140);
     m_plugin = new QComboBox(this);
     m_plugin->addItems(availablePluginNames());
-    auto *btnAdd = new QPushButton(QStringLiteral("添加 / 更新"), this);
-    auto *btnDel = new QPushButton(QStringLiteral("删除选中"), this);
+    m_btnAdd = new QPushButton(QStringLiteral("添加 / 更新"), this);
+    m_btnDel = new QPushButton(QStringLiteral("删除选中"), this);
     row->addWidget(m_ext);
     row->addWidget(m_plugin, 1);
-    row->addWidget(btnAdd);
-    row->addWidget(btnDel);
+    row->addWidget(m_btnAdd);
+    row->addWidget(m_btnDel);
     root->addLayout(row);
 
     auto *bottom = new QHBoxLayout;
@@ -121,8 +121,10 @@ DlgPluginMap::DlgPluginMap(QWidget *parent)
     bottom->addWidget(btnClose);
     root->addLayout(bottom);
 
-    connect(btnAdd, &QPushButton::clicked, this, [this]() { onAdd(); });
-    connect(btnDel, &QPushButton::clicked, this, [this]() { onRemoveSelected(); });
+    connect(m_btnAdd, &QPushButton::clicked, this, [this]() { onAdd(); });
+    connect(m_btnDel, &QPushButton::clicked, this, [this]() { onRemoveSelected(); });
+    connect(m_ext, &QLineEdit::textChanged, this, [this](const QString &) { updateButtonStates(); });
+    connect(m_table, &QTableWidget::itemSelectionChanged, this, [this]() { updateButtonStates(); });
     connect(btnClose, &QPushButton::clicked, this, [this]() { accept(); });
     connect(m_table, &QTableWidget::cellClicked, this, [this](int r, int) {
         if (r < 0 || r >= m_table->rowCount()) return;
@@ -135,6 +137,7 @@ DlgPluginMap::DlgPluginMap(QWidget *parent)
     });
 
     reloadTable();
+    updateButtonStates();
 }
 
 void DlgPluginMap::reloadTable()
@@ -147,12 +150,21 @@ void DlgPluginMap::reloadTable()
         m_table->setItem(i, 1, new QTableWidgetItem(mappingFor(exts.at(i))));
     }
     m_table->resizeColumnToContents(0);
+    updateButtonStates();
 
     // 重建表格后旧的 currentRow 可能指向"移位后的另一条"，输入框也残留已删后缀；
     // 统一清空选择与输入，避免再次删除/添加时操作到错误映射。
     m_table->clearSelection();
     m_table->setCurrentIndex(QModelIndex());
     m_ext->clear();
+}
+
+void DlgPluginMap::updateButtonStates()
+{
+    if (m_btnAdd != nullptr)
+        m_btnAdd->setEnabled(!m_ext->text().trimmed().isEmpty());
+    if (m_btnDel != nullptr)
+        m_btnDel->setEnabled(m_table->currentRow() >= 0 && m_table->currentRow() < m_table->rowCount());
 }
 
 void DlgPluginMap::onAdd()

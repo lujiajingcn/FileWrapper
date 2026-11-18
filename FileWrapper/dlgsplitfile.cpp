@@ -25,6 +25,27 @@ DlgSplitFile::DlgSplitFile(QWidget *parent) :
     resize(w, size().height());
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
+    connect(ui->leMergedFilePath, &QLineEdit::textChanged, this,
+            [this](const QString &) { updateButtonStates(); });
+    connect(ui->leSplittedFileDir, &QLineEdit::textChanged, this,
+            [this](const QString &) { updateButtonStates(); });
+    connect(ui->rbSaveAsOldPath, &QRadioButton::toggled, this,
+            [this](bool) { updateButtonStates(); });
+    connect(ui->brSaveAsSelectedDir, &QRadioButton::toggled, this,
+            [this](bool) { updateButtonStates(); });
+    updateButtonStates();
+}
+
+void DlgSplitFile::updateButtonStates()
+{
+    const bool bHasInput = !ui->leMergedFilePath->text().trimmed().isEmpty();
+    const bool bHasDir = !ui->leSplittedFileDir->text().trimmed().isEmpty();
+    const bool bOk = bHasInput
+                     && (ui->rbSaveAsOldPath->isChecked() || bHasDir);
+    ui->btnOk->setEnabled(bOk);
+    const bool bSelectDir = ui->brSaveAsSelectedDir->isChecked();
+    ui->leSplittedFileDir->setEnabled(bSelectDir);
+    ui->btnSplittedFileDir->setEnabled(bSelectDir);
 }
 
 DlgSplitFile::~DlgSplitFile()
@@ -50,6 +71,7 @@ QString DlgSplitFile::getSplitFileDir()
 void DlgSplitFile::setMergedFilePath(const QString &sPath)
 {
     ui->leMergedFilePath->setText(sPath);
+    updateButtonStates();
 }
 
 void DlgSplitFile::on_btnMergedFilePath_clicked()

@@ -159,24 +159,19 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(m_fileManager, &FileManager::warningOccurred,
             this, &MainWindow::onFileManagerWarning);
 
-    // 常用快捷键（P2）：Ctrl+O 加载、Ctrl+M 合并、Ctrl+S 保存、Ctrl+E 导出、Ctrl+U 卸载
-    auto addShortcut = [this](const QKeySequence &seq, auto slot) {
-        auto *pAction = new QAction(this);
-        pAction->setShortcut(seq);
-        connect(pAction, &QAction::triggered, this, slot);
-        addAction(pAction);
-    };
-    addShortcut(QKeySequence::Open, &MainWindow::on_actionLoadFile_triggered);
-    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_M), &MainWindow::on_actionMergeFile_triggered);
-    addShortcut(QKeySequence::Save, &MainWindow::onActionSaveFileTriggered);
-    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_E), &MainWindow::onActionOutputFileTriggered);
-    addShortcut(QKeySequence(Qt::CTRL | Qt::Key_U), &MainWindow::on_actionUnloadFile_triggered);
+    // 常用快捷键直接挂在动作本身上：动作被 setEnabled(false) 后快捷键也失效，
+    // 避免“按钮灰了但 Ctrl+S/Ctrl+U 仍能触发”的不一致。
+    ui->actionLoadFile->setShortcut(QKeySequence::Open);
+    ui->actionMergeFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
+    m_acSaveFile->setShortcut(QKeySequence::Save);
+    m_acOutputFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
+    ui->actionUnloadFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_U));
 
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
-    QAction *actVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
-    actVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
-    connect(actVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
-    ui->menu->addAction(actVerify);
+    m_acVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
+    m_acVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
+    connect(m_acVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
+    ui->menu->addAction(m_acVerify);
 
     // 「插件诊断」加入插件设置菜单：插件加载失败时用户能自己看到原因与缺哪个依赖
     QAction *actPluginDiag = new QAction(QStringLiteral("插件诊断"), ui->menu_2);
@@ -201,6 +196,9 @@ MainWindow::MainWindow(QWidget *parent) :
     actFormats->setToolTip(QStringLiteral("查看已安装插件能打开哪些格式，以及常见不支持格式的处理建议"));
     connect(actFormats, &QAction::triggered, this, &MainWindow::onActionSupportedFormatsTriggered);
     ui->menu_2->addAction(actFormats);
+
+    // 所有动作创建完毕后统一进入初始状态（启动时未加载归档）
+    syncActionStates();
 
     // 启动时若已有插件加载失败，给一条用户可见的提示（以前只进 qDebug，双击文件毫无反应）
     const int nFailedAtStartup = PluginManager::getInstance()->failures().size();
@@ -344,6 +342,11 @@ void MainWindow::initWidgetFilePath()
     connect(m_acDelFile, &QAction::triggered, this, &MainWindow::onActionDelFileTriggered);
     connect(m_acOutputFile, &QAction::triggered, this, &MainWindow::onActionOutputFileTriggered);
     connect(m_acSaveFile, &QAction::triggered, this, &MainWindow::onActionSaveFileTriggered);
+    // 删除/导出依赖“当前是否选中具体文件”，选中变化后立即刷新可用状态
+    connect(m_tvFilePath->selectionModel(), &QItemSelectionModel::currentChanged,
+            this, [this](const QModelIndex &, const QModelIndex &) { syncActionStates(); });
+    connect(m_tvFilePath->selectionModel(), &QItemSelectionModel::selectionChanged,
+            this, [this](const QItemSelection &, const QItemSelection &) { syncActionStates(); });
 
     // 图标：统一使用 resources/icons（应用图标同款蓝青风格）
     setWindowIcon(FwIcons::get(QStringLiteral("appicon")));
@@ -2272,12 +2275,13 @@ void MainWindow::populateFilePathTree()
 void MainWindow::updateViewActionState()
 {
     const bool bLoaded = m_fileManager->isArchiveLoaded();
+    const bool bBusy = m_fileManager->isBusy();
 
-    m_acViewTree->setEnabled(bLoaded && !m_bTreeMode);
-    m_acViewFlat->setEnabled(bLoaded && m_bTreeMode);
+    m_acViewTree->setEnabled(bLoaded && !bBusy && !m_bTreeMode);
+    m_acViewFlat->setEnabled(bLoaded && !bBusy && m_bTreeMode);
     // 「显示路径/显示名称」仅在平铺模式下有意义
-    m_acShowFilePath->setEnabled(bLoaded && !m_bTreeMode && !m_bShowPath);
-    m_acShowFileName->setEnabled(bLoaded && !m_bTreeMode && m_bShowPath);
+    m_acShowFilePath->setEnabled(bLoaded && !bBusy && !m_bTreeMode && !m_bShowPath);
+    m_acShowFileName->setEnabled(bLoaded && !bBusy && !m_bTreeMode && m_bShowPath);
 }
 
 // 唯一的状态刷新入口：包含保存按钮与所有菜单动作（P1-5 / P1-6）
@@ -2285,18 +2289,22 @@ void MainWindow::syncActionStates()
 {
     const bool bLoaded = m_fileManager->isArchiveLoaded();
     const bool bBusy   = m_fileManager->isBusy();
+    QStandardItem *pCur = m_hModelFilePath->itemFromIndex(
+        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    const bool bHasLeaf = isFileLeafItem(pCur);
 
     updateViewActionState();
     m_acSaveFile->setEnabled(bLoaded && m_fileManager->needsSave() && !bBusy);
     m_acAddFile->setEnabled(bLoaded && !bBusy);
-    m_acDelFile->setEnabled(bLoaded && !bBusy);
-    m_acOutputFile->setEnabled(bLoaded && !bBusy);
+    m_acDelFile->setEnabled(bLoaded && !bBusy && bHasLeaf);
+    m_acOutputFile->setEnabled(bLoaded && !bBusy && bHasLeaf);
 
     ui->actionLoadFile->setEnabled(!bBusy);
-    ui->actionUnloadFile->setEnabled(!bBusy);
+    ui->actionUnloadFile->setEnabled(bLoaded && !bBusy);
     ui->actionMergeFile->setEnabled(!bBusy);
     ui->actionSplitFile->setEnabled(!bBusy);
     ui->actionPluginMap->setEnabled(!bBusy);
+    if (m_acVerify != nullptr) m_acVerify->setEnabled(bLoaded && !bBusy);
 }
 
 // 长操作期间禁用可重入动作（P3-2）
@@ -2309,10 +2317,24 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
     ui->actionMergeFile->setEnabled(bEnabled);
     ui->actionSplitFile->setEnabled(bEnabled);
     ui->actionPluginMap->setEnabled(bEnabled);
+    if (bEnabled)
+        updateViewActionState();
+    else
+    {
+        m_acViewTree->setEnabled(false);
+        m_acViewFlat->setEnabled(false);
+        m_acShowFilePath->setEnabled(false);
+        m_acShowFileName->setEnabled(false);
+    }
+    ui->actionUnloadFile->setEnabled(bEnabled && bLoaded);
+    QStandardItem *pCur = m_hModelFilePath->itemFromIndex(
+        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    const bool bHasLeaf = isFileLeafItem(pCur);
     m_acAddFile->setEnabled(bEnabled && bLoaded);
-    m_acDelFile->setEnabled(bEnabled && bLoaded);
-    m_acOutputFile->setEnabled(bEnabled && bLoaded);
+    m_acDelFile->setEnabled(bEnabled && bLoaded && bHasLeaf);
+    m_acOutputFile->setEnabled(bEnabled && bLoaded && bHasLeaf);
     m_acSaveFile->setEnabled(bEnabled && bLoaded && m_fileManager->needsSave() && !bBusy);
+    if (m_acVerify != nullptr) m_acVerify->setEnabled(bEnabled && bLoaded);
 }
 
 // 统一管理进度对话框的三条连接，避免 disconnect(sender, nullptr, ...) 误伤常驻连接

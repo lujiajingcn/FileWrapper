@@ -6,7 +6,8 @@
 
 QT       += core gui
 
-# 閹绘帊娆㈤幒銉ュ經婢跺瓨鏂侀崷銊ょ波鎼存挻鐗?include/閿涙矮瀵岀粙瀣碍娑撳孩褰冩禒鍫曞厴娴犲酣鍋呴柌灞藉絿閿涘本甯撮崣锝呭礋娑撯偓閺夈儲绨?INCLUDEPATH += $$PWD/../include
+# 鎻掍欢鎺ュ彛澶存斁鍦ㄤ粨搴撴牴 include/锛氫富绋嬪簭涓庢彃浠堕兘浠庨偅閲屽彇锛屾帴鍙ｅ崟涓€鏉ユ簮
+INCLUDEPATH += $$_PRO_FILE_PWD_/../include
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -52,7 +53,7 @@ HEADERS += \
         filemanager.h \
         formatresolver.h \
         mainwindow.h \
-        $$PWD/../include/plugininterface.h \
+        $$_PRO_FILE_PWD_/../include/plugininterface.h \
         pluginmanager.h \
         plugindiag.h
 
@@ -69,13 +70,14 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
 # ============================================================================
-# 閹绘帊娆㈡潻鎰攽閺冩湹绶风挧鏍劥缂冭绱?026-11-17 缂佺喍绔撮敍?#
-# 娴犮儱澧犳潻娆撳櫡閸楁洜瀚径宥呭煑 ffmpeg 閻?5 娑?DLL閿涘luginPdf.pro 婢跺秴鍩?Qt6Pdf/Qt6Network閿?# PluginWord.pro 婢跺秴鍩?Qt6Xml 閳ユ柡鈧?娑撳顦╅梿鑸垫殠閵嗕浇鐭楁禒璁崇瑝濞撳拑绱濋懓灞肩瑬 Qt6Multimedia.dll
-# 閿涘湧luginMedia 閻ㄥ嫰鐓舵０鎴ｇ翻閸戣桨绶风挧鏍电礆閺嶈婀板▽鈥叉眽婢跺秴鍩楅敍姘磻閸欐垶婧€ PATH 闁插本婀?Qt bin 閹碘偓娴犮儳婀呮稉宥呭毉閺夈儻绱?# 閹广垹褰撮張鍝勬珤鐏忎究鈧本褰冩禒璺哄鏉炶棄銇戠拹銉ｂ偓宥忕礉缁嬪绨潻妯圭瑝缂佹瑤鎹㈡担鏇熷絹缁€鎭掆偓?#
-# 閻滄澘婀敍姘贩鐠ф牗绔婚崡鏇氱瀵板鍟撻崷?deploy/plugin-deps.manifest閿涘牆鏁稉鈧弶銉︾爱閿涘绱濋柧鐐复鐎瑰本鍨氶崥搴ｆ暠
-# deploy/deploy-deps.ps1 缂佺喍绔存径宥呭煑閸?exe 閻╊喖缍嶉敍灞借嫙閻㈢喐鍨?plugin-deploy-manifest.txt
-# 娓氭稓鈻兼惔蹇氬殰濡偓閿涘牐顫?plugindiag.cpp閿涘鈧倹鏌婃晶鐐村絻娴犳湹绶风挧鏍у涧閺€?manifest閿涘奔绗夌憰浣稿晙閸?POST_LINK閵?# ============================================================================
-RESOURCES += $$PWD/../resources/resources.qrc
-win32: RC_FILE += $$PWD/../resources/appicon.rc
+# 鎻掍欢杩愯鏃朵緷璧栭儴缃诧紙2026-11-17 缁熶竴锛?#
+# 浠ュ墠杩欓噷鍗曠嫭澶嶅埗 ffmpeg 鐨?5 涓?DLL锛孭luginPdf.pro 澶嶅埗 Qt6Pdf/Qt6Network锛?# PluginWord.pro 澶嶅埗 Qt6Xml 鈥斺€?涓夊闆舵暎銆佽矗浠讳笉娓咃紝鑰屼笖 Qt6Multimedia.dll
+# 锛圥luginMedia 鐨勯煶棰戣緭鍑轰緷璧栵級鏍规湰娌′汉澶嶅埗锛氬紑鍙戞満 PATH 閲屾湁 Qt bin 鎵€浠ョ湅涓嶅嚭鏉ワ紝
+# 鎹㈠彴鏈哄櫒灏便€屾彃浠跺姞杞藉け璐ャ€嶏紝绋嬪簭杩樹笉缁欎换浣曟彁绀恒€?#
+# 鐜板湪锛氫緷璧栨竻鍗曚竴寰嬪啓鍦?deploy/plugin-deps.manifest锛堝敮涓€鏉ユ簮锛夛紝閾炬帴瀹屾垚鍚庣敱
+# deploy/deploy-deps.ps1 缁熶竴澶嶅埗鍒?exe 鐩綍锛屽苟鐢熸垚 plugin-deploy-manifest.txt
+# 渚涚▼搴忚嚜妫€锛堣 plugindiag.cpp锛夈€傛柊澧炴彃浠朵緷璧栧彧鏀?manifest锛屼笉瑕佸啀鍐?POST_LINK銆?# ============================================================================
+RESOURCES += $$_PRO_FILE_PWD_/../resources/resources.qrc
+win32: RC_FILE += $$_PRO_FILE_PWD_/../resources/appicon.rc
 
 include(deploy.pri)

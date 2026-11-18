@@ -6,6 +6,7 @@
 #include <QDirIterator>
 #include <QShortcut>
 #include <QTreeView>
+#include <QItemSelectionModel>
 #include <QScreen>
 #include <QDir>
 #include <QDragEnterEvent>
@@ -58,7 +59,18 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     ui->treeView->viewport()->setAcceptDrops(true);
     ui->treeView->viewport()->installEventFilter(this);
     ui->treeView->setToolTip(tr("可直接把文件或文件夹拖到这里"));
+
+    connect(m_hModelFilePath, &QAbstractItemModel::rowsInserted, this,
+            [this](const QModelIndex &, int, int) { updateButtonStates(); });
+    connect(m_hModelFilePath, &QAbstractItemModel::rowsRemoved, this,
+            [this](const QModelIndex &, int, int) { updateButtonStates(); });
+    connect(ui->treeView->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+            [this](const QItemSelection &, const QItemSelection &) { updateButtonStates(); });
+    connect(ui->leMergedFilePath, &QLineEdit::textChanged, this,
+            [this](const QString &) { updateButtonStates(); });
+
     updateSummary();
+    updateButtonStates();
 }
 
 DlgMergeFile::~DlgMergeFile()
@@ -93,6 +105,16 @@ void DlgMergeFile::addPathItem(const QString &sPath, bool bUpdateSummary)
 }
 
 // 摘要：输入项数、展开后的文件数/总大小、其中多少个是已合并的 .dat
+void DlgMergeFile::updateButtonStates()
+{
+    const bool bHasRows = (m_hModelFilePath->rowCount() > 0);
+    const bool bHasSel = (ui->treeView->selectionModel() != nullptr)
+                         && ui->treeView->selectionModel()->hasSelection();
+    const bool bHasOutput = !ui->leMergedFilePath->text().trimmed().isEmpty();
+    ui->btnDelete->setEnabled(bHasSel);
+    ui->btnOk->setEnabled(bHasRows && bHasOutput);
+}
+
 void DlgMergeFile::updateSummary()
 {
     int nInputs = 0, nFiles = 0, nArchives = 0;

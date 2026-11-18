@@ -8,6 +8,7 @@
 class QTableWidget;
 class QLineEdit;
 class QComboBox;
+class QPushButton;
 
 // 后缀 → 插件映射对话框；映射持久化在 QSettings（P2-2）
 class DlgPluginMap : public QDialog
@@ -26,10 +27,13 @@ private:
     void reloadTable();
     void onAdd();
     void onRemoveSelected();
+    void updateButtonStates();
 
     QTableWidget *m_table;
     QLineEdit    *m_ext;
     QComboBox    *m_plugin;
+    QPushButton  *m_btnAdd = nullptr;
+    QPushButton  *m_btnDel = nullptr;
 };
 
 #endif // DLGPLUGINMAP_H

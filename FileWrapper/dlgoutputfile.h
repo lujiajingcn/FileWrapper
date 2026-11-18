@@ -28,6 +28,7 @@ private slots:
     void on_btnCancel_clicked();
 
 private:
+    void updateButtonStates();
     QString             m_sOutputDir;
     Ui::DlgOutputFile *ui;
 };
