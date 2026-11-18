@@ -39,8 +39,11 @@ static QString absoluteOriginalPath(const QString &sDisplayPath, QString *psErr 
     }
 
     // 扁平模式：E:/x 会存成 E/x（无冒号）。仅单个字母首段才还原，避免误伤普通相对目录。
-    if (segs.size() >= 2 && segs.first().size() == 1
-        && segs.first().at(0).isLetter())
+    const QChar chDrive = segs.isEmpty() ? QChar() : segs.first().at(0);
+    const bool bAsciiDrive = segs.size() >= 2 && segs.first().size() == 1
+        && ((chDrive >= QLatin1Char('A') && chDrive <= QLatin1Char('Z'))
+            || (chDrive >= QLatin1Char('a') && chDrive <= QLatin1Char('z')));
+    if (bAsciiDrive)
     {
         QStringList rest = segs;
         const QString sDrive = rest.takeFirst();
