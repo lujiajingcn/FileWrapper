@@ -173,7 +173,7 @@ static QByteArray makeGarbage()
 // ---------- 主测试 ----------
 int main(int argc, char *argv[])
 {
-    g_logFile.setFileName("C:/Users/lujiajing/AppData/Local/Temp/booktest_result.txt");
+    g_logFile.setFileName(QDir::temp().absoluteFilePath(QStringLiteral("booktest_result.txt")));
     g_logFile.open(QIODevice::WriteOnly | QIODevice::Text);
     g_log.setDevice(&g_logFile);
 

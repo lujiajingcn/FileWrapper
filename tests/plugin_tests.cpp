@@ -19,7 +19,7 @@
 //   * 真实插件 DLL，经 QPluginLoader 加载后走 PluginInterface
 //   * 真实 QTextBrowser 文档：逐段/逐字符/逐表格/逐图片检查渲染结果
 //
-// 用法：plugin_tests <fixture-dir> <plugins-dir> <log-file> [shots-dir] [integrate]
+// 用法：plugin_tests <fixture-dir> <plugins-dir> <log-file> [--shots <dir>] [--integrate]
 //   fixture-dir  tests/fixtures（或重新生成后的目录）
 //   plugins-dir  主程序 exe 同级的 plugins/ 目录（含已构建的插件 DLL 与 sidecar）
 //   shots-dir    给出时额外保存渲染截图
@@ -1425,7 +1425,8 @@ static void verifyDiskSpaceCheck()
     const QString sTemp = QDir::tempPath();
 
     // X3a: 要 1 字节：只要临时盘可用就应通过，并能报出可用空间
-    report(FileManager::hasFreeSpaceFor(sTemp, 1, &nAvail) && nAvail > 0,
+    const bool bSpaceProbe = FileManager::hasFreeSpaceFor(sTemp, 1, &nAvail);
+    report(bSpaceProbe && nAvail > 0,
            QStringLiteral("X3a: free space probe works (%1 MB available)")
                .arg(nAvail / (1024.0 * 1024.0), 0, 'f', 0));
 
@@ -2298,9 +2299,15 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
            QStringLiteral("A6: tab title '%1'").arg(tabs.tabText(0)));
 
     const QPixmap shot = tabs.grab();
-    report(!shot.isNull() && shot.width() > 100,
-           QStringLiteral("A7: tab page grabs %1x%2 (layout ready)")
-               .arg(shot.width()).arg(shot.height()));
+    const bool bLayout = shot.width() > 100
+        && page && page->isVisible()
+        && page->size().width() > 100 && page->size().height() > 100
+        && browser && browser->size().width() > 100;
+    report(bLayout,
+           QStringLiteral("A7: tab/page/browser layout %1x%2 page=%3x%4")
+               .arg(shot.width()).arg(shot.height())
+               .arg(page ? page->size().width() : 0)
+               .arg(page ? page->size().height() : 0));
 
     tabs.removeTab(0);
     delete own;
@@ -2340,8 +2347,9 @@ int main(int argc, char **argv)
     }
     else
     {
-        // 隔离失败会让测试写进用户真实配置：必须显式失败，不能静默继续
+        // 隔离失败会让测试写进用户真实配置：必须显式失败并停止，不能继续。
         report(false, QStringLiteral("settings isolation failed (QTemporaryDir invalid)"));
+        return 1;
     }
 
     const QString work = (argc > 1) ? QString::fromLocal8Bit(argv[1])

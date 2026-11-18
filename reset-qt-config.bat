@@ -46,7 +46,7 @@ rem     Deleting the Makefiles forces a clean regeneration with cmd syntax.
 rem     Object files (.o) are kept, so the next build stays incremental.
 echo.
 set DELN=0
-for /d %%d in (build-*) do (
+for /d %%d in (build build-* ..\build-*) do (
     if exist "%%d" (
         echo   scan: %%d
         for /f "delims=" %%m in ('dir /b /s "%%d\Makefile*" 2^>nul') do (
@@ -58,6 +58,7 @@ for /d %%d in (build-*) do (
         )
     )
 )
+if "!DELN!"=="0" echo   [WARN] no generated Makefile found under build/ or build-*/ or ..\build-*/
 echo   deleted !DELN! generated Makefile^(s^) plus .qmake.stash
 
 echo.

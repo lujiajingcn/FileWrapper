@@ -1,3 +1,5 @@
+SHELL := cmd.exe
+
 # ------------------------------------------------------------
 # libmobi 静态库构建（MinGW / Qt 工具链）
 #
@@ -43,4 +45,4 @@ $(OBJDIR)/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(LIB)
+	del /q $(subst /,\,$(OBJS)) $(subst /,\,$(LIB)) 2>nul
