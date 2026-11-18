@@ -972,7 +972,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         FwArc::Crc32 eCrc;
         bOk = streamCopy(src, s.nOffset, s.nLength, fTmp, eCrc,
                          copiedTotal, totalBytes,
-                         tr("正在合并: %1").arg(s.sDisplayName), err);
+                         tr("正在合并: %1").arg(s.sOriginPath), err);
         contentCrcs.append(eCrc.value());
         src.close();
     }

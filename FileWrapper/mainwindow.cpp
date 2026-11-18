@@ -1935,11 +1935,20 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
     // 起始位置越靠左，于是「正在合并:」这几个字会随着文件名长短左右漂移。
     // 改为左对齐后前缀始终停在左侧，且与下方进度条左端对齐。
     if (QLabel *pStatusLabel = dlg->findChild<QLabel*>())
+    {
         pStatusLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        // 固定尺寸后 label 必须允许收缩，否则超长路径仍会把窗口撑大
+        pStatusLabel->setWordWrap(false);
+        pStatusLabel->setMinimumWidth(0);
+        pStatusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    }
+    // 固定尺寸：状态文本随文件名/路径变化时弹窗不再忽大忽小（长文本由下方 elidedText 处理）
+    dlg->setFixedSize(560, 150);
 
     m_connProgress = connect(m_fileManager, &FileManager::progressChanged, this,
         [this](qint64 cur, qint64 total, const QString &status) {
             if (m_pActiveProgress == nullptr) return;
+            QString sText = status;
             if (total > 0)
             {
                 const int nPct = int(100 * cur / total);
@@ -1950,14 +1959,17 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
                     const qint64 nElapsed = m_progressTimer.elapsed();
                     const qint64 nRemainMs = nElapsed * (100 - nPct) / nPct;
                     if (nRemainMs >= 1000)
-                    {
-                        m_pActiveProgress->setLabelText(
-                            status + tr(" · 剩余约 %1 秒").arg(nRemainMs / 1000));
-                        return;
-                    }
+                        sText += tr(" · 剩余约 %1 秒").arg(nRemainMs / 1000);
                 }
             }
-            m_pActiveProgress->setLabelText(status);
+            if (QLabel *pLabel = m_pActiveProgress->findChild<QLabel*>())
+            {
+                // 路径过长时省略中段：保留"正在合并:"前缀与末尾的进度数字/大小
+                const int nAvail = qMax(80, pLabel->width() - 8);
+                sText = pLabel->fontMetrics().elidedText(sText, Qt::ElideMiddle, nAvail);
+                pLabel->setToolTip(status);      // 鼠标悬停可看完整路径
+            }
+            m_pActiveProgress->setLabelText(sText);
         });
     m_connFinished = connect(m_fileManager, &FileManager::operationFinished, this,
         [this, pbOk, psResultMsg](bool ok, const QString &msg) {
