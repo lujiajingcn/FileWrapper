@@ -18,8 +18,8 @@ MainWindow::MainWindow(QWidget *parent) :
     pActual->setToolTip(tr("按 100% 原始像素显示"));
     ui->toolBar->addAction(pFit);
     ui->toolBar->addAction(pActual);
-    connect(pFit, &QAction::triggered, this, &MainWindow::on_actFit_triggered);
-    connect(pActual, &QAction::triggered, this, &MainWindow::on_actActualSize_triggered);
+    connect(pFit, &QAction::triggered, this, &MainWindow::fitToWindow);
+    connect(pActual, &QAction::triggered, this, &MainWindow::actualSize);
 }
 
 MainWindow::~MainWindow()
@@ -117,7 +117,7 @@ void MainWindow::applyTransform()
     ui->labelPicture->adjustSize();
 }
 
-void MainWindow::on_actFit_triggered()
+void MainWindow::fitToWindow()
 {
     if (m_originalPix.isNull())
         return;
@@ -127,17 +127,23 @@ void MainWindow::on_actFit_triggered()
     if (m_rotateDeg == 90 || m_rotateDeg == 270)
         orig.transpose();
 
-    const QSize avail = ui->labelPicture->contentsRect().size();
-    if (avail.width() <= 0 || avail.height() <= 0 || orig.isEmpty())
+    // 注意：必须用 QScrollArea 的视口尺寸，不能用 labelPicture 的尺寸。
+    // label 在 applyTransform() 里会被 adjustSize() 成"当前缩放后的图片大小"，
+    // 拿它当可用区域算出来的比例恒等于当前缩放，按钮看起来就没有效果。
+    const QSize avail = ui->scrollArea->viewport()->size();
+    if (avail.isEmpty() || orig.isEmpty())
         return;
 
-    m_scale = qMin(qreal(avail.width()) / orig.width(),
-                   qreal(avail.height()) / orig.height());
-    m_scale = qBound(0.1, m_scale, 8.0);
+    const int nMargin = 8;   // 预留边距，避免刚好贴边/触发滚动条抖动
+    m_scale = qMin(qreal(avail.width() - nMargin) / orig.width(),
+                   qreal(avail.height() - nMargin) / orig.height());
+    if (m_scale <= 0.0)
+        return;
+    m_scale = qBound(0.05, m_scale, 8.0);
     applyTransform();
 }
 
-void MainWindow::on_actActualSize_triggered()
+void MainWindow::actualSize()
 {
     if (m_originalPix.isNull())
         return;

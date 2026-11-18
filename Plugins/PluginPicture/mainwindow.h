@@ -19,12 +19,14 @@ public:
     // 打开失败 / 0 字节时清空内容区，避免界面残留上一个文件
     void clearContent();
 
+    // 视图动作（工具栏按钮与探针共用；不是 .ui 里的 action，不需要 on_ 命名）
+    void fitToWindow();     // 适应窗口
+    void actualSize();      // 实际大小 100%
+
 private slots:
     void on_actZoomIn_triggered();
     void on_actZoomOut_triggered();
     void on_actRotate_triggered();
-    void on_actFit_triggered();          // 适应窗口
-    void on_actActualSize_triggered();   // 实际大小 100%
 
 private:
     void applyTransform();  // 根据当前缩放/旋转重新绘制
