@@ -1593,9 +1593,24 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 
     qint64 totalBytes = 0;
     for (const FwArc::Entry &e : meta.entries) totalBytes += qint64(e.size);
+
+    // 目标盘空间预检（按第一个输出目录估算；跨盘条目无法精确，尽力而为）。
+    const QString sSpaceDir = bIsSaveAsOldPath
+        ? QFileInfo(meta.entries.isEmpty() ? sInputFile : meta.entries.first().displayPath).absolutePath()
+        : sSplitFileDir;
+    const QStorageInfo storage(sSpaceDir);
+    if (storage.isValid() && storage.bytesAvailable() >= 0 && totalBytes > storage.bytesAvailable())
+    {
+        finish(false, tr("目标磁盘空间不足：需要约 %1，可用 %2（%3）")
+                           .arg(FwArc::formatSize(totalBytes),
+                                FwArc::formatSize(storage.bytesAvailable()), sSpaceDir));
+        return;
+    }
+
     qint64 copiedTotal = 0;
     QSet<QString> setUsed;
     int nRenamed = 0, nSkipped = 0, nFailed = 0, nDone = 0, nCrcBad = 0;
+    QString sFirstError;
 
     QByteArray buf;
     buf.resize(int(kCopyChunk));
@@ -1610,20 +1625,21 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         const QString sDir = QFileInfo(sOut).absolutePath();
         if (!QDir().exists(sDir) && !QDir().mkpath(sDir))
         {
-            qWarning() << "创建输出目录失败:" << sDir;
+            if (sFirstError.isEmpty()) sFirstError = tr("创建输出目录失败：%1").arg(sDir);
             ++nFailed; continue;
         }
 
         QFile fOut(sOut);
         if (!fOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
         {
-            qWarning() << "打开输出文件失败:" << sOut << fOut.errorString();
+            if (sFirstError.isEmpty()) sFirstError = tr("打开输出文件失败：%1（%2）").arg(sOut, fOut.errorString());
             ++nFailed; continue;
         }
 
         if (!fIn.seek(qint64(e.contentPos)))
         {
             fOut.close(); QFile::remove(sOut);
+            if (sFirstError.isEmpty()) sFirstError = tr("定位归档内容失败：%1").arg(e.relPath);
             ++nFailed; continue;
         }
 
@@ -1658,7 +1674,12 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         if (!bOk || done != qint64(e.size))
         {
             QFile::remove(sOut);
-            ++nFailed;
+            if (!m_bCancelRequested)
+            {
+                if (sFirstError.isEmpty()) sFirstError = tr("写入/读取失败：%1").arg(sOut);
+                ++nFailed;
+            }
+            if (m_bCancelRequested) break;
             continue;
         }
         // 内容 CRC 校验（v1 无校验字段，跳过但会在汇总里说明）
@@ -1683,6 +1704,7 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
     QString msg = tr("分割完成：成功 %1 个，跳过 %2 个，失败 %3 个，自动重命名 %4 个")
                     .arg(nDone).arg(nSkipped).arg(nFailed).arg(nRenamed);
     if (nCrcBad > 0) msg += tr("，内容校验失败 %1 个").arg(nCrcBad);
+    if (!sFirstError.isEmpty()) msg += tr("；首个错误：%1").arg(sFirstError);
     if (meta.version == FwArc::VERSION_V1)
         msg += tr("（v1 归档无内容校验字段，未做逐条 CRC 校验）");
     finish(nFailed == 0 && nCrcBad == 0, msg);

@@ -835,6 +835,7 @@ void MainWindow::loadChapter(int idx)
     // 截断状态在状态栏持续可见，避免只在解析结束时提示一次。
     if (property(kTruncatedProperty).toBool())
         info += QStringLiteral("  |  已截断");
+    m_infoLabel->setTextFormat(Qt::PlainText);   // 书名来自文件，不能按富文本解析
     m_infoLabel->setText(info);
     ui->actionPrevChapter->setEnabled(idx > 0);
     ui->actionNextChapter->setEnabled(idx < m_chapterHtml.size() - 1);

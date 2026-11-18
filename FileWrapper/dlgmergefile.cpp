@@ -274,8 +274,16 @@ void DlgMergeFile::on_btnOk_clicked()
         if (info.isDir())
         {
             QDirIterator it(sItem, QDir::Files, QDirIterator::Subdirectories);
+            int nScanned = 0;
             while (it.hasNext())
             {
+                if (++nScanned > 200000)
+                {
+                    QMessageBox::warning(this, "提示",
+                        "输入目录文件数超过 200000，无法在合理时间内完成输出冲突检查。\n"
+                        "请缩小输入目录范围，或先合并到其它输出文件。");
+                    return;
+                }
                 const QString sub = it.next();
                 if (QFileInfo(sub).absoluteFilePath().toLower() == outKey)
                 {

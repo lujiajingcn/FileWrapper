@@ -1293,8 +1293,11 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         releaseMappedInput(iface);
         return;
     }
-    // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放
-    iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName));
+    // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放。
+    // sendFile() 返回 false 表示插件明确放弃（格式不支持/解码失败），
+    // 宿主必须给出可见提示，不能只留空白画面。
+    if (!iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName)))
+        onFileManagerWarning(tr("插件无法显示该文件：%1").arg(info.sFileName));
     // 新内容已生效：旧的内存映射不再被插件引用，可以释放（Windows 下不释放会阻止归档重写）
     releaseMappedInput(iface);
 }
