@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 
 #include "zipreader.h"
+#include "xmlguard.h"
 #include <QLayout>
 #include <QDomDocument>
 #include <QRegularExpression>
@@ -271,7 +272,10 @@ QVariant BookBrowser::loadResource(int type, const QUrl &name)
             }
         }
     }
-    return QTextBrowser::loadResource(type, name);
+    // 只允许 ZIP/FB2 内部图片；不要回退到 QTextBrowser 的本地文件读取，
+    // 否则 EPUB 里的 file:/// 可绕过图片预算读取任意本地文件。
+    Q_UNUSED(type); Q_UNUSED(name);
+    return QVariant();
 }
 
 // ============================================================
@@ -480,7 +484,10 @@ bool MainWindow::loadEpub(const QByteArray &data)
     }
     if (containerKey.isEmpty()) return false;
 
-    QString opfRel = findTagAttr(QString::fromUtf8(m_entries.value(containerKey)), "rootfile", "full-path");
+    const QList<QMap<QString, QString>> rootfiles = findTagsLimited(
+        QString::fromUtf8(m_entries.value(containerKey)), QStringLiteral("rootfile"), 4096, nullptr);
+QString opfRel;
+if (!rootfiles.isEmpty()) opfRel = rootfiles.first().value(QStringLiteral("full-path"));
     if (opfRel.isEmpty()) return false;
 
     QString opfKey = opfRel;
@@ -622,6 +629,11 @@ bool MainWindow::loadFb2(const QByteArray &data)
         }
     }
 
+    if (!xmlWithinTagBudget(xml))
+    {
+        markTruncated(this, QStringLiteral("FB2 XML 元素过多"));
+        return false;
+    }
     QDomDocument doc;
     if (!doc.setContent(xml)) return false;
     QDomElement root = doc.documentElement();

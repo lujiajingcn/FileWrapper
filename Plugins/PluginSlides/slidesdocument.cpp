@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <algorithm>
 #include <functional>
+#include "xmlguard.h"
 
 namespace {
 
@@ -158,8 +159,11 @@ bool SlidesDocument::parsePptx(QString *error)
         return false;
     };
 
+    const QByteArray presXml = m_zip.entry(QStringLiteral("ppt/presentation.xml"));
+    if (!xmlWithinTagBudget(presXml))
+        return fail(QStringLiteral("pptx XML 元素过多。"));
     QDomDocument pres;
-    if (!pres.setContent(m_zip.entry(QStringLiteral("ppt/presentation.xml"))))
+    if (!pres.setContent(presXml))
         return fail(QStringLiteral("无法解析 ppt/presentation.xml。"));
 
     const QByteArray presRels = m_zip.entry(QStringLiteral("ppt/_rels/presentation.xml.rels"));
@@ -198,7 +202,8 @@ bool SlidesDocument::parsePptx(QString *error)
     {
         const QString path = slidePaths.at(si);
         QDomDocument slideDoc;
-        if (!slideDoc.setContent(m_zip.entry(path))) continue;
+        const QByteArray slideXml = m_zip.entry(path);
+        if (!xmlWithinTagBudget(slideXml) || !slideDoc.setContent(slideXml)) continue;
 
         Slide slide;
         const QString slideDir = path.left(path.lastIndexOf(QLatin1Char('/')));
@@ -352,8 +357,11 @@ bool SlidesDocument::parseOdp(QString *error)
         return false;
     };
 
+    const QByteArray odpXml = m_zip.entry(QStringLiteral("content.xml"));
+    if (!xmlWithinTagBudget(odpXml))
+        return fail(QStringLiteral("ODP XML 元素过多。"));
     QDomDocument doc;
-    if (!doc.setContent(m_zip.entry(QStringLiteral("content.xml"))))
+    if (!doc.setContent(odpXml))
         return fail(QStringLiteral("无法解析 ODP 的 content.xml。"));
 
     QVector<QDomElement> pages;

@@ -52,6 +52,7 @@ private:
         int rows = 0;
         int cols = 0;
         QMap<int, QMap<int, Cell>> cells;   // row -> col -> cell
+        int cellCount = 0;                  // 已插入的格子总数（含 merge 覆盖格）
     };
 
     bool parseXlsx(QString *error);

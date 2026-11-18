@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QStringList>
 #include <QRegularExpression>
+#include "xmlguard.h"
 
 namespace {
 
@@ -105,14 +106,19 @@ void SheetDocument::setCell(int sheetIndex, int row, int col, const QString &tex
     if (sheetIndex < 0 || sheetIndex >= m_sheets.size()) return;
     if (row < 0 || row >= kMaxRows || col < 0 || col >= kMaxCols) { m_truncated = true; return; }
     Sheet &s = m_sheets[sheetIndex];
-    if (s.cells.size() >= kMaxCells) { m_truncated = true; return; }
+    auto &rowMap = s.cells[row];
+    if (!rowMap.contains(col))
+    {
+        if (s.cellCount >= kMaxCells) { m_truncated = true; return; }
+        ++s.cellCount;
+    }
 
     QString t = text;
     if (t.size() > kMaxCellLen) { t.truncate(kMaxCellLen); t += QStringLiteral("…"); m_truncated = true; }
 
     Cell c;
     c.text = t;
-    s.cells[row].insert(col, c);
+    rowMap.insert(col, c);
     s.rows = qMax(s.rows, row + 1);
     s.cols = qMax(s.cols, col + 1);
 }
@@ -134,7 +140,13 @@ void SheetDocument::applyMerge(int sheetIndex, int row, int col, int rowSpan, in
         for (int c = col; c < col + itCell->colSpan && c < kMaxCols; ++c)
         {
             if (r == row && c == col) continue;
-            s.cells[r][c].covered = true;
+            auto &coveredRow = s.cells[r];
+            if (!coveredRow.contains(c))
+            {
+                if (s.cellCount >= kMaxCells) { m_truncated = true; return; }
+                ++s.cellCount;
+            }
+            coveredRow[c].covered = true;
         }
     }
 }
@@ -174,8 +186,11 @@ bool SheetDocument::parseXlsx(QString *error)
         return false;
     };
 
+    const QByteArray wbXml = m_zip.entry(QStringLiteral("xl/workbook.xml"));
+    if (!xmlWithinTagBudget(wbXml))
+        return fail(QStringLiteral("xlsx XML 元素过多。"));
     QDomDocument wb;
-    if (!wb.setContent(m_zip.entry(QStringLiteral("xl/workbook.xml"))))
+    if (!wb.setContent(wbXml))
         return fail(QStringLiteral("无法解析 xl/workbook.xml。"));
 
     const QByteArray wbRels = m_zip.entry(QStringLiteral("xl/_rels/workbook.xml.rels"));
@@ -185,7 +200,8 @@ bool SheetDocument::parseXlsx(QString *error)
     QStringList sharedStrings;
     {
         QDomDocument ss;
-        if (ss.setContent(m_zip.entry(QStringLiteral("xl/sharedStrings.xml"))))
+        const QByteArray ssXml = m_zip.entry(QStringLiteral("xl/sharedStrings.xml"));
+        if (xmlWithinTagBudget(ssXml) && ss.setContent(ssXml))
         {
             for (QDomElement si = ss.documentElement().firstChildElement(QStringLiteral("si"));
                  !si.isNull(); si = si.nextSiblingElement(QStringLiteral("si")))
@@ -232,7 +248,8 @@ bool SheetDocument::parseXlsx(QString *error)
     {
         const QString &target = sheetList.at(si).second;
         QDomDocument sheetDoc;
-        if (!sheetDoc.setContent(m_zip.entry(target))) continue;
+        const QByteArray sheetXml = m_zip.entry(target);
+        if (!xmlWithinTagBudget(sheetXml) || !sheetDoc.setContent(sheetXml)) continue;
 
         Sheet sheet;
         sheet.name = sheetList.at(si).first;
@@ -310,8 +327,11 @@ bool SheetDocument::parseOds(QString *error)
         return false;
     };
 
+    const QByteArray odsXml = m_zip.entry(QStringLiteral("content.xml"));
+    if (!xmlWithinTagBudget(odsXml))
+        return fail(QStringLiteral("ODS XML 元素过多。"));
     QDomDocument doc;
-    if (!doc.setContent(m_zip.entry(QStringLiteral("content.xml"))))
+    if (!doc.setContent(odsXml))
         return fail(QStringLiteral("无法解析 ODS 的 content.xml。"));
 
     QDomElement spreadsheet;
