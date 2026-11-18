@@ -2367,12 +2367,22 @@ void MainWindow::onActionViewTreeTriggered()
         return;
     m_bTreeMode = true;
     populateFilePathView(m_bShowPath);
+    // 从平铺切回树形：恢复切到平铺前记录的展开状态。
+    if (!m_setExpandedTree.isEmpty())
+    {
+        for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+            restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(), m_setExpandedTree);
+    }
 }
 
 void MainWindow::onActionViewFlatTriggered()
 {
     if (!m_bTreeMode)
         return;
+    // 切到平铺会重建模型；先记住树的展开状态，切回树形时恢复。
+    m_setExpandedTree.clear();
+    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+        collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), m_setExpandedTree);
     m_bTreeMode = false;
     populateFilePathView(m_bShowPath);
 }

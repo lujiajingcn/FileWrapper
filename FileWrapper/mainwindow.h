@@ -177,6 +177,7 @@ private:
     QSet<QString>            m_setBuiltinTextPlugins;   // 用户选择“以文本查看”的插件，允许再次兜底
     QSet<QString>            m_setTempFiles;
     QSet<QString>            m_setExpandedBeforeSort;   // 树形点列头排序前记住的展开目录
+    QSet<QString>            m_setExpandedTree;         // 切到平铺前记住的树展开状态
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用
     QStringList              m_listTempOrder;   // 创建顺序，用于上限淘汰
     quint64                  m_uTempSerial = 0; // 单调递增，保证临时文件名不重复

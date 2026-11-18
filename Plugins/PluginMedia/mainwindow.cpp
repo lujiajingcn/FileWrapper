@@ -877,9 +877,15 @@ void MainWindow::clearContent()
 
 void MainWindow::stopPlayback()
 {
-    // clearFFmpegResources 内部先停解码线程，再停音频输出，最后释放 FFmpeg 上下文。
-    // 若等待超时，它会挂起释放（m_bCleanupPending），由 decodingFinished 补做。
-    clearFFmpegResources();
+    // 宿主在 stopPlayback() 返回后会立刻 unmap 归档内容区；此时如果解码线程
+    // 仍在运行，它会通过 VideoWorker::setContexts 持有的裸指针读已释放映射。
+    // 2s 正常等待失败时继续阻塞到 worker 真正退出，再强制释放上下文。
+    if (m_videoWorker && !stopWorkerAndWait(2000))
+    {
+        qWarning() << "[Stop] 解码线程 2s 未退出，继续等待直到退出（避免宿主释放映射后 UAF）";
+        if (m_videoThread) m_videoThread->wait();
+    }
+    clearFFmpegResources(true);
     qDebug() << "[Stop] stopPlayback (切换文件，停止后台播放)";
 }
 
