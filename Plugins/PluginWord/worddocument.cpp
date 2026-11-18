@@ -2052,8 +2052,23 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
                           "style=\"border-collapse:collapse;font-size:%1pt\">")
                .arg(fmtNum(m_defaultSizePt * scale));
 
-    for (QDomElement row = table.firstChildElement(QStringLiteral("table:table-row"));
-         !row.isNull(); row = row.nextSiblingElement(QStringLiteral("table:table-row")))
+    // ODF 允许行被 table:table-header-rows / table-rows / table-row-group 包裹；
+    // 只取直接子 table:table-row 会让整行（如重复标题行）消失。
+    QVector<QDomElement> rows;
+    std::function<void(const QDomElement &)> collectRows = [&](const QDomElement &parent) {
+        for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
+        {
+            const QString tag = c.tagName();
+            if (tag == QLatin1String("table:table-row"))
+                rows.append(c);
+            else if (tag == QLatin1String("table:table-header-rows")
+                     || tag == QLatin1String("table:table-rows")
+                     || tag == QLatin1String("table:table-row-group"))
+                collectRows(c);
+        }
+    };
+    collectRows(table);
+    for (const QDomElement &row : rows)
     {
         if (m_truncated) break;
         out << QStringLiteral("<tr>");

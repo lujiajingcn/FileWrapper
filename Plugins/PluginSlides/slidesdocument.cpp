@@ -440,10 +440,22 @@ bool SlidesDocument::parseOdp(QString *error)
             for (QDomElement box = frame.firstChildElement(QStringLiteral("draw:text-box")); !box.isNull();
                  box = box.nextSiblingElement(QStringLiteral("draw:text-box")))
             {
-                for (QDomElement p = box.firstChildElement(); !p.isNull(); p = p.nextSiblingElement())
+                // 正文可能在 text:list/list-item、表格或 draw:g 内；递归收集段落，
+                // 不再只取 text-box 的直接子 text:p。
+                QVector<QDomElement> paras;
+                std::function<void(const QDomElement &)> collectParas = [&](const QDomElement &parent) {
+                    for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
+                    {
+                        const QString tag = c.tagName();
+                        if (tag == QLatin1String("text:p") || tag == QLatin1String("text:h"))
+                            paras.append(c);
+                        else
+                            collectParas(c);
+                    }
+                };
+                collectParas(box);
+                for (const QDomElement &p : paras)
                 {
-                    if (p.tagName() != QLatin1String("text:p") && p.tagName() != QLatin1String("text:h"))
-                        continue;
                     const bool heading = (p.tagName() == QLatin1String("text:h"));
                     const QString text = p.text().trimmed();
                     if (text.isEmpty()) continue;

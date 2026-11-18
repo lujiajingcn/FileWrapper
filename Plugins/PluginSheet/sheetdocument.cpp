@@ -357,10 +357,23 @@ bool SheetDocument::parseOds(QString *error)
         const int idx = m_sheets.size() - 1;
 
         int rowIdx = 0;
-        for (QDomElement row = table.firstChildElement(QStringLiteral("table:table-row"));
-             !row.isNull() && rowIdx < kMaxRows;
-             row = row.nextSiblingElement(QStringLiteral("table:table-row")))
+        QVector<QDomElement> odsRows;
+        std::function<void(const QDomElement &)> collectRows = [&](const QDomElement &parent) {
+            for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
+            {
+                const QString tag = c.tagName();
+                if (tag == QLatin1String("table:table-row"))
+                    odsRows.append(c);
+                else if (tag == QLatin1String("table:table-header-rows")
+                         || tag == QLatin1String("table:table-rows")
+                         || tag == QLatin1String("table:table-row-group"))
+                    collectRows(c);
+            }
+        };
+        collectRows(table);
+        for (const QDomElement &row : odsRows)
         {
+            if (rowIdx >= kMaxRows) break;
             const int rowRepeat = qBound(1, row.attribute(QStringLiteral("table:number-rows-repeated")).toInt(), 40);
 
             int colIdx = 0;
