@@ -216,7 +216,8 @@ bool SlidesDocument::parsePptx(QString *error)
             if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
 
             const QString tag = el.tagName();
-            if (tag == QLatin1String("p:sp") || tag == QLatin1String("p:pic"))
+            if (tag == QLatin1String("p:sp") || tag == QLatin1String("p:pic")
+                || tag == QLatin1String("p:graphicFrame"))
             {
                 // 位置：a:off x/y + a:ext cx/cy（用来近似阅读顺序与图片尺寸）
                 double x = 0.0, y = 0.0, cx = 0.0, cy = 0.0;

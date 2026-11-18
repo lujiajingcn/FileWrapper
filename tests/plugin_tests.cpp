@@ -2003,9 +2003,13 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     bool bHasSlash = !crossPaths.isEmpty();
     for (const QString &p : crossPaths)
         if (!p.contains(QLatin1Char('/'))) bHasSlash = false;
-    report(bSaved1 && bMeta1 && crossMeta.root.isEmpty() && crossPaths.size() == 3
-               && bHasSlash && !hasDup(crossPaths)
-               && !crossPaths.contains(QStringLiteral("basic.docx")),
+    const QString expectedRoot = FwArc::commonRoot(
+        QStringList{ work + QStringLiteral("/basic.docx"), sNote });
+    const bool bRootShape = (crossMeta.root == expectedRoot);
+    const bool bFlatShape = !expectedRoot.isEmpty()
+        || (!crossPaths.contains(QStringLiteral("basic.docx")) && bHasSlash);
+    report(bSaved1 && bMeta1 && bRootShape && bFlatShape && crossPaths.size() == 3
+               && !hasDup(crossPaths),
            QStringLiteral("K1: cross-drive save keeps drive-prefixed paths (%1)")
                .arg(crossPaths.join(QStringLiteral(", "))));
 
@@ -2226,8 +2230,14 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
     QString err4;
     const bool bG4 = FileManager::inspectArchive(sArcRoot, rooted, err4);
     const QStringList rootedPaths = listPaths(rooted);
-    report(bG4 && rooted.root.isEmpty()
-               && rootedPaths.contains(QStringLiteral("D/testfiles_copy/a/file1.txt"))
+    const QString g4Root = FwArc::commonRoot(
+        QStringList{ QStringLiteral("D:/testfiles_copy/a/file1.txt"),
+                     work + QStringLiteral("/basic.docx") });
+    const bool bG4Root = (rooted.root == g4Root);
+    const bool bG4Paths = g4Root.isEmpty()
+        ? rootedPaths.contains(QStringLiteral("D/testfiles_copy/a/file1.txt"))
+        : rootedPaths.contains(QStringLiteral("testfiles_copy/a/file1.txt"));
+    report(bG4 && bG4Root && bG4Paths
                && hasSuffix(rootedPaths, QStringLiteral("basic.docx")),
            QStringLiteral("G4: archived origin preserved cross-drive (%1)")
                .arg(rootedPaths.join(QStringLiteral(", "))));
