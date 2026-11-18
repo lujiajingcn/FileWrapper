@@ -916,11 +916,11 @@ static void verifyOtherViewers(const QString &work)
 {
     // 调试开关：FW_VIEWER_ONLY=V1/V2/V3 时只跑其中一组（定位退出期崩溃用）
     const QString sOnly = qEnvironmentVariable("FW_VIEWER_ONLY");
-    auto want = [&sOnly](const char *id) {
+    auto want = [&sOnly](const char *id, int nAssertions = 1) {
         const bool bWanted = sOnly.isEmpty() || sOnly == QLatin1String(id);
         if (!bWanted)
         {
-            ++g_skipped;
+            g_skipped += nAssertions;   // 按断言数计 SKIP，而不是按组计 1
             note(QStringLiteral("[SKIP] %1 skipped by FW_VIEWER_ONLY").arg(QLatin1String(id)));
         }
         return bWanted;
@@ -1034,7 +1034,7 @@ static void verifyOtherViewers(const QString &work)
     }
 
     // V6: PluginWord 的 ODT（OpenDocument Text）分支：段落/标题 + 表格
-    if (want("V6"))
+    if (want("V6", 2))
     {
         QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
         PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
@@ -1080,7 +1080,7 @@ static void verifyOtherViewers(const QString &work)
     }
 
     // V8: PluginWord 的 RTF 子集分支：段落 + 字符格式（.rtf 不再是"不支持"提示）
-    if (want("V8"))
+    if (want("V8", 2))
     {
         QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
         PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
