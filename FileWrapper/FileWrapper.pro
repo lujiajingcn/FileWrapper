@@ -36,6 +36,7 @@ SOURCES += \
         dlgpluginmap.cpp \
         dlgsplitfile.cpp \
         filemanager.cpp \
+        filemetadata.cpp \
         formatresolver.cpp \
         main.cpp \
         mainwindow.cpp \
@@ -53,6 +54,7 @@ HEADERS += \
         dlgpluginmap.h \
         dlgsplitfile.h \
         filemanager.h \
+        filemetadata.h \
         formatresolver.h \
         mainwindow.h \
         $$_PRO_FILE_PWD_/../include/plugininterface.h \

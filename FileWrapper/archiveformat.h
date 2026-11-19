@@ -2,11 +2,11 @@
 #define ARCHIVEFORMAT_H
 
 // ============================================================
-// FileWrapper 归档格式公共定义（v1 兼容读取 / v2 写入）
+// FileWrapper 归档格式公共定义（v1/v2 兼容读取 / v3 写入）
 //
-// 全局头 24 字节（v1 / v2 完全相同，小端）:
+// 全局头 24 字节（v1 / v2 / v3 完全相同，小端）:
 //   [0..3]   Magic "FWDA"
-//   [4..7]   Version  uint32  1 = 旧格式, 2 = 当前格式
+//   [4..7]   Version  uint32  1 = 旧格式, 2 = 增强格式, 3 = 当前格式
 //   [8..11]  HeaderSize uint32 全局头 + 头部元数据区 + 条目头的总大小
 //   [12..15] FileCount  uint32
 //   [16..19] HeaderChecksum uint32  CRC32
@@ -27,9 +27,21 @@
 //   头部 CRC 随之重算；内容区留待下一次完整重写时回收。
 //   FileCount 记录物理槽位数（含墓碑），因此可能大于实际可见条目数。
 //
+// v3 头部区（当前写入格式，v1/v2 仍可读取）:
+//   [24..27] RootLength u32
+//   [28..]   Root u8[RootLength] (UTF-8)
+//   重复 FileCount 次:
+//     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
+//     CreatedMs u64 / ModifiedMs u64 / AccessedMs u64 / Attributes u32
+//     Path u8[PathLength]
+//   三个时间都是 UTC 毫秒（1970-01-01 起），0 表示「未知/未记录」；
+//   Attributes 存 FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h），
+//   用于导出/分割时把源文件的只读/隐藏/系统/存档属性写回磁盘。
+//   v3 不再使用墓碑（原地改头部）；删除与新增统一走完整重写。
+//
 // 校验说明:
 //   HeaderChecksum 覆盖 全局头[0..15] + 全局头[20..23] + 整个头部区。
-//   v2 每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
+//   v2/v3 每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
 //   v1 没有内容校验字段，读取时跳过内容校验，保持对 1.dat 等旧归档的兼容。
 // ============================================================
 
@@ -73,15 +85,43 @@ inline bool hasArchiveSuffix(const QString &sPath)
 static const char MAGIC[4] = {'F', 'W', 'D', 'A'};
 static const quint32 VERSION_V1       = 1;
 static const quint32 VERSION_V2       = 2;
-static const quint32 CURRENT_VERSION  = VERSION_V2;
+static const quint32 VERSION_V3       = 3;
+static const quint32 CURRENT_VERSION  = VERSION_V3;
 static const quint32 GLOBAL_HDR       = 24;
 static const quint32 ENTRY_FIXED_V1   = 20;
 static const quint32 ENTRY_FIXED_V2   = 24;
+// v3：v2 的固定字段 + 3 个 u64 时间 + 1 个 u32 属性
+static const quint32 ENTRY_FIXED_V3   = 52;
 static const quint32 MAX_FILES        = 1000000;
 static const quint32 MAX_PATH_LEN     = 32768;
 static const quint32 MAX_ROOT_LEN     = 32768;
 static const quint64 MAX_HDR_SIZE     = 512ULL * 1024 * 1024;
 static const quint64 MAX_CONTENT_LEN  = (1ULL << 62);
+// 时间戳合理上界（UTC 毫秒）：9999-12-31 23:59:59.999。
+// 超出视为未知，避免伪造的 u64 在 QDateTime 转换/显示时变成无意义的值。
+static const quint64 MAX_TIMESTAMP_MS = 253402300799999ULL;
+
+// 条目固定字段长度（按版本）。v1/v2 没有文件系统元数据。
+inline quint32 entryFixedSize(quint32 version)
+{
+    switch (version)
+    {
+    case VERSION_V1: return ENTRY_FIXED_V1;
+    case VERSION_V2: return ENTRY_FIXED_V2;
+    case VERSION_V3: return ENTRY_FIXED_V3;
+    default:         return 0;
+    }
+}
+
+// v2 起每条都有内容 CRC；v3 起每条都有文件系统元数据。
+inline bool versionHasContentCrc(quint32 version) { return version >= VERSION_V2; }
+inline bool versionHasFsMetadata(quint32 version) { return version >= VERSION_V3; }
+
+// 把任意时间值收敛到「可显示」的范围：0 或 [1, MAX_TIMESTAMP_MS]。
+inline quint64 sanitizeTimestamp(quint64 ms)
+{
+    return ms <= MAX_TIMESTAMP_MS ? ms : 0;
+}
 
 struct Entry
 {
@@ -91,6 +131,12 @@ struct Entry
     quint64 contentPos    = 0;
     quint32 contentCrc    = 0;
     bool    hasContentCrc = false;
+    // v3 文件系统元数据（v1/v2 条目 hasFsMetadata=false、其余为 0）
+    bool    hasFsMetadata = false;
+    quint64 createdMs     = 0;
+    quint64 modifiedMs    = 0;
+    quint64 accessedMs    = 0;
+    quint32 attributes    = 0;
 };
 
 struct Meta

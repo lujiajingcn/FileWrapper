@@ -1,8 +1,10 @@
 #include "dlgfileproperty.h"
 #include "archiveformat.h"
+#include "filemetadata.h"
 
 #include <QApplication>
 #include <QClipboard>
+#include <QDateTime>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QFrame>
@@ -25,9 +27,21 @@ QString archiveFormatText(quint32 nVersion)
         return QCoreApplication::translate("DlgFileProperty", "FWDA v1（旧格式）");
     case FwArc::VERSION_V2:
         return QCoreApplication::translate("DlgFileProperty", "FWDA v2");
+    case FwArc::VERSION_V3:
+        return QCoreApplication::translate("DlgFileProperty", "FWDA v3");
     default:
         return QCoreApplication::translate("DlgFileProperty", "未知");
     }
+}
+
+// 文件时间统一按本地时区显示（与资源管理器一致）；0 表示归档未记录。
+QString timestampText(qint64 nMs)
+{
+    if (!FwMeta::isPlausibleTimestamp(nMs))
+        return QCoreApplication::translate("DlgFileProperty", "—");
+    static const QLocale locale(QLocale::Chinese, QLocale::China);
+    const QDateTime dt = QDateTime::fromMSecsSinceEpoch(nMs);
+    return locale.toString(dt, QLocale::ShortFormat);
 }
 
 QString locationText(const DlgFileProperty::Data &data)
@@ -265,6 +279,26 @@ QVector<DlgFileProperty::Section> DlgFileProperty::buildSections(const Data &dat
         basic.rows.append(qMakePair(tr("压缩方式"), tr("不压缩（原样存储）")));
     }
     sections.append(basic);
+
+    // 文件系统元数据（v3 起随归档保存；v1/v2 归档没有可显示的值）
+    if (!data.bDir)
+    {
+        Section file;
+        file.sTitle = tr("文件");
+        if (data.bHasFsMetadata)
+        {
+            file.rows.append(qMakePair(tr("创建时间"), timestampText(data.nCreatedTime)));
+            file.rows.append(qMakePair(tr("修改时间"), timestampText(data.nModifiedTime)));
+            file.rows.append(qMakePair(tr("访问时间"), timestampText(data.nAccessedTime)));
+            file.rows.append(qMakePair(tr("属性"), FwMeta::attributesText(data.nAttributes)));
+        }
+        else
+        {
+            file.rows.append(qMakePair(tr("文件时间"),
+                tr("未记录（该归档版本未保存文件元数据）")));
+        }
+        sections.append(file);
+    }
 
     Section archive;
     archive.sTitle = tr("归档信息");

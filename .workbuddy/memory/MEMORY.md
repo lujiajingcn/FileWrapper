@@ -117,7 +117,7 @@
   再统一决定外层 root：所有条目在同一公共目录下 → 存相对路径（显示为 root + 相对路径，
   保持短路径）；**跨盘符/无公共根 → root 为空，把盘符当首段**（`E:/x` → `E/x`，
   冒号不能进路径段），保证原 111.dat 里的文件不会因为另一输入在 D: 就被改挂到 D: 下。
-  - 撞名自动加 ` (2)`；`writeV2Header` 多了可选 `pStoredPaths`（给了就按给定路径写）。
+  - 撞名自动加 ` (2)`；`writeArchiveHeader`（v3）多了可选 `pStoredPaths`（给了就按给定路径写）。
   - 只展开一层：归档条目本身若又是 `.dat` 就作为普通条目保留。
   - 测试见 `tests/plugin_tests.cpp` 的 G 组（含 `fixtures/rooted.dat` 的跨盘符用例）。
 - **插件公共代码在 `Plugins/common/`**（源码级共享，不是运行时库）：
@@ -244,8 +244,9 @@
   `FW_TEST_SCRATCH_DIR` 覆盖入口。沙箱下 `QTemporaryDir` 会把目录 ACL 收成 owner-only，
   测试进程反而写不进去 → 受限环境必须用这两个环境变量指向预创建的可写目录。
   无音频设备时 V13 断言"纯音频明确失败并复位界面"；D6 在沙箱按环境 SKIP。
-- **验证基线**：全量构建 0 error；`plugin_tests --integrate` = 226 PASS / 0 FAIL / 0 SKIP
-  （`-SkipShots` 为 223 PASS + 3 SKIP；数字随用例增长，以 `tests/build/logs/plugin_tests.log` 为准）。
+- **验证基线**：全量构建 0 error；`plugin_tests --integrate` = 236 PASS / 0 FAIL / 0 SKIP
+  （`-SkipShots` 为 233 PASS + 3 SKIP；无音频输出设备时 V13b/c 会多 2 条 → 238）。
+  数字随用例增长，以 `tests/build/logs/plugin_tests.log` 为准。
 
 ## 2026-11-19 插件失败信息（接口 v6）
 - **起因（用户报的真实问题）**：打开 `1.dat` 里的 `audio.wav` 时提示「插件无法显示该文件：audio.wav」，
@@ -266,3 +267,21 @@
 - **测试**：V13 扩展为 V13/V13b–f（无设备分支断言原因与画面区文案；坏媒体文件与声卡无关地覆盖同样两条），
   A11a/b 断言宿主文案。`tests/build` 在旧沙箱里是只读的（应用目录 ACL 收紧），
   受限环境跑测试要给 `TEMP`/`TMP` 指到可写目录，否则 H10–H14/H19 会因 `QDir::tempPath()` 不可写而假失败。
+
+## 2026-11-19 归档 v3：合并时保存文件系统元数据
+- **起因**：合并/查看只保存内容，源文件的创建/修改/访问时间与只读/隐藏属性会丢；
+  属性页只能显示路径/大小/CRC。现改为 v3 头部按条目保存元数据，导出/分割再写回。
+- **格式**：`archiveformat.h` 新增 `VERSION_V3=3` / `ENTRY_FIXED_V3=52`：在 v2 的
+  `PathLength/FileSize/ContentPos/ContentCrc32` 后追加 `CreatedMs/ModifiedMs/AccessedMs`（u64，
+  UTC 毫秒，0=未记录）与 `Attributes`（u32，FILE_ATTRIBUTE_* 的 R/H/S/A 位）。
+  **写 v3，读 v1/v2/v3**；v1/v2 条目 `hasFsMetadata=false`（属性页显示"未记录"），
+  保存 v1/v2 归档会升级成 v3。v3 不使用墓碑（解析仍兼容 v2 墓碑）。
+- **采集/恢复**：`filemetadata.{h,cpp}`（`FwMeta::capture/apply`）。合并**先 capture 再读内容**
+  （探测魔数/复制都会刷新 atime）；`addFiles` 时 capture、`rewriteArchive` 对 pending 条目
+  save 前再 capture；分割/导出在内容 CRC 通过后写回时间/属性（失败只告警，不删内容）。
+  只读保存在 `GetFileAttributes`/`SetFileAttributesW` 上，跨平台时只映射只读位。
+- **属性页**：新增"文件"段（创建/修改/访问时间、属性 R/H/S/A）；`DlgFileProperty::Data`
+  增加元数据字段，`formatInfoText` 同步（复制信息也包含）。EXIF/相机/GPS 属于文件内容，
+  本次未解析；需要时另加（JPEG APP1/TIFF IFD 或 Windows WIC 均可）。
+- **测试**：P 组 12 条（v3 写入/读取、导出/分割恢复、新增保存、v3 再合并传递、v2 兼容、
+  头部 CRC 覆盖元数据）。atime 断言只要求"有值"——关闭句柄时系统可能回写访问时间。

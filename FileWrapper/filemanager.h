@@ -10,11 +10,17 @@
 
 typedef struct FILEINFO
 {
-    QString sFilePath;          // 展示路径（v2 = 原始根 + 相对路径；v1 = 归档内原路径）
+    QString sFilePath;          // 展示路径（v2/v3 = 原始根 + 相对路径；v1 = 归档内原路径）
     QString sFileName;          // 文件名称（包括后缀）
     qint64  nFileLen;           // 文件大小
     qint64  nContentPositon;    // 文件内容在归档中的位置
     int     nState;             // 是否已经删除
+    // v3 文件系统元数据（v1/v2 条目 bHasFsMetadata=false，时间/属性为 0）
+    qint64  nCreatedTime = 0;   // UTC 毫秒时间戳，0 = 未知
+    qint64  nModifiedTime = 0;
+    qint64  nAccessedTime = 0;
+    quint32 nAttributes = 0;    // FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h）
+    bool    bHasFsMetadata = false;
 } FILEINFO;
 
 Q_DECLARE_METATYPE(FILEINFO)
@@ -136,17 +142,17 @@ private:
     bool openEntrySource(const QString &sFilePath, const FILEINFO &fi,
                          QFile &localFile, qint64 &srcPos, QString &sErr) const;
 
-    // 写 v2 头部（CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
+    // 写 v3 头部（内容 CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
     // pStoredPaths 非空时直接用它作为每条目的存储路径（合并时展开已有归档用）。
-    bool writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
-                       const QString &sRoot, QVector<qint64> &outCrcFieldPos,
-                       QVector<qint64> &outContentPos, qint64 &outHeaderSize,
-                       QString &sErr, const QStringList *pStoredPaths = nullptr);
+    bool writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos,
+                            const QString &sRoot, QVector<qint64> &outCrcFieldPos,
+                            QVector<qint64> &outContentPos, qint64 &outHeaderSize,
+                            QString &sErr, const QStringList *pStoredPaths = nullptr);
     // 回填内容 CRC + 头部 CRC
-    bool finalizeV2Header(QFile &fOut, qint64 headerSize,
-                          const QVector<qint64> &crcFieldPos,
-                          const QVector<quint32> &contentCrcs,
-                          QString &sErr);
+    bool finalizeArchiveHeader(QFile &fOut, qint64 headerSize,
+                               const QVector<qint64> &crcFieldPos,
+                               const QVector<quint32> &contentCrcs,
+                               QString &sErr);
 
     bool streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst,
                     FwArc::Crc32 &crc, qint64 &copiedTotal, qint64 totalBytes,

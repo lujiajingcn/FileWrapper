@@ -2585,6 +2585,11 @@ DlgFileProperty::Data MainWindow::filePropertyData(const FILEINFO &info) const
     data.sArchivePath = normalizePath(m_fileManager->archivePath());
     data.nArchiveVersion = m_fileManager->archiveVersion();
     data.bPending = m_fileManager->isPendingEntry(info.sFilePath);
+    data.bHasFsMetadata = info.bHasFsMetadata;
+    data.nCreatedTime   = info.nCreatedTime;
+    data.nModifiedTime  = info.nModifiedTime;
+    data.nAccessedTime  = info.nAccessedTime;
+    data.nAttributes    = info.nAttributes;
     quint32 nCrc = 0;
     data.bHasCrc = m_fileManager->contentCrcFor(info.sFilePath, &nCrc);
     if (data.bHasCrc)

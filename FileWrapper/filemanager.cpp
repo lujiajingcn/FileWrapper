@@ -1,4 +1,5 @@
 #include "filemanager.h"
+#include "filemetadata.h"
 
 #include <QApplication>
 #include <QDebug>
@@ -342,7 +343,8 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
     const quint32 fileCount = FwArc::readU32(gh + 12);
     const quint32 storedCrc = FwArc::readU32(gh + 16);
 
-    if (version != FwArc::VERSION_V1 && version != FwArc::VERSION_V2)
+    if (version != FwArc::VERSION_V1 && version != FwArc::VERSION_V2
+        && version != FwArc::VERSION_V3)
         return fail(QStringLiteral("不支持的归档版本: %1").arg(version));
     if (fileCount == 0 || fileCount > FwArc::MAX_FILES)
         return fail(QStringLiteral("文件数量异常: %1").arg(fileCount));
@@ -350,11 +352,10 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         || quint64(hdrSize) > FwArc::MAX_HDR_SIZE)
         return fail(QStringLiteral("头部大小异常: %1").arg(hdrSize));
 
-    const quint32 entryFixed = (version == FwArc::VERSION_V2)
-                             ? FwArc::ENTRY_FIXED_V2 : FwArc::ENTRY_FIXED_V1;
+    const quint32 entryFixed = FwArc::entryFixedSize(version);
     const quint64 entriesRegion = quint64(hdrSize) - FwArc::GLOBAL_HDR;
-    const quint64 metaPrefix    = (version == FwArc::VERSION_V2) ? 4 : 0;
-    if (entriesRegion < metaPrefix + quint64(entryFixed) * fileCount)
+    const quint64 metaPrefix = FwArc::versionHasContentCrc(version) ? 4 : 0;
+    if (entryFixed == 0 || entriesRegion < metaPrefix + quint64(entryFixed) * fileCount)
         return fail(QStringLiteral("头部大小与文件数量不匹配"));
 
     // —— 头部 CRC：分块计算，不一次性分配头部大小的内存（P3-2）——
@@ -384,7 +385,7 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
     if (!f.seek(FwArc::GLOBAL_HDR)) return fail(QStringLiteral("定位条目区失败"));
     qint64 cursor = FwArc::GLOBAL_HDR;
 
-    if (version == FwArc::VERSION_V2)
+    if (FwArc::versionHasContentCrc(version))
     {
         char rl[4];
         if (f.read(rl, 4) != 4) return fail(QStringLiteral("读取原始根长度失败"));
@@ -415,7 +416,7 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
             return fail(QStringLiteral("第 %1 条路径长度异常: %2").arg(i).arg(pathLen));
         // v2 允许墓碑条目（快速删除留下的空槽）。判定：路径区首字节为 NUL，
         // PathLength 保持原值，槽位大小不变，后续条目才能正确对齐。
-        // PathLength=0 作为旧写法的墓碑一并兼容。v1 不允许空路径。
+        // PathLength=0 作为旧写法的墓碑一并兼容。v1/v3 不允许空路径。
         if (pathLen == 0 && version != FwArc::VERSION_V2)
             return fail(QStringLiteral("第 %1 条路径长度为 0").arg(i));
         if (cursor + qint64(entryFixed) + pathLen > hdrSize)
@@ -425,11 +426,27 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         if (f.read(fsBuf, 8) != 8) return fail(QStringLiteral("第 %1 条大小读取失败").arg(i));
         if (f.read(cpBuf, 8) != 8) return fail(QStringLiteral("第 %1 条偏移读取失败").arg(i));
         quint32 entryCrc = 0;
-        if (version == FwArc::VERSION_V2)
+        if (FwArc::versionHasContentCrc(version))
         {
             char crcBuf[4];
             if (f.read(crcBuf, 4) != 4) return fail(QStringLiteral("第 %1 条内容 CRC 读取失败").arg(i));
             entryCrc = FwArc::readU32(crcBuf);
+        }
+        // v3：固定字段里的文件系统元数据（时间 UTC 毫秒 + DOS 属性）
+        quint64 createdMs = 0, modifiedMs = 0, accessedMs = 0;
+        quint32 attributes = 0;
+        if (FwArc::versionHasFsMetadata(version))
+        {
+            char metaBuf[8];
+            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条创建时间读取失败").arg(i));
+            createdMs = FwArc::readU64(metaBuf);
+            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条修改时间读取失败").arg(i));
+            modifiedMs = FwArc::readU64(metaBuf);
+            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条访问时间读取失败").arg(i));
+            accessedMs = FwArc::readU64(metaBuf);
+            char attrBuf[4];
+            if (f.read(attrBuf, 4) != 4) return fail(QStringLiteral("第 %1 条属性读取失败").arg(i));
+            attributes = FwArc::readU32(attrBuf);
         }
         const quint64 size = FwArc::readU64(fsBuf);
         const quint64 pos  = FwArc::readU64(cpBuf);
@@ -458,9 +475,19 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         e.size          = size;
         e.contentPos    = pos;
         e.contentCrc    = entryCrc;
-        e.hasContentCrc = (version == FwArc::VERSION_V2);
+        e.hasContentCrc = FwArc::versionHasContentCrc(version);
+        if (FwArc::versionHasFsMetadata(version))
+        {
+            // 时间/属性按「头部里存什么就显示什么」处理；伪造的超界时间戳
+            // 收敛为 0（未知），避免显示无意义的年份。
+            e.hasFsMetadata = true;
+            e.createdMs     = FwArc::sanitizeTimestamp(createdMs);
+            e.modifiedMs    = FwArc::sanitizeTimestamp(modifiedMs);
+            e.accessedMs    = FwArc::sanitizeTimestamp(accessedMs);
+            e.attributes    = attributes & FwMeta::ATTR_MASK;
+        }
 
-        if (version == FwArc::VERSION_V2)
+        if (FwArc::versionHasContentCrc(version))
         {
             QString why;
             if (!FwArc::isSafeRelativePath(path, &why))
@@ -495,7 +522,7 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
 
     // 内容区不得重叠。
     //
-    // 注意零长度条目（0 字节文件）：写入端 writeV2Header 按文件长度累加内容偏移，
+    // 注意零长度条目（0 字节文件）：写入端 writeArchiveHeader 按文件长度累加内容偏移，
     // 0 字节文件不推进游标，于是「它自己」和「它后面那条」共享同一个 contentPos。
     // 这在语义上是正确的 —— 0 字节文件本来就不占任何内容区。
     //
@@ -800,6 +827,16 @@ bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPrePars
         fi.nFileLen         = qint64(e.size);
         fi.nContentPositon  = qint64(e.contentPos);
         fi.nState           = 0;
+        // v3 记录存在但三项时间与属性全为 0（例如把 v2 归档重写进 v3）时，
+        // 视为「没有可显示的元数据」，属性页会明确写"未记录"。
+        const bool bHasMeta = e.hasFsMetadata
+                              && (e.createdMs != 0 || e.modifiedMs != 0
+                                  || e.accessedMs != 0 || e.attributes != 0);
+        fi.bHasFsMetadata   = bHasMeta;
+        fi.nCreatedTime     = bHasMeta ? qint64(e.createdMs) : 0;
+        fi.nModifiedTime    = bHasMeta ? qint64(e.modifiedMs) : 0;
+        fi.nAccessedTime    = bHasMeta ? qint64(e.accessedMs) : 0;
+        fi.nAttributes      = bHasMeta ? e.attributes : 0;
         m_vtFileInfos.push_back(fi);
         m_mapFileInfos[fi.sFilePath] = fi;
         if (e.hasContentCrc) m_mapContentCrc.insert(fi.sFilePath, e.contentCrc);
@@ -849,6 +886,17 @@ void FileManager::addFiles(const QVector<QString> &vtNewFiles)
         info.nFileLen        = fi.size();
         info.nContentPositon = 0;
         info.nState          = 0;
+        // 添加时先记下源文件的时间/属性：v3 保存时会把它们写进归档。
+        // 未保存前属性页也直接显示这份信息。
+        const FwMeta::Metadata m = FwMeta::capture(fp);
+        if (m.valid)
+        {
+            info.bHasFsMetadata = true;
+            info.nCreatedTime   = m.createdMs;
+            info.nModifiedTime  = m.modifiedMs;
+            info.nAccessedTime  = m.accessedMs;
+            info.nAttributes    = m.attributes;
+        }
         m_vtFileInfos.append(info);
         m_mapFileInfos[fp] = info;
         m_setPendingFiles.insert(fp);
@@ -903,15 +951,15 @@ bool FileManager::save()
 }
 
 // ============================================================
-// v2 归档写入：头部占位 → 流式复制内容 → 回填 CRC
+// v3 归档写入：头部占位 → 流式复制内容 → 回填 CRC
 // ============================================================
 
-bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
-                                const QString &sRoot,
-                                QVector<qint64> &outCrcFieldPos,
-                                QVector<qint64> &outContentPos,
-                                qint64 &outHeaderSize, QString &sErr,
-                                const QStringList *pStoredPaths)
+bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos,
+                                     const QString &sRoot,
+                                     QVector<qint64> &outCrcFieldPos,
+                                     QVector<qint64> &outContentPos,
+                                     qint64 &outHeaderSize, QString &sErr,
+                                     const QStringList *pStoredPaths)
 {
     auto fail = [&sErr](const QString &m) { sErr = m; return false; };
 
@@ -934,7 +982,7 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
         if (rb.size() > int(FwArc::MAX_PATH_LEN))
             return fail(QStringLiteral("条目路径过长: %1").arg(fi.sFilePath));
         rels.append(rb);
-        hs += FwArc::ENTRY_FIXED_V2 + rb.size();
+        hs += FwArc::ENTRY_FIXED_V3 + rb.size();
     }
     if (hs < FwArc::GLOBAL_HDR || quint64(hs) > FwArc::MAX_HDR_SIZE
         || quint64(hs) > 0xFFFFFFFFULL)
@@ -942,7 +990,7 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
 
     if (!fOut.seek(0)) return fail(QStringLiteral("定位输出文件失败"));
     if (fOut.write(FwArc::MAGIC, 4) != 4) return fail(QStringLiteral("写入魔数失败"));
-    bool ok = FwArc::writeU32(fOut, FwArc::VERSION_V2)
+    bool ok = FwArc::writeU32(fOut, FwArc::VERSION_V3)
            && FwArc::writeU32(fOut, quint32(hs))
            && FwArc::writeU32(fOut, quint32(infos.size()))
            && FwArc::writeU32(fOut, 0)      // HeaderChecksum 占位
@@ -957,13 +1005,26 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
     outContentPos.clear();
     for (int i = 0; i < infos.size(); ++i)
     {
+        const FILEINFO &fi = infos.at(i);
         ok = FwArc::writeU32(fOut, quint32(rels.at(i).size()))
-          && FwArc::writeU64(fOut, quint64(infos.at(i).nFileLen))
+          && FwArc::writeU64(fOut, quint64(fi.nFileLen))
           && FwArc::writeU64(fOut, quint64(cp));
         if (!ok) return fail(QStringLiteral("写入第 %1 条记录失败").arg(i));
         outCrcFieldPos.append(fOut.pos());
         if (!FwArc::writeU32(fOut, 0))    // ContentCrc32 占位
             return fail(QStringLiteral("写入第 %1 条 CRC 字段失败").arg(i));
+        // v3：时间统一收敛到可显示范围，属性只保留 R/H/S/A 位
+        const quint64 created  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                                     ? quint64(fi.nCreatedTime) : 0;
+        const quint64 modified = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                                     ? quint64(fi.nModifiedTime) : 0;
+        const quint64 accessed = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                                     ? quint64(fi.nAccessedTime) : 0;
+        ok = FwArc::writeU64(fOut, created)
+          && FwArc::writeU64(fOut, modified)
+          && FwArc::writeU64(fOut, accessed)
+          && FwArc::writeU32(fOut, fi.nAttributes & FwMeta::ATTR_MASK);
+        if (!ok) return fail(QStringLiteral("写入第 %1 条元数据失败").arg(i));
         if (!rels.at(i).isEmpty() && fOut.write(rels.at(i)) != rels.at(i).size())
             return fail(QStringLiteral("写入第 %1 条路径失败").arg(i));
         outContentPos.append(cp);
@@ -973,10 +1034,10 @@ bool FileManager::writeV2Header(QFile &fOut, const QVector<FILEINFO> &infos,
     return true;
 }
 
-bool FileManager::finalizeV2Header(QFile &fOut, qint64 headerSize,
-                                   const QVector<qint64> &crcFieldPos,
-                                   const QVector<quint32> &contentCrcs,
-                                   QString &sErr)
+bool FileManager::finalizeArchiveHeader(QFile &fOut, qint64 headerSize,
+                                        const QVector<qint64> &crcFieldPos,
+                                        const QVector<quint32> &contentCrcs,
+                                        QString &sErr)
 {
     auto fail = [&sErr](const QString &m) { sErr = m; return false; };
     if (crcFieldPos.size() != contentCrcs.size())
@@ -1151,6 +1212,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         QString sStoredPath;      // 写入输出归档的路径（由 sOriginPath 推导）
         QString sDisplayName;     // 进度与错误提示
         bool    bFromArchive = false;
+        // v3：源文件的文件系统元数据（普通文件现读；展开归档时沿用条目里存的）
+        FwMeta::Metadata fsMeta;
         // P1-2：来源归档条目的内容 CRC。复制完必须与它比对，否则「结构完好但
         // 内容已损坏」的 v2 输入会在二次合并后被重新算出 CRC、变成看似完好的归档。
         quint32 nContentCrc = 0;
@@ -1172,6 +1235,11 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             finish(false, tr("输入文件不存在或不是普通文件：%1").arg(fp));
             return;
         }
+
+        // 先读元数据再碰文件内容：下面探测 FWDA 魔数会读 4 个字节，
+        // 而「读文件」本身会刷新访问时间（部分机器启用了 atime 更新）。
+        // 普通文件用这份；展开归档时用条目里存的元数据。
+        const FwMeta::Metadata sourceMeta = FwMeta::capture(fi.absoluteFilePath());
 
         // 已经是 FWDA 归档：读索引并展开条目
         bool bFwda = false;
@@ -1210,6 +1278,14 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.nContentCrc = e.contentCrc;
                 s.bHasContentCrc = e.hasContentCrc;
                 s.nSourceSize = qint64(meta.fileSize);
+                if (e.hasFsMetadata)
+                {
+                    s.fsMeta.valid      = true;
+                    s.fsMeta.createdMs  = qint64(e.createdMs);
+                    s.fsMeta.modifiedMs = qint64(e.modifiedMs);
+                    s.fsMeta.accessedMs = qint64(e.accessedMs);
+                    s.fsMeta.attributes = e.attributes;
+                }
                 sources.append(s);
                 allOrigins << s.sOriginPath;
                 ++nArchiveEntries;
@@ -1224,6 +1300,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         s.sOriginPath  = fi.absoluteFilePath();
         s.sDisplayName = fi.fileName();
         s.nSourceSize  = fi.size();
+        // v3：合并时把源文件的时间/属性一起收进归档
+        s.fsMeta       = sourceMeta;
         sources.append(s);
         allOrigins << s.sOriginPath;
     }
@@ -1339,6 +1417,14 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         info.nFileLen        = s.nLength;
         info.nContentPositon = s.nOffset;
         info.nState          = 0;
+        if (s.fsMeta.valid)
+        {
+            info.bHasFsMetadata = true;
+            info.nCreatedTime   = s.fsMeta.createdMs;
+            info.nModifiedTime  = s.fsMeta.modifiedMs;
+            info.nAccessedTime  = s.fsMeta.accessedMs;
+            info.nAttributes    = s.fsMeta.attributes;
+        }
         infos.append(info);
         storedPaths << s.sStoredPath;
         totalBytes += s.nLength;
@@ -1346,7 +1432,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     const qint64 rootBytes = qint64(sRoot.toUtf8().size());
     qint64 needBytes = FwArc::GLOBAL_HDR + 4 + rootBytes
-                     + qint64(FwArc::ENTRY_FIXED_V2) * qint64(infos.size()) + totalBytes;
+                     + qint64(FwArc::ENTRY_FIXED_V3) * qint64(infos.size()) + totalBytes;
     for (const QString &s : storedPaths)
     {
         if (!FwArc::checkedAdd64(needBytes, qint64(s.toUtf8().size()), &needBytes))
@@ -1399,8 +1485,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     QVector<qint64> crcFieldPos, contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
-                       &storedPaths))
+    if (!writeArchiveHeader(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
+                            &storedPaths))
     {
         fTmp.close();
         finish(false, tr("写入归档头部失败：%1").arg(err));
@@ -1451,7 +1537,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         contentCrcs.append(eCrc.value());
         src.close();
     }
-    if (bOk) bOk = finalizeV2Header(fTmp, headerSize, crcFieldPos, contentCrcs, err);
+    if (bOk) bOk = finalizeArchiveHeader(fTmp, headerSize, crcFieldPos, contentCrcs, err);
     fTmp.close();
 
     if (bOk)
@@ -1769,7 +1855,24 @@ bool FileManager::rewriteArchive()
     BusyGuard guard(this);
 
     const QString sArchivePath = m_qFile.fileName();
-    const QVector<FILEINFO> infos = m_vtFileInfos;
+    QVector<FILEINFO> infos = m_vtFileInfos;
+
+    // v3：新增但尚未保存的条目在保存时重新读一次源文件元数据，
+    // 让归档里记录的时间和属性与真正写进去的内容一致（源文件可能在添加后被修改过）。
+    for (FILEINFO &fi : infos)
+    {
+        if (!m_setPendingFiles.contains(fi.sFilePath))
+            continue;
+        const FwMeta::Metadata m = FwMeta::capture(fi.sFilePath);
+        if (m.valid)
+        {
+            fi.bHasFsMetadata = true;
+            fi.nCreatedTime   = m.createdMs;
+            fi.nModifiedTime  = m.modifiedMs;
+            fi.nAccessedTime  = m.accessedMs;
+            fi.nAttributes    = m.attributes;
+        }
+    }
 
     // P1-3：v2 墓碑快速删除已停用（原地改头部没有崩溃恢复日志）。
     // 删除与新增统一走下面的完整事务重写。
@@ -1825,7 +1928,7 @@ bool FileManager::rewriteArchive()
     for (const QString &rel : storedPaths)
     {
         qint64 one = 0;
-        if (!FwArc::checkedAdd64(qint64(FwArc::ENTRY_FIXED_V2),
+        if (!FwArc::checkedAdd64(qint64(FwArc::ENTRY_FIXED_V3),
                                  qint64(rel.toUtf8().size()), &one)
             || !FwArc::checkedAdd64(headerBytes, one, &headerBytes))
         {
@@ -1869,8 +1972,8 @@ bool FileManager::rewriteArchive()
     QVector<qint64> crcFieldPos, contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
-                       &storedPaths))
+    if (!writeArchiveHeader(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
+                            &storedPaths))
     {
         fTmp.close();
         setError(tr("写入归档头部失败：%1").arg(err));
@@ -1935,7 +2038,7 @@ bool FileManager::rewriteArchive()
         contentCrcs.append(eCrc.value());
     }
     srcArc.close();
-    if (bOk) bOk = finalizeV2Header(fTmp, headerSize, crcFieldPos, contentCrcs, err);
+    if (bOk) bOk = finalizeArchiveHeader(fTmp, headerSize, crcFieldPos, contentCrcs, err);
     fTmp.close();
 
     if (bOk)
@@ -2144,7 +2247,7 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 
     qint64 copiedTotal = 0;
     QSet<QString> setUsed;
-    int nRenamed = 0, nSkipped = 0, nFailed = 0, nDone = 0, nCrcBad = 0;
+    int nRenamed = 0, nSkipped = 0, nFailed = 0, nDone = 0, nCrcBad = 0, nMetaWarn = 0;
     QString sFirstError;
 
     QByteArray buf;
@@ -2260,6 +2363,18 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
                                 .arg(i + 1).arg(sOutFinal));
             continue;
         }
+        // v3：把条目录下的文件时间/属性写回磁盘。失败只告警，不删已写出的内容。
+        if (e.hasFsMetadata)
+        {
+            QString sMetaErr;
+            if (!FwMeta::apply(sOutFinal, qint64(e.createdMs), qint64(e.modifiedMs),
+                               qint64(e.accessedMs), e.attributes, &sMetaErr))
+            {
+                ++nMetaWarn;
+                emit warningOccurred(tr("文件已写出，但时间/属性恢复失败：%1\n%2")
+                                         .arg(sOutFinal, sMetaErr));
+            }
+        }
         ++nDone;
     }
     fIn.close();
@@ -2273,6 +2388,7 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
     QString msg = tr("分割完成：成功 %1 个，跳过 %2 个，失败 %3 个，自动重命名 %4 个")
                     .arg(nDone).arg(nSkipped).arg(nFailed).arg(nRenamed);
     if (nCrcBad > 0) msg += tr("，内容校验失败 %1 个").arg(nCrcBad);
+    if (nMetaWarn > 0) msg += tr("，时间/属性恢复失败 %1 个").arg(nMetaWarn);
     if (!sFirstError.isEmpty()) msg += tr("；首个错误：%1").arg(sFirstError);
     // P1-4：完全成功必须同时满足「无跳过、无失败、无 CRC 失败，且计数覆盖全部条目」。
     // 以前只看 failed/CRC，全部条目都被跳过时仍会发 operationFinished(true)。
@@ -2628,6 +2744,16 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
         setError(tr("导出失败：内容校验不通过（CRC32 不匹配），%1 可能已损坏。").arg(sFilePath));
         return;
     }
+    // v3：把条目录下的文件时间/属性写回导出文件；失败只告警，内容已经成功写出。
+    if (fi.bHasFsMetadata)
+    {
+        QString sMetaErr;
+        if (!FwMeta::apply(sOut, fi.nCreatedTime, fi.nModifiedTime, fi.nAccessedTime,
+                           fi.nAttributes, &sMetaErr))
+        {
+            emit warningOccurred(tr("文件已导出，但时间/属性恢复失败：%1\n%2").arg(sOut, sMetaErr));
+        }
+    }
     m_sLastError.clear();
     m_sLastOutputPath = sOut;
 }
@@ -2648,7 +2774,7 @@ bool FileManager::verifyArchive(QString *psReport)
     if (m_meta.version == FwArc::VERSION_V1)
     {
         const QString s = tr("当前归档是 v1 格式，不含逐条目内容校验字段，无法检测内容区损坏。"
-                             "\n建议用「保存」重写为 v2 格式后即可校验。");
+                             "\n建议用「保存」重写为 v3 格式后即可校验。");
         if (psReport) *psReport = s;
         setError(s);
         return false;

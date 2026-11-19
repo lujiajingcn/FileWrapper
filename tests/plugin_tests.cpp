@@ -32,6 +32,8 @@
 #include <QAbstractItemModel>
 #include <QAction>
 #include <QApplication>
+#include <QDateTime>
+#include <QDirIterator>
 #include <QProcess>
 #include <QDir>
 #include <QElapsedTimer>
@@ -78,6 +80,7 @@
 #include "dlgpluginmap.h"
 #include "dlgfileproperty.h"
 #include "filemanager.h"
+#include "filemetadata.h"
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
 #include "filelistmodel.h"
@@ -2160,7 +2163,9 @@ static void verifyMergeDialog()
                           && fd.sLocation == FwArc::normalizePath(sTreeDir)
                           && fd.sEntryPath == FwArc::normalizePath(sTreeDir + QStringLiteral("/top.txt"))
                           && fd.sArchivePath == FwArc::normalizePath(sTreeArc)
-                          && fd.nArchiveVersion == FwArc::VERSION_V2
+                          && fd.nArchiveVersion == FwArc::VERSION_V3
+                          && fd.bHasFsMetadata
+                          && fd.nModifiedTime > 0
                           && fd.bHasCrc
                           && !fd.bPending
                           && !fd.bDir;
@@ -2205,10 +2210,15 @@ static void verifyMergeDialog()
         d.sLocation = QStringLiteral("E:/testfiles_copy");
         d.nSize = 22907;
         d.sArchivePath = QStringLiteral("E:/testfiles_copy/1.dat");
-        d.nArchiveVersion = FwArc::VERSION_V2;
+        d.nArchiveVersion = FwArc::VERSION_V3;
         d.sEntryPath = QStringLiteral("E:/testfiles_copy/report.docx");
         d.bHasCrc = true;
         d.nCrc = 0xDEADBEEFu;
+        d.bHasFsMetadata = true;
+        d.nCreatedTime = QDateTime(QDate(2025, 1, 25), QTime(15, 53)).toMSecsSinceEpoch();
+        d.nModifiedTime = QDateTime(QDate(2025, 1, 26), QTime(16, 54)).toMSecsSinceEpoch();
+        d.nAccessedTime = QDateTime(QDate(2025, 1, 27), QTime(17, 55)).toMSecsSinceEpoch();
+        d.nAttributes = FwMeta::ATTR_ARCHIVE | FwMeta::ATTR_READONLY;
 
         const QString sText = DlgFileProperty::formatInfoText(d);
         bPropTextOk = sText.contains(QStringLiteral("名称：report.docx"))
@@ -2216,8 +2226,12 @@ static void verifyMergeDialog()
                       && sText.contains(QStringLiteral("位置：E:/testfiles_copy"))
                       && sText.contains(QStringLiteral("大小：22.37 KB（22,907 字节）"))
                       && sText.contains(QStringLiteral("压缩方式：不压缩（原样存储）"))
+                      && sText.contains(QStringLiteral("创建时间：2025/1/25"))
+                      && sText.contains(QStringLiteral("修改时间：2025/1/26"))
+                      && sText.contains(QStringLiteral("访问时间：2025/1/27"))
+                      && sText.contains(QStringLiteral("属性：RA"))
                       && sText.contains(QStringLiteral("所属归档：E:/testfiles_copy/1.dat"))
-                      && sText.contains(QStringLiteral("归档格式：FWDA v2"))
+                      && sText.contains(QStringLiteral("归档格式：FWDA v3"))
                       && sText.contains(QStringLiteral("归档内路径：E:/testfiles_copy/report.docx"))
                       && sText.contains(QStringLiteral("内容校验：CRC32 0xDEADBEEF"))
                       && sText.contains(QStringLiteral("状态：已保存在归档中"))
@@ -2236,13 +2250,15 @@ static void verifyMergeDialog()
         DlgFileProperty::Data v1 = d;
         v1.bHasCrc = false;
         v1.nCrc = 0;
+        v1.bHasFsMetadata = false;
         v1.nArchiveVersion = FwArc::VERSION_V1;
         const QString sV1 = DlgFileProperty::formatInfoText(v1);
         bPropStateOk = sPending.contains(QStringLiteral("内容校验：不可用（新增条目尚未保存）"))
                        && sPending.contains(QStringLiteral("状态：新增条目，尚未保存"))
                        && sV1.contains(QStringLiteral("归档格式：FWDA v1（旧格式）"))
                        && sV1.contains(QStringLiteral("内容校验：不可用（v1 归档未记录内容校验）"))
-                       && sV1.contains(QStringLiteral("状态：已保存在归档中"));
+                       && sV1.contains(QStringLiteral("状态：已保存在归档中"))
+                       && sV1.contains(QStringLiteral("文件时间：未记录（该归档版本未保存文件元数据）"));
 
         DlgFileProperty::Data folderData;
         folderData.bDir = true;
@@ -2254,7 +2270,7 @@ static void verifyMergeDialog()
         folderData.nDirCount = 4;
         folderData.bFiltered = true;
         folderData.sArchivePath = QStringLiteral("E:/study/1.dat");
-        folderData.nArchiveVersion = FwArc::VERSION_V2;
+        folderData.nArchiveVersion = FwArc::VERSION_V3;
         folderData.sEntryPath = QStringLiteral("E:/study/代码");
         const QString sFolder = DlgFileProperty::formatInfoText(folderData);
         DlgFileProperty::Data unfiltered;
@@ -2534,6 +2550,273 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         QFile::remove(sArc);
         QFile::remove(sSrc);
     }
+}
+
+// ---------------------------------------------------------------------------
+// P: FWDA v3 文件系统元数据
+//   合并时把创建/修改/访问时间与 DOS 属性写进归档；导出/分割时写回磁盘；
+//   v1/v2 归档仍可读取（没有元数据）。
+// ---------------------------------------------------------------------------
+static void verifyArchiveMetadata(const QString &work, const QString &scratchDir)
+{
+    Q_UNUSED(scratchDir);
+    const QString sDir = makeWritableTestDir(QStringLiteral("archive_meta"));
+    const bool bDirOk = QDir(sDir).exists();
+    report(bDirOk, QStringLiteral("P0: metadata test dir"));
+    if (!bDirOk)
+        return;
+
+    auto writeFile = [](const QString &sPath, const QByteArray &data) {
+        QFile f(sPath);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate)
+               && f.write(data) == data.size();
+    };
+    // 设置修改/访问时间（QFileDevice::setFileTime 是实例方法，需要先打开文件）
+    auto setTimes = [](const QString &sPath, const QDateTime &dtMod, const QDateTime &dtAcc) {
+        QFile f(sPath);
+        if (!f.open(QIODevice::ReadWrite))
+            return false;
+        bool bOk = f.setFileTime(dtMod, QFileDevice::FileModificationTime);
+        bOk = f.setFileTime(dtAcc, QFileDevice::FileAccessTime) && bOk;
+        f.close();
+        return bOk;
+    };
+    auto near = [](qint64 a, qint64 b) { return qAbs(a - b) <= 2000; };
+    auto clearReadOnlyForCleanup = [](const QString &sRoot) {
+        QDirIterator it(sRoot, QDir::Files | QDir::Hidden | QDir::System,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext())
+            QFile::setPermissions(it.next(), QFile::ReadOwner | QFile::WriteOwner
+                                               | QFile::ReadUser | QFile::WriteUser);
+    };
+
+    const QString sAlpha = sDir + QStringLiteral("/alpha.txt");
+    const QString sBeta  = sDir + QStringLiteral("/beta.txt");
+    const QDateTime dtModified(QDate(2025, 2, 3), QTime(4, 5, 6));
+    const QDateTime dtAccessed(QDate(2025, 2, 4), QTime(5, 6, 7));
+    const bool bSources = writeFile(sAlpha, QByteArray(300, 'a'))
+                          && writeFile(sBeta, QByteArray(700, 'b'))
+                          && setTimes(sAlpha, dtModified, dtAccessed)
+                          && setTimes(sBeta, dtModified, dtAccessed);
+    // 把 beta 设为只读：Windows 上就是 FILE_ATTRIBUTE_READONLY
+    const bool bReadOnly = bSources
+                           && QFile::setPermissions(sBeta, QFile::ReadOwner | QFile::ReadUser);
+    report(bSources && bReadOnly, QStringLiteral("P1: metadata source files ready"));
+    if (!bSources || !bReadOnly)
+    {
+        clearReadOnlyForCleanup(sDir);
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    FileManager fm;
+    const QString sArc = sDir + QStringLiteral("/meta.fwda");
+    bool bMergeDone = false, bMergeOk = false;
+    QObject::connect(&fm, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bMergeDone = true; bMergeOk = ok; });
+    fm.QMergeFiles(QVector<QString>{ sAlpha, sBeta }, sArc);
+
+    FwArc::Meta meta;
+    QString sErr;
+    const bool bInspect = FileManager::inspectArchive(sArc, meta, sErr);
+    report(bMergeDone && bMergeOk && bInspect
+               && meta.version == FwArc::VERSION_V3 && meta.entries.size() == 2,
+           QStringLiteral("P1b: merge writes FWDA v3 (%1 entries, err=%2)")
+               .arg(bInspect ? meta.entries.size() : -1).arg(sErr));
+
+    auto entryIndexBySuffix = [&meta](const QString &sSuffix) {
+        for (int i = 0; i < meta.entries.size(); ++i)
+            if (meta.entries.at(i).displayPath.endsWith(sSuffix, Qt::CaseInsensitive))
+                return i;
+        return -1;
+    };
+    const int iAlpha = entryIndexBySuffix(QStringLiteral("alpha.txt"));
+    const int iBeta  = entryIndexBySuffix(QStringLiteral("beta.txt"));
+    const qint64 nModMs = dtModified.toMSecsSinceEpoch();
+    const bool bHeaderMeta = iAlpha >= 0 && iBeta >= 0
+        && meta.entries.at(iAlpha).hasFsMetadata
+        && near(qint64(meta.entries.at(iAlpha).modifiedMs), nModMs)
+        // 访问时间会被「读文件」等操作刷新（Windows 也可能在句柄关闭时回写），
+        // 这里只要求它被记录成一个有效时间，不比对具体值。
+        && meta.entries.at(iAlpha).accessedMs > 0
+        && (meta.entries.at(iAlpha).attributes & FwMeta::ATTR_ARCHIVE)
+        && (meta.entries.at(iBeta).attributes & FwMeta::ATTR_READONLY);
+    report(bHeaderMeta,
+           QStringLiteral("P2: v3 header stores times/attributes "
+                          "[iA=%1 iB=%2 meta=%3 mod=%4/%5 acc=%6 attrA=0x%7 attrB=0x%8]")
+               .arg(iAlpha).arg(iBeta)
+               .arg(iAlpha >= 0 ? meta.entries.at(iAlpha).hasFsMetadata : false)
+               .arg(iAlpha >= 0 ? qint64(meta.entries.at(iAlpha).modifiedMs) : -1)
+               .arg(nModMs)
+               .arg(iAlpha >= 0 ? qint64(meta.entries.at(iAlpha).accessedMs) : -1)
+               .arg(iAlpha >= 0 ? meta.entries.at(iAlpha).attributes : 0, 0, 16)
+               .arg(iBeta >= 0 ? meta.entries.at(iBeta).attributes : 0, 0, 16));
+
+    FileManager fmLoad;
+    const bool bLoaded = fmLoad.QLoadMergedFile(sArc);
+    const QVector<FILEINFO> infos = fmLoad.getFileInfos();
+    auto findInfo = [&infos](const QString &sSuffix) {
+        for (const FILEINFO &fi : infos)
+            if (fi.sFilePath.endsWith(sSuffix, Qt::CaseInsensitive))
+                return fi;
+        return FILEINFO();
+    };
+    const FILEINFO fiAlpha = findInfo(QStringLiteral("alpha.txt"));
+    const FILEINFO fiBeta  = findInfo(QStringLiteral("beta.txt"));
+    report(bLoaded && fiAlpha.bHasFsMetadata && near(fiAlpha.nModifiedTime, nModMs)
+               && fiAlpha.nAccessedTime > 0
+               && (fiBeta.nAttributes & FwMeta::ATTR_READONLY),
+           QStringLiteral("P3: loaded FILEINFO exposes v3 metadata "
+                          "[loaded=%1 meta=%2 mod=%3 acc=%4 attrB=0x%5]")
+               .arg(bLoaded).arg(fiAlpha.bHasFsMetadata)
+               .arg(fiAlpha.nModifiedTime).arg(fiAlpha.nAccessedTime)
+               .arg(fiBeta.nAttributes, 0, 16));
+
+    // —— 导出：时间/属性写回 ——
+    const QString sOutDir = sDir + QStringLiteral("/out");
+    QDir().mkpath(sOutDir);
+    fmLoad.outputFile(fiAlpha.sFilePath, sOutDir);
+    const QString sAlphaOut = fmLoad.lastOutputPath();
+    const bool bExportTime = !sAlphaOut.isEmpty() && QFileInfo::exists(sAlphaOut)
+        && near(QFileInfo(sAlphaOut).lastModified().toMSecsSinceEpoch(), nModMs)
+        && (iAlpha < 0 || meta.entries.at(iAlpha).createdMs == 0
+            || near(QFileInfo(sAlphaOut).birthTime().toMSecsSinceEpoch(),
+                    qint64(meta.entries.at(iAlpha).createdMs)));
+    report(bExportTime, QStringLiteral("P4: export restores modified+created time (%1)")
+                            .arg(QFileInfo(sAlphaOut).fileName()));
+
+    fmLoad.outputFile(fiBeta.sFilePath, sOutDir);
+    const QString sBetaOut = fmLoad.lastOutputPath();
+    const bool bExportRo = !sBetaOut.isEmpty() && QFileInfo::exists(sBetaOut)
+                           && !QFileInfo(sBetaOut).isWritable();
+    report(bExportRo, QStringLiteral("P5: export restores read-only attribute"));
+
+    // —— 分割：同样恢复时间/属性 ——
+    const QString sSplitDir = sDir + QStringLiteral("/split");
+    bool bSplitDone = false, bSplitOk = false;
+    QString sSplitMsg;
+    QObject::connect(&fmLoad, &FileManager::operationFinished,
+                     [&](bool ok, const QString &msg) { bSplitDone = true; bSplitOk = ok; sSplitMsg = msg; });
+    fmLoad.QSplitFiles(sArc, false, sSplitDir);
+
+    QString sSplitAlpha, sSplitBeta;
+    QDirIterator splitIt(sSplitDir, QDir::Files, QDirIterator::Subdirectories);
+    while (splitIt.hasNext())
+    {
+        const QString sPath = splitIt.next();
+        if (sPath.endsWith(QStringLiteral("alpha.txt"), Qt::CaseInsensitive)) sSplitAlpha = sPath;
+        if (sPath.endsWith(QStringLiteral("beta.txt"), Qt::CaseInsensitive))  sSplitBeta  = sPath;
+    }
+    const bool bSplitMeta = bSplitDone && bSplitOk
+        && !sSplitAlpha.isEmpty() && !sSplitBeta.isEmpty()
+        && near(QFileInfo(sSplitAlpha).lastModified().toMSecsSinceEpoch(), nModMs)
+        && !QFileInfo(sSplitBeta).isWritable();
+    report(bSplitMeta, QStringLiteral("P6: split restores times/attributes (%1)")
+                           .arg(QString(sSplitMsg).replace(QLatin1Char('\n'), QStringLiteral(" | "))));
+
+    // —— 新增文件：添加时捕获、保存时落盘 ——
+    const QString sGamma = sDir + QStringLiteral("/gamma.txt");
+    const QDateTime dtGammaMod = dtModified.addSecs(3600);
+    const bool bGammaSrc = writeFile(sGamma, QByteArray(50, 'g'))
+                           && setTimes(sGamma, dtGammaMod, dtAccessed);
+    if (bGammaSrc)
+        fmLoad.addFiles(QVector<QString>{ sGamma });
+    const bool bAdded = bGammaSrc;
+    FILEINFO fiGamma;
+    for (const FILEINFO &fi : fmLoad.getFileInfos())
+        if (fi.sFilePath.endsWith(QStringLiteral("gamma.txt"), Qt::CaseInsensitive))
+            fiGamma = fi;
+    const bool bAddedMeta = bAdded && fiGamma.bHasFsMetadata
+                            && near(fiGamma.nModifiedTime, dtGammaMod.toMSecsSinceEpoch());
+    const bool bSaved = bAddedMeta && fmLoad.save();
+
+    FwArc::Meta metaSaved;
+    QString sSavedErr;
+    const bool bSavedInspect = bSaved && FileManager::inspectArchive(sArc, metaSaved, sSavedErr);
+    bool bSavedMeta = false;
+    if (bSavedInspect)
+    {
+        for (const FwArc::Entry &e : metaSaved.entries)
+        {
+            if (!e.displayPath.endsWith(QStringLiteral("gamma.txt"), Qt::CaseInsensitive))
+                continue;
+            bSavedMeta = e.hasFsMetadata
+                         && near(qint64(e.modifiedMs), dtGammaMod.toMSecsSinceEpoch())
+                         && (e.attributes & FwMeta::ATTR_ARCHIVE);
+        }
+    }
+    report(bSavedMeta, QStringLiteral("P7: pending add captures metadata and save persists it"));
+
+    // —— v2 旧归档：照常解析，只是没有元数据 ——
+    const QString sV2 = work + QStringLiteral("/rooted.dat");
+    FwArc::Meta metaV2;
+    QString sV2Err;
+    const bool bV2Inspect = FileManager::inspectArchive(sV2, metaV2, sV2Err)
+                            && metaV2.version == FwArc::VERSION_V2
+                            && !metaV2.entries.isEmpty()
+                            && !metaV2.entries.first().hasFsMetadata;
+    FileManager fmV2;
+    const bool bV2Load = fmV2.QLoadMergedFile(sV2)
+                         && !fmV2.getFileInfos().isEmpty()
+                         && !fmV2.getFileInfos().first().bHasFsMetadata;
+    report(bV2Inspect && bV2Load,
+           QStringLiteral("P8: v2 fixture still loads, without metadata flag"));
+
+    // —— v3 头部 CRC 仍然覆盖新增的元数据字段 ——
+    const QString sBad = sDir + QStringLiteral("/bad_meta.fwda");
+    bool bCorrupted = false;
+    if (QFile::copy(sArc, sBad) && bInspect)
+    {
+        const qint64 nOff = qint64(FwArc::GLOBAL_HDR) + 4
+                            + qint64(meta.root.toUtf8().size())
+                            + 24 + 2;   // 第一条目 created 字段内部
+        QFile f(sBad);
+        if (f.open(QIODevice::ReadWrite) && f.seek(nOff))
+        {
+            char ch = 0;
+            if (f.getChar(&ch))
+            {
+                ch = char(ch ^ 0x5A);
+                bCorrupted = f.seek(nOff) && f.write(&ch, 1) == 1;
+            }
+        }
+    }
+    FileManager fmBad;
+    QString sBadErr;
+    const bool bBadRejected = bCorrupted && !fmBad.validateMergedFile(sBad, &sBadErr);
+    report(bBadRejected, QStringLiteral("P9: corrupted v3 metadata rejected by header CRC"));
+
+    // —— v3 归档再合并：条目里已有的元数据必须随条目一起带走 ——
+    const QString sAgain = sDir + QStringLiteral("/again.fwda");
+    FileManager fmAgain;
+    bool bAgainDone = false, bAgainOk = false;
+    QObject::connect(&fmAgain, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bAgainDone = true; bAgainOk = ok; });
+    fmAgain.QMergeFiles(QVector<QString>{ sArc }, sAgain);
+    FwArc::Meta metaAgain;
+    QString sAgainErr;
+    bool bAgainMeta = false;
+    if (bAgainDone && bAgainOk && FileManager::inspectArchive(sAgain, metaAgain, sAgainErr))
+    {
+        for (const FwArc::Entry &e : metaAgain.entries)
+        {
+            if (!e.displayPath.endsWith(QStringLiteral("beta.txt"), Qt::CaseInsensitive))
+                continue;
+            bAgainMeta = e.hasFsMetadata
+                         && near(qint64(e.modifiedMs), nModMs)
+                         && (e.attributes & FwMeta::ATTR_READONLY);
+        }
+    }
+    report(bAgainMeta,
+           QStringLiteral("P10: merging an existing v3 archive keeps entry metadata"));
+
+    QFile::remove(sBad);
+    QFile::remove(sAgain);
+    // 释放仍打开的归档句柄，否则 Windows 上 meta.fwda 删不掉、临时目录会残留
+    fmLoad.unLoadMergedFile();
+    fmV2.unLoadMergedFile();
+    clearReadOnlyForCleanup(sDir);
+    QDir(sDir).removeRecursively();
 }
 
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
@@ -3304,6 +3587,9 @@ int main(int argc, char **argv)
 
     // ---------- K: 保存路径规划（P0：添加文件后不得拍平目录） ----------
     verifySavePathPreservation(work, scratchDir);
+
+    // ---------- P: v3 元数据（合并保存 / 导出恢复 / 旧归档兼容） ----------
+    verifyArchiveMetadata(work, scratchDir);
 
     // ---------- AUDIT-2026-11: 本轮审查修复的回归 ----------
     verifyAudit2026Fixes(work, scratchDir);

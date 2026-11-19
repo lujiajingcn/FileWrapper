@@ -38,11 +38,18 @@ public:
         bool    bFiltered = false;     // 大小/数量是否来自当前搜索筛选结果
 
         QString sArchivePath;          // 所属归档的完整路径
-        quint32 nArchiveVersion = 0;   // 1 / 2
+        quint32 nArchiveVersion = 0;   // 1 / 2 / 3
         QString sEntryPath;            // 归档内路径（FILEINFO::sFilePath）
         bool    bPending = false;      // 新增条目，尚未保存进归档
         bool    bHasCrc = false;
         quint32 nCrc = 0;
+
+        // v3 文件系统元数据（v1/v2 或来源归档没有记录时 bHasFsMetadata=false）
+        bool    bHasFsMetadata = false;
+        qint64  nCreatedTime = 0;      // UTC 毫秒，0 = 未知
+        qint64  nModifiedTime = 0;
+        qint64  nAccessedTime = 0;
+        quint32 nAttributes = 0;       // FILE_ATTRIBUTE_* 的 R/H/S/A 位
     };
 
     explicit DlgFileProperty(const Data &data, QWidget *parent = nullptr);
