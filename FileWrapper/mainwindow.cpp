@@ -61,6 +61,10 @@
 #include <QLayout>
 #include <QResizeEvent>
 #include <QFrame>
+#include <QBuffer>
+#include <QImage>
+#include <QImageReader>
+#include <QPainterPath>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
@@ -69,6 +73,16 @@ static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
 
 // 文件列表「文件路径」列的最小宽度：面板再窄也保留这么宽，超出部分交给横向滚动条
 static const int kMinPathColumnWidth = 140;
+
+// 缩略图：网格里显示的图标边长（逻辑像素），解码时按 2 倍像素生成，
+// 150%/200% 缩放下也不会因为放大而发糊。
+static const int kThumbnailIconSize  = 96;
+static const int kThumbnailPixelSize = kThumbnailIconSize * 2;
+// 单张图片条目的预算：超过后不再整块读进内存解码（宁可显示类型角标也不卡死界面）
+static const qint64 kThumbnailMaxBytes  = 32LL * 1024 * 1024;
+static const qint64 kThumbnailMaxPixels = 40LL * 1000 * 1000;
+// 缩略图内存缓存条数上限：超过后丢弃旧缓存（当前已在模型里的 QIcon 不受影响）
+static const int kThumbnailCacheLimit = 1024;
 
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
@@ -394,10 +408,11 @@ void MainWindow::updateNewTabButton()
 
 // 运行期绘制的标签页类型角标：品牌色圆角方块 + 一个字母。
 // 不依赖额外的图片资源，任何 DPI 下都清晰。
+// 尺寸同时覆盖 16–32px 的标签/列表小图标与 96–128px 的缩略图占位图标。
 static QIcon makeTypeBadge(const QString &sLetter, const QColor &clrBadge)
 {
     QIcon icon;
-    for (int nSize : {16, 24, 32})
+    for (int nSize : {16, 24, 32, 48, 64, 96, 128})
     {
         QPixmap pm(nSize, nSize);
         pm.fill(Qt::transparent);
@@ -519,6 +534,41 @@ QIcon MainWindow::tabIconForFile(const QString &sFileName)
 
     static const QIcon s_iconUnknown = makeTypeBadge(QStringLiteral("?"), QColor(QStringLiteral("#94A3B8")));
     return s_iconUnknown;
+}
+
+// 「缩略图显示」工具按钮图标：2×2 圆角块（左上角用品牌青色强调），
+// 与 view_tree / view_flat 一样是运行期绘制的深蓝线性图标，不新增资源文件。
+static QIcon makeThumbnailViewIcon()
+{
+    QIcon icon;
+    for (int nSize : {20, 24, 32, 40, 48, 64})
+    {
+        QPixmap pm(nSize, nSize);
+        pm.fill(Qt::transparent);
+
+        QPainter painter(&pm);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(Qt::NoPen);
+
+        const qreal dGap = nSize * 0.10;
+        const qreal dCell = (nSize - 3.0 * dGap) / 2.0;
+        const QColor clrDark(QStringLiteral("#1F2A3D"));
+        const QColor clrCyan(QStringLiteral("#0FB2FB"));
+        for (int r = 0; r < 2; ++r)
+        {
+            for (int c = 0; c < 2; ++c)
+            {
+                const QRectF rcCell(dGap + c * (dCell + dGap),
+                                    dGap + r * (dCell + dGap), dCell, dCell);
+                painter.setBrush((r == 0 && c == 0) ? clrCyan : clrDark);
+                const qreal dRadius = qMax<qreal>(1.0, nSize * 0.07);
+                painter.drawRoundedRect(rcCell, dRadius, dRadius);
+            }
+        }
+        painter.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
 }
 
 // 窗口标题：归档名 + 未保存标记（和标签页的关闭确认逻辑保持一致）
@@ -669,6 +719,8 @@ MainWindow::~MainWindow()
         if (QHeaderView *pHeader = m_tvFilePath->header())
             pHeader->viewport()->removeEventFilter(this);
     }
+    if (m_lvFilePath)
+        m_lvFilePath->viewport()->removeEventFilter(this);
     delete m_fileManager;
     delete m_hModelFilePath;
     m_hModelFilePath = nullptr;
@@ -754,6 +806,35 @@ void MainWindow::initWidgetFilePath()
     // 否则收不到按下列头的事件，排序后无法恢复展开状态。
     m_tvFilePath->header()->viewport()->installEventFilter(this);
 
+    // 缩略图视图：与树形共用同一个模型（只显示第 0 列），单独放在 QStackedWidget
+    // 里随模式切换。列表只做“展示成什么样”，文件数据/右键/删除/导出仍走同一套业务。
+    m_lvFilePath = new QListView(ui->dockWidgetContents);
+    m_lvFilePath->setObjectName(QStringLiteral("thumbnailView"));
+    m_lvFilePath->setAccessibleName(tr("文件缩略图"));
+    m_lvFilePath->setModel(m_hModelFilePath);
+    m_lvFilePath->setModelColumn(0);
+    m_lvFilePath->setViewMode(QListView::IconMode);
+    m_lvFilePath->setFlow(QListView::LeftToRight);
+    m_lvFilePath->setWrapping(true);
+    m_lvFilePath->setResizeMode(QListView::Adjust);
+    m_lvFilePath->setMovement(QListView::Static);
+    m_lvFilePath->setIconSize(QSize(kThumbnailIconSize, kThumbnailIconSize));
+    // 单元格要同时容纳图标和最多两行文件名；宽度再留出一点左右留白。
+    m_lvFilePath->setGridSize(QSize(kThumbnailIconSize + 36, kThumbnailIconSize + 50));
+    m_lvFilePath->setSpacing(6);
+    m_lvFilePath->setWordWrap(true);
+    m_lvFilePath->setUniformItemSizes(true);
+    m_lvFilePath->setTextElideMode(Qt::ElideRight);
+    m_lvFilePath->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_lvFilePath->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_lvFilePath->setSelectionBehavior(QAbstractItemView::SelectItems);
+
+    m_swFilePathViews = new QStackedWidget(ui->dockWidgetContents);
+    m_swFilePathViews->setObjectName(QStringLiteral("fileViewStack"));
+    m_swFilePathViews->addWidget(m_tvFilePath);
+    m_swFilePathViews->addWidget(m_lvFilePath);
+    m_swFilePathViews->setCurrentWidget(m_tvFilePath);
+
     // 文件列表工具条：图标化 + 按语义分组。
     // 用 FwActionBar（流式布局）而不是 QToolBar：QToolBar 在窄栏里会把放不下的动作
     // 折进溢出菜单（"»"）导致按钮直接消失；FwActionBar 改成排满换行，8 个按钮始终可见。
@@ -762,6 +843,7 @@ void MainWindow::initWidgetFilePath()
 
     m_acViewTree = new QAction("树形显示", m_tbFilePath);
     m_acViewFlat = new QAction("平铺显示", m_tbFilePath);
+    m_acViewThumbnail = new QAction("缩略图显示", m_tbFilePath);
     m_acShowFilePath = new QAction("显示路径", m_tbFilePath);
     m_acShowFileName = new QAction("显示名称", m_tbFilePath);
     m_acAddFile = new QAction("添加文件", m_tbFilePath);
@@ -772,16 +854,18 @@ void MainWindow::initWidgetFilePath()
 
     m_acViewTree->setToolTip(tr("树形显示：按合并前的目录层级展示"));
     m_acViewFlat->setToolTip(tr("平铺显示：不显示层级，每个文件一行"));
-    m_acShowFilePath->setToolTip(tr("平铺模式下显示文件的完整路径"));
-    m_acShowFileName->setToolTip(tr("平铺模式下仅显示文件名"));
+    m_acViewThumbnail->setToolTip(tr("缩略图显示：网格展示文件，图片条目显示内容预览"));
+    m_acShowFilePath->setToolTip(tr("平铺/缩略图模式下显示文件的完整路径"));
+    m_acShowFileName->setToolTip(tr("平铺/缩略图模式下仅显示文件名"));
     m_acAddFile->setToolTip(tr("添加文件到当前归档"));
     m_acDelFile->setToolTip(tr("从归档中删除选中的文件"));
     m_acOutputFile->setToolTip(tr("把选中的文件导出到磁盘"));
     m_acSaveFile->setToolTip(tr("保存对归档的改动（Ctrl+S）"));
 
-    // 视图（树/平铺）｜显示（路径/名称）｜文件（增删导出保存）
+    // 视图（树/平铺/缩略图）｜显示（路径/名称）｜文件（增删导出保存）
     m_tbFilePath->addAction(m_acViewTree);
     m_tbFilePath->addAction(m_acViewFlat);
+    m_tbFilePath->addAction(m_acViewThumbnail);
     m_tbFilePath->addSeparator();
     m_tbFilePath->addAction(m_acShowFilePath);
     m_tbFilePath->addAction(m_acShowFileName);
@@ -835,6 +919,8 @@ void MainWindow::initWidgetFilePath()
 
     connect(m_acViewTree, &QAction::triggered, this, &MainWindow::onActionViewTreeTriggered);
     connect(m_acViewFlat, &QAction::triggered, this, &MainWindow::onActionViewFlatTriggered);
+    connect(m_acViewThumbnail, &QAction::triggered, this,
+            &MainWindow::onActionViewThumbnailTriggered);
     connect(m_acShowFilePath, &QAction::triggered, this, &MainWindow::onActionShowFilePathTriggered);
     connect(m_acShowFileName, &QAction::triggered, this, &MainWindow::onActionShowFileNameTriggered);
     connect(m_acAddFile, &QAction::triggered, this, &MainWindow::onActionAddFileTriggered);
@@ -845,6 +931,10 @@ void MainWindow::initWidgetFilePath()
     connect(m_tvFilePath->selectionModel(), &QItemSelectionModel::currentChanged,
             this, [this](const QModelIndex &, const QModelIndex &) { syncActionStates(); });
     connect(m_tvFilePath->selectionModel(), &QItemSelectionModel::selectionChanged,
+            this, [this](const QItemSelection &, const QItemSelection &) { syncActionStates(); });
+    connect(m_lvFilePath->selectionModel(), &QItemSelectionModel::currentChanged,
+            this, [this](const QModelIndex &, const QModelIndex &) { syncActionStates(); });
+    connect(m_lvFilePath->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, [this](const QItemSelection &, const QItemSelection &) { syncActionStates(); });
 
     // 图标：统一使用 resources/icons（应用图标同款蓝青风格）
@@ -857,6 +947,7 @@ void MainWindow::initWidgetFilePath()
     ui->actionAbout->setIcon(FwIcons::get(QStringLiteral("about")));
     m_acViewTree->setIcon(FwIcons::get(QStringLiteral("view_tree")));
     m_acViewFlat->setIcon(FwIcons::get(QStringLiteral("view_flat")));
+    m_acViewThumbnail->setIcon(makeThumbnailViewIcon());
     m_acShowFilePath->setIcon(FwIcons::get(QStringLiteral("show_path")));
     m_acShowFileName->setIcon(FwIcons::get(QStringLiteral("show_name")));
     m_acAddFile->setIcon(FwIcons::get(QStringLiteral("add")));
@@ -879,26 +970,30 @@ void MainWindow::initWidgetFilePath()
     ui->mainToolBar->addAction(ui->actionMergeFile);
     ui->mainToolBar->addAction(ui->actionSplitFile);
 
-    // 左侧面板三段式：搜索行 / 图标工具条 / 文件树
+    // 左侧面板三段式：搜索行 / 图标工具条 / 文件视图（树形/平铺 与 缩略图共用一个容器）
     QVBoxLayout *vbLytFilePath = new QVBoxLayout(ui->dockWidgetContents);
     vbLytFilePath->setContentsMargins(0, 0, 0, 0);
     vbLytFilePath->setSpacing(0);
     vbLytFilePath->addWidget(pSearchRow);
     vbLytFilePath->addWidget(m_tbFilePath);
-    vbLytFilePath->addWidget(m_tvFilePath, 1);
+    vbLytFilePath->addWidget(m_swFilePathViews, 1);
 
-    // 默认树形模式，故平铺模式专属的两个按钮置灰；同时统一刷新保存按钮等状态
+    // 默认树形模式，故平铺/缩略图模式专属的按钮置灰；同时统一刷新保存按钮等状态
     syncActionStates();
 
-    // 文件列表右键菜单（含“打开新标签页”）
+    // 文件列表右键菜单（含“打开新标签页”）：树形与缩略图各自弹同一份菜单
     m_tvFilePath->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_tvFilePath, &QTreeView::customContextMenuRequested,
             this, &MainWindow::onTreeViewCustomContextMenu);
+    m_lvFilePath->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_lvFilePath, &QListView::customContextMenuRequested,
+            this, &MainWindow::onThumbnailViewCustomContextMenu);
 
     // 关闭 QTreeView 自带的「双击展开/折叠」，改由 eventFilter 统一处理：
     // 自带行为会在业务侧 setExpanded() 之后再次翻转节点，两者互相抵消。
     m_tvFilePath->setExpandsOnDoubleClick(false);
     m_tvFilePath->viewport()->installEventFilter(this);
+    m_lvFilePath->viewport()->installEventFilter(this);
 }
 
 // 停靠面板标题栏按钮（浮动 / 关闭）的尺寸与图标。
@@ -2458,24 +2553,36 @@ static qint64 folderBytesOfItem(const QStandardItem *pDir)
     return nTotal;
 }
 
-// 文件列表右键菜单
+// 文件列表右键菜单（树形模式）
 void MainWindow::onTreeViewCustomContextMenu(const QPoint &pos)
 {
-    if (!m_fileManager->isArchiveLoaded())
+    showFileListContextMenu(m_tvFilePath, pos);
+}
+
+// 文件列表右键菜单（缩略图模式）
+void MainWindow::onThumbnailViewCustomContextMenu(const QPoint &pos)
+{
+    showFileListContextMenu(m_lvFilePath, pos);
+}
+
+// 右键菜单的共用实现：两种视图只是 indexAt()/viewport 不同，菜单内容与副作用一致。
+void MainWindow::showFileListContextMenu(QAbstractItemView *pView, const QPoint &pos)
+{
+    if (pView == nullptr || !m_fileManager->isArchiveLoaded())
         return;
 
-    const QModelIndex index = m_tvFilePath->indexAt(pos);
+    const QModelIndex index = pView->indexAt(pos);
     if (!index.isValid())
         return;
 
     // 右键同时把该行设为当前行：选中态与"属性/打开"作用的对象一致，也方便随后的删除/导出
     const QModelIndex itemIndex = index.siblingAtColumn(0);
-    m_tvFilePath->setCurrentIndex(itemIndex);
+    pView->setCurrentIndex(itemIndex);
 
     QMenu *pMenu = buildFileListContextMenu(itemIndex);
     if (pMenu == nullptr)
         return;
-    pMenu->exec(m_tvFilePath->viewport()->mapToGlobal(pos));
+    pMenu->exec(pView->viewport()->mapToGlobal(pos));
     delete pMenu;
 }
 
@@ -2667,10 +2774,11 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
     // 双击可能落在"大小/类型"列：统一按第 0 列的业务项判断/取 FILEINFO
     const QModelIndex itemIndex = index.siblingAtColumn(0);
     QStandardItem *pItem = m_hModelFilePath->itemFromIndex(itemIndex);
-    // 目录节点：双击仅做展开 / 折叠，不打开文件
+    // 目录节点：双击仅做展开 / 折叠，不打开文件（缩略图模式只展示文件，不会走到这里）
     if (!isFileLeafItem(pItem))
     {
-        m_tvFilePath->setExpanded(itemIndex, !m_tvFilePath->isExpanded(itemIndex));
+        if (m_eViewMode == ViewTree)
+            m_tvFilePath->setExpanded(itemIndex, !m_tvFilePath->isExpanded(itemIndex));
         return;
     }
 
@@ -2736,7 +2844,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         if (event->type() == QEvent::MouseButtonPress)
         {
             m_setExpandedBeforeSort.clear();
-            if (m_bTreeMode)
+            if (m_eViewMode == ViewTree)
             {
                 for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
                     collectExpandedItems(m_hModelFilePath->index(i, 0), QString(),
@@ -2757,7 +2865,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         else if (event->type() == QEvent::MouseButtonRelease)
         {
             QTimer::singleShot(0, this, [this]() {
-                if (m_bTreeMode && !m_setExpandedBeforeSort.isEmpty())
+                if (m_eViewMode == ViewTree && !m_setExpandedBeforeSort.isEmpty())
                 {
                     for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
                         restoreExpandedItems(m_hModelFilePath->index(i, 0), QString(),
@@ -2793,16 +2901,20 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         // 不消费事件：让 QHeaderView/QTreeView 正常完成排序
     }
 
-    if (m_tvFilePath && m_hModelFilePath
-        && obj == m_tvFilePath->viewport()
+    if (m_hModelFilePath
+        && ((m_tvFilePath && obj == m_tvFilePath->viewport())
+            || (m_lvFilePath && obj == m_lvFilePath->viewport()))
         && event->type() == QEvent::MouseButtonDblClick)
     {
+        QAbstractItemView *pView = (m_lvFilePath && obj == m_lvFilePath->viewport())
+                                       ? static_cast<QAbstractItemView *>(m_lvFilePath)
+                                       : static_cast<QAbstractItemView *>(m_tvFilePath);
         QMouseEvent *me = static_cast<QMouseEvent *>(event);
-        const QModelIndex index = m_tvFilePath->indexAt(me->position().toPoint());
+        const QModelIndex index = pView->indexAt(me->position().toPoint());
         if (index.isValid())
         {
             handleFileListDoubleClick(index);
-            return true;   // 已处理，不再走 QTreeView 默认的双击逻辑
+            return true;   // 已处理，不再走视图默认的双击逻辑
         }
     }
     return QMainWindow::eventFilter(obj, event);
@@ -2941,6 +3053,9 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
     // 换归档：上一份的树展开状态与路径同名的目录无关，不能套到新归档上
     m_setExpandedTree.clear();
     m_bResetTreeExpansion = true;
+
+    // 新归档的条目内容与上一份无关，缩略图缓存必须整体作废
+    invalidateThumbnailCache();
 
     populateFilePathView(m_bShowPath);
     syncActionStates();
@@ -3233,38 +3348,59 @@ void MainWindow::on_actionSplitFile_triggered()
     }
 }
 
-// 按当前模式刷新列表：树形（默认）或平铺
+// 按当前模式刷新列表：树形（默认）/ 平铺 / 缩略图
 void MainWindow::populateFilePathView(bool bShowPath)
 {
     m_bShowPath = bShowPath;
 
-    // 两种模式都支持点列头排序：
-    //   * 平铺：全局排序；
+    // 三种模式都支持排序：
+    //   * 平铺/缩略图：全局排序；
     //   * 树形：同级排序、目录优先（FileListModel 实现），不会把层级拍平。
     // 排序在初始化时就已启用，这里不再反复 setSortingEnabled(true)：
     // Qt 每次调用都会立即 sort 当前模型，若发生在捕获展开状态之前，会把
     // 已展开目录折叠后又被当成"本来就没展开"。
-    if (m_bTreeMode)
+    if (m_eViewMode == ViewTree)
     {
         populateFilePathTree();   // 内部捕获展开状态 -> 重建/排序 -> 恢复
     }
     else
     {
-        populateFilePathList(bShowPath);
-        applyCurrentSortToModel();
+        // 离开缩略图后，尚未生成的空闲回调立即作废（不用等它们自己检查模式）
+        cancelThumbnailGeneration();
+        if (m_eViewMode == ViewThumbnail)
+        {
+            // 缩略图自己负责排序并在排序后重建索引映射；这里不能再排一次，
+            // 否则第二次 takeRow/appendRow 会把刚建好的持久索引再次打散。
+            populateFilePathThumbnails(bShowPath);
+        }
+        else
+        {
+            populateFilePathList(bShowPath);
+            applyCurrentSortToModel();
+        }
+    }
+
+    // 树控件承载树形/平铺，缩略图列表单独一格
+    if (m_swFilePathViews != nullptr)
+    {
+        m_swFilePathViews->setCurrentWidget(m_eViewMode == ViewThumbnail
+                                                ? static_cast<QWidget *>(m_lvFilePath)
+                                                : static_cast<QWidget *>(m_tvFilePath));
     }
 
     updateViewActionState();
 
-    // 模型重建后「大小/类型」两列的内容宽度会变，路径列宽度跟着重算
-    QTimer::singleShot(0, this, [this]() { adjustPathColumnWidth(); });
+    // 模型重建后「大小/类型」两列的内容宽度会变，路径列宽度跟着重算。
+    // 缩略图模式没有表头，不做这项（也避免在隐藏视图上反复触发）。
+    if (m_eViewMode != ViewThumbnail)
+        QTimer::singleShot(0, this, [this]() { adjustPathColumnWidth(); });
 }
 
 // 「文件路径」列宽度 = 视口宽 - 大小/类型两列，且不低于 kMinPathColumnWidth。
 // 面板拖窄到放不下时保留最小宽度，由横向滚动条兜底，而不是把文件名压成一条缝。
 void MainWindow::adjustPathColumnWidth()
 {
-    if (m_tvFilePath == nullptr)
+    if (m_tvFilePath == nullptr || m_eViewMode == ViewThumbnail)
         return;
     QHeaderView *pHeader = m_tvFilePath->header();
     if (pHeader == nullptr)
@@ -3317,6 +3453,237 @@ void MainWindow::populateFilePathList(bool bShowPath)
         m_hModelFilePath->setItem(nRow, 2, pType);
         ++nRow;
     }
+}
+
+// 缩略图模式：每个文件一格。非图片与暂未解码的图片先显示类型角标，
+// 图片随后由 processNextThumbnail() 逐张替换成内容缩略图。
+void MainWindow::populateFilePathThumbnails(bool bShowPath)
+{
+    cancelThumbnailGeneration();   // 作废上一轮（筛选/增删导致重建）的空闲回调
+    m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
+
+    const QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
+    int nRow = 0;
+    for (const FILEINFO &info : vtFileInfos)
+    {
+        if (!matchesFilter(info))
+            continue;
+
+        auto *pItem = new QStandardItem(bShowPath ? normalizePath(info.sFilePath)
+                                                  : info.sFileName);
+        pItem->setToolTip(tr("%1\n%2 · %3")
+                              .arg(normalizePath(info.sFilePath),
+                                   FwArc::formatSize(info.nFileLen),
+                                   typeLabel(info.sFileName)));
+        QVariant var;
+        var.setValue(info);
+        pItem->setData(var, FileListModel::InfoRole);
+        // 图标模式下文件名在图标下方，居中显示；路径/名称切换与平铺模式一致
+        pItem->setTextAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+
+        const auto itCached = m_mapThumbnailIcons.constFind(info.sFilePath);
+        const bool bHasCachedThumb = (itCached != m_mapThumbnailIcons.constEnd());
+        pItem->setIcon(bHasCachedThumb ? itCached.value()
+                                       : tabIconForFile(info.sFileName));
+
+        QStandardItem *pSize = new QStandardItem(FwArc::formatSize(info.nFileLen));
+        pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        pSize->setData(info.nFileLen, Qt::UserRole);
+        QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
+
+        m_hModelFilePath->setItem(nRow, 0, pItem);
+        m_hModelFilePath->setItem(nRow, 1, pSize);
+        m_hModelFilePath->setItem(nRow, 2, pType);
+
+        if (!bHasCachedThumb && info.nFileLen > 0 && info.nFileLen <= kThumbnailMaxBytes
+            && isThumbnailImageName(info.sFileName))
+        {
+            m_listThumbnailPending << info.sFilePath;
+        }
+        ++nRow;
+    }
+
+    applyCurrentSortToModel();
+
+    // FileListModel::sort() 用 takeRow/appendRow 移动整行，排序前记录的
+    // QPersistentModelIndex 会随「行被移除」而失效。必须排序后按当前行重建映射，
+    // 否则空闲回调拿到的索引无效，界面上就只剩类型角标、永远等不到缩略图。
+    for (int r = 0; r < m_hModelFilePath->rowCount(); ++r)
+    {
+        const QStandardItem *pRow = m_hModelFilePath->item(r, 0);
+        if (pRow == nullptr || !isFileLeafItem(pRow))
+            continue;
+        const FILEINFO info = pRow->data(FileListModel::InfoRole).value<FILEINFO>();
+        m_mapThumbnailIndex.insert(info.sFilePath,
+                                   QPersistentModelIndex(m_hModelFilePath->index(r, 0)));
+    }
+    scheduleNextThumbnail();
+}
+
+// 归档里的条目能不能尝试解码成缩略图（按后缀先筛，避免对每个二进制文件都读一遍）
+bool MainWindow::isThumbnailImageName(const QString &sFileName)
+{
+    static const QSet<QString> kImageSuffixes = {
+        QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("jpe"),
+        QStringLiteral("jfif"), QStringLiteral("png"), QStringLiteral("gif"),
+        QStringLiteral("bmp"), QStringLiteral("webp"), QStringLiteral("tif"),
+        QStringLiteral("tiff"), QStringLiteral("ico"), QStringLiteral("svg"),
+        QStringLiteral("xpm"),
+    };
+    return kImageSuffixes.contains(QFileInfo(sFileName).suffix().toLower());
+}
+
+// 读归档内容并解码成缩略图（与界面无关，测试可以直接调用）。
+// 返回的 QPixmap 按 2x 像素生成并标记 DPR=2，供 96px 网格使用。
+QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
+{
+    if (m_fileManager == nullptr || !m_fileManager->isArchiveLoaded())
+        return QPixmap();
+    if (!isThumbnailImageName(info.sFileName)
+        || info.nFileLen <= 0 || info.nFileLen > kThumbnailMaxBytes)
+        return QPixmap();
+
+    QString sErr;
+    const QByteArray data = m_fileManager->entryContent(info.sFilePath, &sErr);
+    if (data.isEmpty())
+        return QPixmap();
+
+    QBuffer buffer;
+    buffer.setData(data);
+    if (!buffer.open(QIODevice::ReadOnly))
+        return QPixmap();
+
+    QImageReader reader(&buffer);
+    // 归档条目来自外部文件，后缀不一定可信：以内容嗅探为准；
+    // 并把 EXIF 方向应用上，否则手机竖拍的图在网格里会躺倒。
+    reader.setDecideFormatFromContent(true);
+    reader.setAutoTransform(true);
+
+    // 解码前先看尺寸，避免超大图在内存里展开（解压炸弹/误改后缀）
+    const QSize szSource = reader.size();
+    if (szSource.isValid()
+        && qint64(szSource.width()) * qint64(szSource.height()) > kThumbnailMaxPixels)
+        return QPixmap();
+    if (szSource.isValid())
+    {
+        const QSize szTarget = szSource.scaled(
+            QSize(kThumbnailPixelSize, kThumbnailPixelSize), Qt::KeepAspectRatio);
+        if (szTarget.isValid() && !szTarget.isEmpty())
+            reader.setScaledSize(szTarget);   // 支持缩放的解码器不必先解出全尺寸
+    }
+
+    const QImage img = reader.read();
+    if (img.isNull())
+        return QPixmap();
+
+    const QImage scaled = img.scaled(QSize(kThumbnailPixelSize, kThumbnailPixelSize),
+                                     Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    if (scaled.isNull())
+        return QPixmap();
+
+    // 统一画进正方形底片：不同宽高比的图片都占满 96×96 的图标格，
+    // 文件名才会在同一行对齐；否则宽图会把文字顶上去、竖图把文字压下去。
+    QImage canvas(kThumbnailPixelSize, kThumbnailPixelSize, QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::transparent);
+    {
+        QPainter painter(&canvas);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QPainterPath pathTile;
+        pathTile.addRoundedRect(QRectF(0.5, 0.5, kThumbnailPixelSize - 1.0,
+                                       kThumbnailPixelSize - 1.0),
+                                12.0, 12.0);
+        painter.fillPath(pathTile, QColor(QStringLiteral("#F7F9FC")));
+        painter.setPen(QPen(QColor(QStringLiteral("#E3E8EF")), 1.0));
+        painter.drawPath(pathTile);
+        painter.setClipPath(pathTile);
+        painter.drawImage(QPoint((kThumbnailPixelSize - scaled.width()) / 2,
+                                 (kThumbnailPixelSize - scaled.height()) / 2),
+                          scaled);
+    }
+
+    QPixmap pm = QPixmap::fromImage(canvas);
+    pm.setDevicePixelRatio(2.0);
+    return pm;
+}
+
+void MainWindow::cancelThumbnailGeneration()
+{
+    ++m_nThumbnailEpoch;             // 已排队的 singleShot 看到代数不同就直接退出
+    m_listThumbnailPending.clear();
+    m_mapThumbnailIndex.clear();
+}
+
+void MainWindow::invalidateThumbnailCache()
+{
+    cancelThumbnailGeneration();
+    m_mapThumbnailIcons.clear();
+}
+
+void MainWindow::scheduleNextThumbnail()
+{
+    if (m_listThumbnailPending.isEmpty() || m_eViewMode != ViewThumbnail)
+        return;
+    const quint64 nEpoch = m_nThumbnailEpoch;
+    QTimer::singleShot(0, this, [this, nEpoch]() { processNextThumbnail(nEpoch); });
+}
+
+// 每轮回调只解码一张：既有机会让界面先画出占位角标，
+// 也让用户在大归档里切视图/筛选时能立刻中止。
+void MainWindow::processNextThumbnail(quint64 nEpoch)
+{
+    if (nEpoch != m_nThumbnailEpoch || m_eViewMode != ViewThumbnail)
+        return;
+    if (m_listThumbnailPending.isEmpty())
+        return;
+
+    const QString sPath = m_listThumbnailPending.takeFirst();
+    const QPersistentModelIndex index = m_mapThumbnailIndex.value(sPath);
+    QStandardItem *pItem = index.isValid() ? m_hModelFilePath->itemFromIndex(index) : nullptr;
+    if (pItem == nullptr)
+    {
+        scheduleNextThumbnail();
+        return;
+    }
+
+    if (!m_mapThumbnailIcons.contains(sPath))
+    {
+        const FILEINFO info = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
+        const QPixmap pm = renderEntryThumbnail(info);
+        if (!pm.isNull())
+        {
+            QIcon icon;
+            icon.addPixmap(pm);
+            if (m_mapThumbnailIcons.size() >= kThumbnailCacheLimit)
+                m_mapThumbnailIcons.clear();   // 只丢缓存；模型里已设的图标不受影响
+            m_mapThumbnailIcons.insert(sPath, icon);
+            if (QStandardItem *pNow = m_hModelFilePath->itemFromIndex(index))
+                pNow->setIcon(icon);
+        }
+    }
+
+    scheduleNextThumbnail();
+}
+
+// 当前视图（树/平铺/缩略图）的当前项。删除/导出/属性/可用状态统一从这里取，
+// 避免三个模式各写一套 currentIndex()。
+QAbstractItemView *MainWindow::activeFileListView() const
+{
+    if (m_eViewMode == ViewThumbnail && m_lvFilePath != nullptr)
+        return m_lvFilePath;
+    return m_tvFilePath;
+}
+
+QModelIndex MainWindow::currentFileListIndex() const
+{
+    QAbstractItemView *pView = activeFileListView();
+    return pView != nullptr ? pView->currentIndex() : QModelIndex();
+}
+
+QStandardItem *MainWindow::currentFileListItem() const
+{
+    if (m_hModelFilePath == nullptr)
+        return nullptr;
+    return m_hModelFilePath->itemFromIndex(currentFileListIndex().siblingAtColumn(0));
 }
 
 bool MainWindow::matchesFilter(const FILEINFO &info) const
@@ -3504,12 +3871,15 @@ void MainWindow::updateViewActionState()
 {
     const bool bLoaded = m_fileManager->isArchiveLoaded();
     const bool bBusy = m_fileManager->isBusy();
+    const bool bCanSwitch = bLoaded && !bBusy;
 
-    m_acViewTree->setEnabled(bLoaded && !bBusy && !m_bTreeMode);
-    m_acViewFlat->setEnabled(bLoaded && !bBusy && m_bTreeMode);
-    // 「显示路径/显示名称」仅在平铺模式下有意义
-    m_acShowFilePath->setEnabled(bLoaded && !bBusy && !m_bTreeMode && !m_bShowPath);
-    m_acShowFileName->setEnabled(bLoaded && !bBusy && !m_bTreeMode && m_bShowPath);
+    m_acViewTree->setEnabled(bCanSwitch && m_eViewMode != ViewTree);
+    m_acViewFlat->setEnabled(bCanSwitch && m_eViewMode != ViewFlat);
+    m_acViewThumbnail->setEnabled(bCanSwitch && m_eViewMode != ViewThumbnail);
+    // 「显示路径/显示名称」在平铺与缩略图模式下都有意义（缩略图标签同样可切换）
+    const bool bListLike = bCanSwitch && m_eViewMode != ViewTree;
+    m_acShowFilePath->setEnabled(bListLike && !m_bShowPath);
+    m_acShowFileName->setEnabled(bListLike && m_bShowPath);
 }
 
 // 唯一的状态刷新入口：包含保存按钮与所有菜单动作（P1-5 / P1-6）
@@ -3517,8 +3887,7 @@ void MainWindow::syncActionStates()
 {
     const bool bLoaded = m_fileManager->isArchiveLoaded();
     const bool bBusy   = m_fileManager->isBusy();
-    QStandardItem *pCur = m_hModelFilePath->itemFromIndex(
-        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    QStandardItem *pCur = currentFileListItem();
     const bool bHasLeaf = isFileLeafItem(pCur);
 
     updateViewActionState();
@@ -3557,12 +3926,12 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
     {
         m_acViewTree->setEnabled(false);
         m_acViewFlat->setEnabled(false);
+        m_acViewThumbnail->setEnabled(false);
         m_acShowFilePath->setEnabled(false);
         m_acShowFileName->setEnabled(false);
     }
     ui->actionUnloadFile->setEnabled(bEnabled && bLoaded);
-    QStandardItem *pCur = m_hModelFilePath->itemFromIndex(
-        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    QStandardItem *pCur = currentFileListItem();
     const bool bHasLeaf = isFileLeafItem(pCur);
     m_acAddFile->setEnabled(bEnabled && bLoaded);
     m_acDelFile->setEnabled(bEnabled && bLoaded && bHasLeaf);
@@ -3717,6 +4086,14 @@ void MainWindow::onActionVerifyArchiveTriggered()
     else     QMessageBox::warning(this, QStringLiteral("校验归档"), sReport);
 }
 
+// 离开树形前记住展开状态；切平铺、切缩略图两条路径共用
+void MainWindow::captureTreeExpansionState()
+{
+    m_setExpandedTree.clear();
+    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+        collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), m_setExpandedTree);
+}
+
 // 递归收集当前已展开的节点（键 = 从根到该节点的文本链）
 void MainWindow::collectExpandedItems(const QModelIndex &index, const QString &sKeyPrefix, QSet<QString> &setExpanded)
 {
@@ -3793,11 +4170,11 @@ void MainWindow::refreshTabInfosFromManager()
 
 void MainWindow::onActionViewTreeTriggered()
 {
-    if (m_bTreeMode)
+    if (m_eViewMode == ViewTree)
         return;
-    m_bTreeMode = true;
+    m_eViewMode = ViewTree;
     populateFilePathView(m_bShowPath);
-    // 从平铺切回树形：恢复切到平铺前记录的展开状态。
+    // 从平铺/缩略图切回树形：恢复离开树形前记录的展开状态。
     if (!m_setExpandedTree.isEmpty())
     {
         for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
@@ -3807,13 +4184,22 @@ void MainWindow::onActionViewTreeTriggered()
 
 void MainWindow::onActionViewFlatTriggered()
 {
-    if (!m_bTreeMode)
+    if (m_eViewMode == ViewFlat)
         return;
-    // 切到平铺会重建模型；先记住树的展开状态，切回树形时恢复。
-    m_setExpandedTree.clear();
-    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
-        collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), m_setExpandedTree);
-    m_bTreeMode = false;
+    // 切走会重建模型：先在树形下记住展开状态，切回树形时恢复。
+    if (m_eViewMode == ViewTree)
+        captureTreeExpansionState();
+    m_eViewMode = ViewFlat;
+    populateFilePathView(m_bShowPath);
+}
+
+void MainWindow::onActionViewThumbnailTriggered()
+{
+    if (m_eViewMode == ViewThumbnail)
+        return;
+    if (m_eViewMode == ViewTree)
+        captureTreeExpansionState();
+    m_eViewMode = ViewThumbnail;
     populateFilePathView(m_bShowPath);
 }
 
@@ -3855,6 +4241,8 @@ void MainWindow::onActionAddFileTriggered()
     m_fileManager->addFiles(vtAdd);
     QApplication::restoreOverrideCursor();
 
+    // 新增条目可能覆盖同路径的旧内容（或带来新图片），缩略图缓存不能沿用
+    invalidateThumbnailCache();
     refreshFilePathView();
     syncActionStates();
 }
@@ -3869,8 +4257,7 @@ void MainWindow::onActionDelFileTriggered()
     }
 
     // 树形模式下目录节点不可删除，需选中具体文件；列可能不是第 0 列
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(
-        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    QStandardItem *pItem = currentFileListItem();
     if (!isFileLeafItem(pItem))
     {
         QMessageBox::information(this, tr("删除文件"),
@@ -3923,6 +4310,7 @@ void MainWindow::onActionDelFileTriggered()
             tr("已删除条目，并关闭 %1 个正在显示它的标签页").arg(nClosedTabs), 6000);
     }
 
+    invalidateThumbnailCache();
     refreshFilePathView();
     syncActionStates();
 }
@@ -3930,8 +4318,7 @@ void MainWindow::onActionDelFileTriggered()
 void MainWindow::onActionOutputFileTriggered()
 {
     // 树形模式下目录节点不可导出，需选中具体文件；列可能不是第 0 列
-    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(
-        m_tvFilePath->currentIndex().siblingAtColumn(0));
+    QStandardItem *pItem = currentFileListItem();
     if (!isFileLeafItem(pItem))
     {
         QMessageBox::information(this, tr("导出文件"),
@@ -4059,7 +4446,9 @@ void MainWindow::onActionSaveFileTriggered()
         return;
     }
 
-    // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮
+    // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮。
+    // 跨盘保存可能改动展示路径（E:/x -> E/x），缩略图缓存一并作废。
+    invalidateThumbnailCache();
     refreshTabInfosFromManager();
     refreshFilePathView();
     syncActionStates();
@@ -4103,9 +4492,24 @@ void MainWindow::restoreUiState()
     if (!geo.isEmpty()) restoreGeometry(geo);
     const QByteArray state = st.value(QStringLiteral("state")).toByteArray();
     if (!state.isEmpty()) restoreState(state);
-    m_bTreeMode = st.value(QStringLiteral("treeMode"), true).toBool();
+    // 新版写 viewMode；旧配置只有 treeMode（true/false），按它回退成树形/平铺。
+    const QString sMode = st.value(QStringLiteral("viewMode")).toString();
+    if (sMode == QLatin1String("flat"))
+        m_eViewMode = ViewFlat;
+    else if (sMode == QLatin1String("thumbnail"))
+        m_eViewMode = ViewThumbnail;
+    else if (sMode == QLatin1String("tree"))
+        m_eViewMode = ViewTree;
+    else
+        m_eViewMode = st.value(QStringLiteral("treeMode"), true).toBool() ? ViewTree : ViewFlat;
     m_bShowPath = st.value(QStringLiteral("showPath"), false).toBool();
     st.endGroup();
+    if (m_swFilePathViews != nullptr)
+    {
+        m_swFilePathViews->setCurrentWidget(m_eViewMode == ViewThumbnail
+                                                ? static_cast<QWidget *>(m_lvFilePath)
+                                                : static_cast<QWidget *>(m_tvFilePath));
+    }
     updateViewActionState();
 }
 
@@ -4116,7 +4520,12 @@ void MainWindow::saveUiState()
     st.beginGroup(QStringLiteral("MainWindow"));
     st.setValue(QStringLiteral("geometry"), saveGeometry());
     st.setValue(QStringLiteral("state"), saveState());
-    st.setValue(QStringLiteral("treeMode"), m_bTreeMode);
+    const QString sMode = (m_eViewMode == ViewThumbnail) ? QStringLiteral("thumbnail")
+                        : (m_eViewMode == ViewFlat)      ? QStringLiteral("flat")
+                                                         : QStringLiteral("tree");
+    st.setValue(QStringLiteral("viewMode"), sMode);
+    // 兼容旧版读取逻辑（只认 treeMode）：平铺/缩略图都按"非树形"保存
+    st.setValue(QStringLiteral("treeMode"), m_eViewMode == ViewTree);
     st.setValue(QStringLiteral("showPath"), m_bShowPath);
     st.endGroup();
 }
@@ -4153,6 +4562,7 @@ void MainWindow::on_actionUnloadFile_triggered()
         return;
 
     m_fileManager->unLoadMergedFile();
+    invalidateThumbnailCache();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
     // 卸载后模型已清空：树展开状态也一并作废，避免下次加载同名目录被无端展开
     m_setExpandedTree.clear();

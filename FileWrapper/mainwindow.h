@@ -7,8 +7,11 @@
 #include "plugininterface.h"
 #include "dlgfileproperty.h"   // 「属性」数据收集的返回值类型
 #include <QTreeView>
+#include <QListView>
 #include <QStackedWidget>
 #include <QHeaderView>
+#include <QPixmap>
+#include <QPersistentModelIndex>
 #include <QToolBar>
 #include <QLayout>
 #include <QAction>
@@ -129,6 +132,7 @@ private slots:
     void on_actionSplitFile_triggered();
     void onActionViewTreeTriggered();
     void onActionViewFlatTriggered();
+    void onActionViewThumbnailTriggered();
     void onActionShowFilePathTriggered();
     void onActionShowFileNameTriggered();
     void onActionAddFileTriggered();
@@ -150,6 +154,7 @@ private slots:
     // P0-2：用户拖动标签后原子地同步文档数组，避免“标签顺序与 m_vTabDocs 失配”
     void onTabBarTabMoved(int from, int to);
     void onTreeViewCustomContextMenu(const QPoint &pos);
+    void onThumbnailViewCustomContextMenu(const QPoint &pos);
     void onActionNewTabTriggered();
 
 protected:
@@ -164,8 +169,23 @@ protected:
     void refreshTabInfosFromManager();
     void populateFilePathList(bool bShowPath);
     void populateFilePathTree();
+    void populateFilePathThumbnails(bool bShowPath);
     void applyCurrentSortToModel();
     void updateViewActionState();
+    // 当前视图（树/平铺/缩略图）的当前项；删除/导出/属性只看这一处，避免各模式各写一套。
+    QModelIndex currentFileListIndex() const;
+    QStandardItem *currentFileListItem() const;
+    QAbstractItemView *activeFileListView() const;
+    // 右键菜单：树形与缩略图共用一套构造逻辑，只是 indexAt/弹出位置不同
+    void showFileListContextMenu(QAbstractItemView *pView, const QPoint &pos);
+    // 缩略图：先全部放类型角标，再以空闲回调逐张解码替换，避免大归档切视图时卡死
+    void cancelThumbnailGeneration();
+    void invalidateThumbnailCache();
+    void scheduleNextThumbnail();
+    void processNextThumbnail(quint64 nEpoch);
+    // 离开树形前记住展开状态（切平铺/切缩略图共用）
+    void captureTreeExpansionState();
+    static bool isThumbnailImageName(const QString &sFileName);
 
     // 统一刷新所有工具栏 / 菜单动作（含保存按钮），消除「列表空了但保存可用」的状态错乱
     void syncActionStates();
@@ -178,6 +198,9 @@ protected:
     // 校验并加载归档（加载文件与"打开合并结果"共用；失败时保持当前归档不变）
 protected:
     void loadArchiveFile(const QString &sFileName);   // 测试派生类需要直接加载归档
+    // 把归档里的图片条目解码成缩略图（不是图片/读不出来时返回空 QPixmap）。
+    // 与界面展示分离：测试派生类可以直接验证解码结果，不必等后台逐张生成。
+    QPixmap renderEntryThumbnail(const FILEINFO &info) const;
     // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 属性；目录行 = 属性。
     // 返回的菜单归调用方 delete；返回 nullptr 表示该行没有可用操作。
     // （protected 是为了让测试派生类能检查菜单项，不弹出真实的模态菜单。）
@@ -239,13 +262,16 @@ private:
     FileManager             *m_fileManager;
 
     QStackedWidget          *m_swShowArea;
+    QStackedWidget          *m_swFilePathViews = nullptr;   // 文件列表容器：树形/平铺(树控件) vs 缩略图
     QTreeView               *m_tvFilePath;
+    QListView               *m_lvFilePath = nullptr;        // 缩略图网格
     FwActionBar             *m_tbFilePath;
     QToolButton             *m_btnNewTab = nullptr;   // 贴在标签栏末尾的「+」
     bool                     m_bNewTabBtnPending = false;
     bool                     m_bAdjustingPathColumn = false;   // 防止列宽回调递归
     QAction                 *m_acViewTree;
     QAction                 *m_acViewFlat;
+    QAction                 *m_acViewThumbnail = nullptr;
     QAction                 *m_acShowFilePath;
     QAction                 *m_acShowFileName;
     QAction                 *m_acAddFile;
@@ -254,8 +280,22 @@ private:
     QAction                 *m_acSaveFile;
     QAction                 *m_acVerify = nullptr;
 
-    bool                    m_bTreeMode = true;
-    bool                    m_bShowPath = false;
+    // 文件列表的三种显示模式（树形 / 平铺 / 缩略图）
+    enum FileViewMode
+    {
+        ViewTree = 0,
+        ViewFlat,
+        ViewThumbnail,
+    };
+    FileViewMode             m_eViewMode = ViewTree;
+    bool                     m_bShowPath = false;
+
+    // 缩略图缓存：条目路径 -> 已解码的图标。归档内容变化（加载/增删/保存）时整体失效。
+    QHash<QString, QIcon>    m_mapThumbnailIcons;
+    // 本轮缩略图模式下待生成/可定位的条目（QPersistentModelIndex 会跟着排序移动）
+    QStringList              m_listThumbnailPending;
+    QHash<QString, QPersistentModelIndex> m_mapThumbnailIndex;
+    quint64                  m_nThumbnailEpoch = 0;   // 模式切换/重建时作废过期的空闲回调
 
     PluginInterface         *m_pCurrentInterface = nullptr;
 

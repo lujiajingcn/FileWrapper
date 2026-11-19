@@ -158,6 +158,28 @@ QTreeView::branch {
     background: transparent;
 }
 
+/* 文件缩略图 ------------------------------------------------------------ */
+QListView#thumbnailView {
+    background-color: #FFFFFF;
+    border: none;
+    outline: 0;
+    selection-background-color: #E3EEFE;
+    selection-color: #12365F;
+}
+QListView#thumbnailView::item {
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 4px;
+}
+QListView#thumbnailView::item:hover {
+    background-color: #F3F8FF;
+}
+QListView#thumbnailView::item:selected {
+    background-color: #E3EEFE;
+    color: #12365F;
+    border-color: #C7DDFB;
+}
+
 QHeaderView::section {
     background-color: #F7F9FC;
     color: #6B7280;

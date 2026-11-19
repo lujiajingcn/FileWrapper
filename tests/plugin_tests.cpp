@@ -49,6 +49,8 @@
 #include <QSettings>
 #include <QStatusBar>
 #include <QTreeView>
+#include <QListView>
+#include <QStackedWidget>
 #include <QHeaderView>
 #include <QMouseEvent>
 #include <QPushButton>
@@ -266,6 +268,7 @@ public:
     using MainWindow::buildFileListContextMenu;
     using MainWindow::filePropertyData;
     using MainWindow::folderPropertyData;
+    using MainWindow::renderEntryThumbnail;
 };
 
 static void checkExtensionMapping()
@@ -2292,6 +2295,129 @@ static void verifyMergeDialog()
            QStringLiteral("H20b: pending entry and v1 archive show explicit CRC/state text"));
     report(bPropFolderOk,
            QStringLiteral("H20c: folder property text shows aggregate and filter scope"));
+
+    // H21: 文件列表第三种视图——缩略图（图标网格 + 图片内容预览 + 非图片角标回退）
+    {
+        const QString sThumbDir = makeWritableTestDir(QStringLiteral("thumb_view"));
+        const QString sPng = sThumbDir + QStringLiteral("/preview.png");
+        const QString sPng2 = sThumbDir + QStringLiteral("/a_preview.png");
+        const QString sTxt = sThumbDir + QStringLiteral("/readme.txt");
+        const QString sArc = sThumbDir + QStringLiteral("/thumb.dat");
+
+        QImage img(120, 80, QImage::Format_RGB32);
+        img.fill(QColor(QStringLiteral("#2E8EF1")));
+        const bool bPng = img.save(sPng, "PNG") && img.save(sPng2, "PNG");
+        bool bTxt = false;
+        {
+            QFile f(sTxt);
+            if (f.open(QIODevice::WriteOnly))
+                bTxt = f.write("thumbnail fallback") > 0;
+        }
+
+        bool bMerged = false;
+        if (bPng && bTxt)
+        {
+            FileManager fmThumb;
+            QObject::connect(&fmThumb, &FileManager::operationFinished,
+                             [&bMerged](bool o, const QString &) { bMerged = o; });
+            // 故意让合并顺序与名称排序不同：applyCurrentSortToModel() 会 takeRow/appendRow，
+            // 用来覆盖“排序后持久索引失效导致缩略图不再生成”的回归。
+            fmThumb.QMergeFiles(QVector<QString>{ sPng, sTxt, sPng2 }, sArc);
+            bMerged = bMerged && QFileInfo::exists(sArc);
+        }
+
+        bool bGridOk = false;
+        bool bImageOk = false;
+        bool bFallbackAndAsyncOk = false;
+        bool bBackToTreeOk = false;
+        int nRows = -1;
+        if (bMerged)
+        {
+            ProbeTreeWindow mwThumb;
+            QMetaObject::invokeMethod(&mwThumb, "onActionViewThumbnailTriggered",
+                                      Qt::DirectConnection);
+            mwThumb.loadArchiveFile(sArc);
+
+            auto *pList = mwThumb.findChild<QListView *>(QStringLiteral("thumbnailView"));
+            auto *pStack = mwThumb.findChild<QStackedWidget *>(QStringLiteral("fileViewStack"));
+            auto *pTree = mwThumb.findChild<QTreeView *>();
+            auto *pModel = pList ? qobject_cast<QStandardItemModel *>(pList->model()) : nullptr;
+            nRows = pModel ? pModel->rowCount() : -1;
+
+            QStandardItem *pPngItem = nullptr;
+            QStandardItem *pPngItem2 = nullptr;
+            QStandardItem *pTxtItem = nullptr;
+            if (pModel)
+            {
+                for (int r = 0; r < pModel->rowCount(); ++r)
+                {
+                    QStandardItem *pItem = pModel->item(r, 0);
+                    if (pItem == nullptr)
+                        continue;
+                    if (pItem->text() == QStringLiteral("preview.png")) pPngItem = pItem;
+                    if (pItem->text() == QStringLiteral("a_preview.png")) pPngItem2 = pItem;
+                    if (pItem->text() == QStringLiteral("readme.txt")) pTxtItem = pItem;
+                }
+            }
+
+            bGridOk = pList != nullptr && pStack != nullptr && pTree != nullptr
+                      && pStack->currentWidget() == pList
+                      && pList->viewMode() == QListView::IconMode
+                      && pList->model() == pModel
+                      && pModel != nullptr && pModel->rowCount() == 3
+                      && pList->iconSize().width() >= 64
+                      && pPngItem != nullptr && pPngItem2 != nullptr && pTxtItem != nullptr;
+
+            if (pPngItem)
+            {
+                const FILEINFO fi = pPngItem->data(FileListModel::InfoRole).value<FILEINFO>();
+                const QPixmap pm = mwThumb.renderEntryThumbnail(fi);
+                bImageOk = !pm.isNull() && pm.width() >= 96
+                           && pm.width() <= 192 && pm.height() <= 192;
+            }
+            if (pTxtItem)
+                bFallbackAndAsyncOk = !pTxtItem->icon().isNull();
+
+            // 缩略图由空闲回调逐张生成：记录占位角标的 cacheKey，等图片格子换成新图标。
+            // 只判断“有图标”不行——占位角标本来就有；必须确认图标对象被替换过。
+            const qint64 nPngKey = pPngItem ? pPngItem->icon().cacheKey() : 0;
+            const qint64 nPng2Key = pPngItem2 ? pPngItem2->icon().cacheKey() : 0;
+            if (pPngItem && pPngItem2)
+            {
+                QElapsedTimer wait;
+                wait.start();
+                while (wait.elapsed() < 5000)
+                {
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                    if (pPngItem->icon().cacheKey() != nPngKey
+                        && pPngItem2->icon().cacheKey() != nPng2Key)
+                    {
+                        bFallbackAndAsyncOk = true;
+                        break;
+                    }
+                }
+            }
+
+            if (pList && pStack && pTree)
+            {
+                QMetaObject::invokeMethod(&mwThumb, "onActionViewTreeTriggered",
+                                          Qt::DirectConnection);
+                auto *pTreeModel = qobject_cast<QStandardItemModel *>(pTree->model());
+                bBackToTreeOk = pStack->currentWidget() == pTree
+                                && pTreeModel != nullptr
+                                && pTreeModel->item(0, 0) != nullptr
+                                && pTreeModel->item(0, 0)->data(FileListModel::IsDirRole).toBool()
+                                && pTree->isSortingEnabled();
+            }
+        }
+        report(bGridOk,
+               QStringLiteral("H21a: thumbnail view is a third icon-grid mode (%1 rows)").arg(nRows));
+        report(bImageOk, QStringLiteral("H21b: image entry decodes to a real thumbnail pixmap"));
+        report(bFallbackAndAsyncOk,
+               QStringLiteral("H21c: non-image keeps type badge, images get real thumbnails"));
+        report(bBackToTreeOk, QStringLiteral("H21d: switching back to tree restores tree model"));
+        QDir(sThumbDir).removeRecursively();
+    }
 
     QDir(sChainDir).removeRecursively();
 }
