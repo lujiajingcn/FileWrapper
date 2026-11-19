@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QFile>
+#include <QFileInfo>
 #include <QDebug>
 #include <QTimer>
 #include <QSlider>
@@ -12,10 +13,20 @@
 #include <QSize>
 #include <QStatusBar>
 #include <QPixmap>
+#include <QStringList>
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QAudioDevice>
+#include <QMediaDevices>
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
 #include <limits>
+
+extern "C"
+{
+    #include <libavutil/error.h>
+}
 
 // ============================================================
 // 自定义内存 IO 回调
@@ -53,11 +64,66 @@ static int64_t memIOSeek(void *opaque, int64_t offset, int whence)
     if (w == SEEK_CUR)      base = m->pos;
     else if (w == SEEK_END) base = m->size;
     else if (w != SEEK_SET) return AVERROR(EINVAL);
+    // P2-14：base + offset 的有符号溢出检查（伪造/异常时间轴时不能让偏移回绕）
+    if ((offset > 0 && base > std::numeric_limits<int64_t>::max() - offset)
+        || (offset < 0 && base < std::numeric_limits<int64_t>::min() - offset))
+        return AVERROR(EINVAL);
     int64_t newPos = base + offset;
     if (newPos < 0)
         return AVERROR(EINVAL);
     m->pos = newPos;   // 允许越过文件尾；后续 read 返回 EOF，与真实文件行为一致
     return newPos;
+}
+
+// P1-18：FFmpeg 中断回调。停止/换文件时把标志置 1，
+// 让阻塞中的 avformat_open_input / find_stream_info / 协议读取尽快返回，
+// 而不是一直卡到 GUI 侧 30 秒超时。
+static int fwIoInterruptCallback(void *opaque)
+{
+    const auto *p = static_cast<const std::atomic<int> *>(opaque);
+    return (p != nullptr && p->load(std::memory_order_relaxed) != 0) ? 1 : 0;
+}
+
+// FFmpeg 返回码 -> 可读文本。以前这些细节只进 qWarning，界面上一律是
+// 「插件无法显示该文件」，用户根本不知道是文件坏了还是环境缺东西。
+static QString avErrText(int nRet)
+{
+    char szBuf[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+    if (av_strerror(nRet, szBuf, sizeof(szBuf)) < 0)
+        return QStringLiteral("FFmpeg error %1").arg(nRet);
+    return QString::fromUtf8(szBuf);
+}
+
+// QAudio::Error -> 枚举名（"错误码 1"对用户没有意义，OpenError 才有）
+static const char *audioErrorName(int nErr)
+{
+    switch (nErr)
+    {
+    case QAudio::NoError:       return "NoError";
+    case QAudio::OpenError:     return "OpenError";
+    case QAudio::IOError:       return "IOError";
+    case QAudio::UnderrunError: return "UnderrunError";
+    case QAudio::FatalError:    return "FatalError";
+    default:                    return "UnknownError";
+    }
+}
+
+// diagnoseAudioFailure() 的两种"还没到 QAudioSink 就已知"的原因
+static const int kAudioNoDevice        = -1;
+static const int kAudioFormatUnsupported = -2;
+
+// 秒 -> m:ss / h:mm:ss（失败页与进度条口径一致）
+static QString formatClock(qint64 nMs)
+{
+    if (nMs < 0) nMs = 0;
+    const qint64 nTotalSec = nMs / 1000;
+    const qint64 nH = nTotalSec / 3600;
+    const qint64 nM = (nTotalSec % 3600) / 60;
+    const qint64 nS = nTotalSec % 60;
+    if (nH > 0)
+        return QStringLiteral("%1:%2:%3").arg(nH)
+                .arg(nM, 2, 10, QChar('0')).arg(nS, 2, 10, QChar('0'));
+    return QStringLiteral("%1:%2").arg(nM).arg(nS, 2, 10, QChar('0'));
 }
 
 // ============================================================
@@ -85,9 +151,12 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
                               SwrContext *swr, uint8_t *aOutBuf,
                               QMutex *aMutex, QByteArray *aByteBuf,
                               int outSampleRate, int genId,
-                              int audioOutBufCapacity)
+                              int audioOutBufCapacity,
+                              quint64 runId)
 {
     QMutexLocker locker(&m_mutex);
+    // P0-4：新上下文对应新的 runId。任何旧 runId 的排队任务都会在入口直接退出。
+    m_contextRunId.store(runId, std::memory_order_release);
     pFormatCtx = fmtCtx;
     pCodecCtx  = vCodecCtx;
     videoindex = videoIdx;
@@ -221,6 +290,12 @@ void VideoWorker::requestStop()
     m_pauseCond.wakeAll();
 }
 
+void VideoWorker::setContextRunId(quint64 runId)
+{
+    // 直接连接调用：只做一次原子写，让排队中的旧 doDecodeRun 在入口失效。
+    m_contextRunId.store(runId, std::memory_order_release);
+}
+
 void VideoWorker::clearStopRequest()
 {
     m_stopRequested.store(0, std::memory_order_relaxed);
@@ -257,14 +332,25 @@ bool VideoWorker::waitForDecodingStopped(unsigned long timeoutMs)
     return true;
 }
 
-void VideoWorker::doDecode()
+void VideoWorker::doDecodeRun(quint64 runId)
 {
+    // P0-4：任务世代校验。已排队但上下文已被替换/作废的旧任务在这里直接退出：
+    // 不读任何上下文、不设置/清理共享状态，从根本上消除「旧任务用新上下文解码」。
+    if (runId != m_contextRunId.load(std::memory_order_acquire))
+        return;
+
     // 启动新一轮解码：标记运行中
     // 注意：不在此清除 stop 标志。若主线程已请求停止（如 clearFFmpegResources），
     // 则此处仍排队的 doDecode 会立即检测到 stop 并退出，避免访问已释放的资源。
     // stop 标志由 setContexts() 在新播放开始时清除。
     m_running.store(1, std::memory_order_relaxed);
     m_lastPtsMs = 0;
+    // 任务开始时捕获世代：结束信号必须用它，不能结束时再读共享 m_genId
+    int genIdAtStart = -1;
+    {
+        QMutexLocker locker(&m_mutex);
+        genIdAtStart = m_genId;
+    }
 
     // 本线程持有的数据包（与主线程解耦，避免跨线程共享所有权）
     AVPacket *pkt = av_packet_alloc();
@@ -272,7 +358,7 @@ void VideoWorker::doDecode()
     {
         m_running.store(0, std::memory_order_relaxed);
         m_stoppedCond.wakeAll();
-        emit decodingFinished(m_genId);
+        emit decodingFinished(genIdAtStart);
         return;
     }
 
@@ -294,6 +380,9 @@ void VideoWorker::doDecode()
     while (true)
     {
         if (m_stopRequested.load(std::memory_order_relaxed))
+            goto stop_decode;
+        // P0-4：上下文已被替换（换文件/停止）时立即退出，不再访问旧上下文
+        if (runId != m_contextRunId.load(std::memory_order_acquire))
             goto stop_decode;
 
         // ---- 暂停处理：阻塞在条件变量上，直到被唤醒（继续/停止） ----
@@ -701,12 +790,17 @@ stop_decode:
         av_packet_free(&pkt);
         {
             QMutexLocker locker(&m_mutex);
-            m_stopRequested.store(0, std::memory_order_relaxed);
-            m_paused.store(0, std::memory_order_relaxed);
+            // 只有当前世代的运行任务才能清理共享的 stop/pause 标志。
+            // 旧任务若在这里清标志，会让后续排队任务「越过」停止检查（P0-4）。
+            if (runId == m_contextRunId.load(std::memory_order_acquire))
+            {
+                m_stopRequested.store(0, std::memory_order_relaxed);
+                m_paused.store(0, std::memory_order_relaxed);
+            }
             m_running.store(0, std::memory_order_relaxed);
             m_stoppedCond.wakeAll();
         }
-        emit decodingFinished(m_genId);
+        emit decodingFinished(genIdAtStart);
     }
 }
 
@@ -738,8 +832,11 @@ MainWindow::MainWindow(QWidget *parent)
     timer->setTimerType(Qt::PreciseTimer);
     connect(timer, &QTimer::timeout, this, &MainWindow::timeCallback);
 
-    // 创建视频解码线程
-    m_videoThread = new QThread(this);
+    // 创建视频解码线程。
+    // P0-5：**不能**把它挂成 MainWindow 的子对象：停止失败时析构函数提前 return
+    // 也阻止不了 QObject 基类删除子对象，等于删除一个仍在运行的 QThread。
+    // 现在由 MainWindow 显式管理，且只有确认线程退出后才会 delete。
+    m_videoThread = new QThread();
     m_videoWorker = new VideoWorker();
     m_videoWorker->moveToThread(m_videoThread);
 
@@ -780,11 +877,18 @@ void MainWindow::timeCallback(void)
         int writeBytes = qMin(byteBuf.length(), audioOutput->bytesFree());
         if (writeBytes > 0)
         {
-            streamOut->write(byteBuf.data(), writeBytes);
-            if (writeBytes < byteBuf.length())
-                byteBuf = byteBuf.right(byteBuf.length() - writeBytes);
-            else
-                byteBuf.clear();
+            // P1-20：只移除**实际写入**的字节。旧实现无视 write() 返回值，
+            // 短写/零写入时也会把计划写入的整段 PCM 丢掉（表现为爆音、断音）。
+            const qint64 written = streamOut->write(byteBuf.constData(), writeBytes);
+            if (written > 0)
+            {
+                if (written < byteBuf.size())
+                    byteBuf.remove(0, int(written));
+                else
+                    byteBuf.clear();
+            }
+            // written <= 0：设备暂时写不进去（或出错），保留数据下一拍重试，
+            // 不能丢弃；持续错误由设备状态/错误信号反映。
         }
     }
 
@@ -957,11 +1061,35 @@ bool MainWindow::stopWorkerAndWait(unsigned long timeoutMs)
 {
     if (!m_videoWorker)
         return true;
+    // P1-18：先置中断标志，让阻塞中的 FFmpeg I/O 尽快返回；再请求停止。
+    m_ioInterrupt.store(1, std::memory_order_relaxed);
     // 请求停止（DirectConnection 设置原子标志并唤醒暂停条件变量）
     QMetaObject::invokeMethod(m_videoWorker, "requestStop", Qt::DirectConnection);
     // 阻塞等待 worker 退出 doDecode（条件变量替代旧的忙等待轮询）。
     // 返回 false 表示超时、worker 可能仍在访问 FFmpeg 上下文，调用方不得立即释放。
     return m_videoWorker->waitForDecodingStopped(timeoutMs);
+}
+
+// P0-4：推进播放世代。worker 切换上下文/停止时都要调用：
+// 已在队列里等待执行的旧 doDecodeRun 会在入口发现 runId 不匹配并直接退出。
+void MainWindow::invalidateDecodeRun()
+{
+    ++m_runId;
+    m_ioInterrupt.store(1, std::memory_order_relaxed);
+    if (m_videoWorker)
+    {
+        QMetaObject::invokeMethod(m_videoWorker, "setContextRunId", Qt::DirectConnection,
+                                  Q_ARG(quint64, m_runId));
+    }
+}
+
+void MainWindow::queueDecode(quint64 runId)
+{
+    if (!m_videoWorker)
+        return;
+    m_ioInterrupt.store(0, std::memory_order_relaxed);
+    QMetaObject::invokeMethod(m_videoWorker, "doDecodeRun", Qt::QueuedConnection,
+                              Q_ARG(quint64, runId));
 }
 
 // 刷新画面区：
@@ -1015,8 +1143,215 @@ void MainWindow::clearContent()
     updatePlayPauseIcon();
 }
 
+// ============================================================
+// 打开失败的诊断与呈现（接口 v6）
+//
+// 修复前的行为：showVideo() 的每个失败分支只写一条 qWarning 然后 return -1，
+// 宿主拿到 false 后统一显示「插件无法显示该文件：audio.wav」。于是
+//   * 系统没有可用的音频输出设备（本机：扬声器未连接 / 被禁用）
+//   * 文件根本不是媒体文件、已被截断
+//   * 插件自带的 FFmpeg 不含该编码的解码器
+// 在界面上长得一模一样 —— 界面显示的信息是错的。
+// 现在每个出口都给出原因：一句话给宿主（状态栏），多行详细版留在画面区。
+// ============================================================
+
+int MainWindow::failOpen(const QString &sShortReason, const QString &sDetail)
+{
+    m_sLastError = sShortReason.trimmed();
+    m_sFailureDetail = m_sLastError;
+    if (!sDetail.isEmpty())
+        m_sFailureDetail += QLatin1Char('\n') + sDetail;
+    qWarning() << "[ShowVideo] 打开失败:" << m_sLastError
+               << (sDetail.isEmpty() ? QStringLiteral("") : QStringLiteral("| ") + sDetail);
+    clearFFmpegResources();
+    return -1;
+}
+
+void MainWindow::clearLastError()
+{
+    m_sLastError.clear();
+    m_sFailureDetail.clear();
+}
+
+void MainWindow::showFailurePage()
+{
+    const QString sText = m_sFailureDetail.trimmed().isEmpty() ? m_sLastError : m_sFailureDetail;
+    clearVideoPicture();
+    if (sText.isEmpty())
+        return;
+
+    // 画面区是黑底白字：第一行当标题，其余行当正文（文件信息 + 建议 + 技术细节）。
+    const QStringList lines = sText.split(QLatin1Char('\n'));
+    QString sHtml;
+    bool bFirst = true;
+    for (const QString &sLine : lines)
+    {
+        const QString s = sLine.trimmed().toHtmlEscaped();
+        if (s.isEmpty())
+            continue;
+        sHtml += bFirst ? QStringLiteral("<h3>%1</h3>").arg(s)
+                        : QStringLiteral("<p>%1</p>").arg(s);
+        bFirst = false;
+    }
+    ui->videoLabel->setWordWrap(true);
+    ui->videoLabel->setText(sHtml);
+}
+
+// 秒 -> 进度条/失败页共用的时间文本（不在这里做 locale 处理，保持 ASCII 冒号）
+qint64 MainWindow::probeDurationMs(AVFormatContext *pCtx, AVStream *vstream, AVStream *astream) const
+{
+    if (pCtx == nullptr)
+        return 0;
+
+    // 容器 -> 流 -> 按比特率/文件大小估算
+    qint64 nMs = (pCtx->duration > 0) ? (pCtx->duration / 1000) : 0;
+    AVStream *durStream = (vstream != nullptr) ? vstream : astream;
+    if (nMs <= 0 && durStream != nullptr && durStream->duration > 0)
+        nMs = (qint64)(durStream->duration * av_q2d(durStream->time_base) * 1000);
+    if (nMs <= 0 && pCtx->bit_rate > 0)
+    {
+        // 按路径打开时 FFmpeg 自建的是 pFormatCtx->pb，m_avioCtx 为 nullptr；
+        // 内存通道时 pFormatCtx->pb 就是 m_avioCtx。统一用 pb 两种通道都有效，
+        // 否则大文件按路径打开且容器无时长时会退化为兜底的 60000ms。
+        const int64_t nFileSize = (pCtx->pb != nullptr) ? avio_size(pCtx->pb) : -1;
+        if (nFileSize > 0)
+            nMs = (qint64)(nFileSize * 8.0 * 1000.0 / pCtx->bit_rate);
+    }
+    return nMs;
+}
+
+// 失败页用的文件信息：封装 / 音频编码 / 采样率 / 声道 / 大小 / 时长
+QString MainWindow::sourceSummary(AVFormatContext *pCtx, AVStream *astream) const
+{
+    if (pCtx == nullptr)
+        return QString();
+
+    QStringList parts;
+    if (pCtx->iformat != nullptr)
+    {
+        const char *pName = (pCtx->iformat->long_name != nullptr) ? pCtx->iformat->long_name
+                                                                  : pCtx->iformat->name;
+        if (pName != nullptr)
+            parts << QString::fromUtf8(pName);
+    }
+    if (astream != nullptr && astream->codecpar != nullptr)
+    {
+        parts << QString::fromUtf8(avcodec_get_name(astream->codecpar->codec_id));
+        if (astream->codecpar->sample_rate > 0)
+            parts << tr("%1 Hz").arg(astream->codecpar->sample_rate);
+        const int nCh = astream->codecpar->ch_layout.nb_channels;
+        if (nCh > 0)
+            parts << tr("%1 声道").arg(nCh);
+    }
+    const int64_t nSize = (pCtx->pb != nullptr) ? avio_size(pCtx->pb) : -1;
+    if (nSize > 0)
+        parts << tr("%1 MB").arg(nSize / 1024.0 / 1024.0, 0, 'f', 2);
+    const qint64 nDur = probeDurationMs(pCtx, nullptr, astream);
+    if (nDur > 0)
+        parts << tr("时长 %1").arg(formatClock(nDur));
+    return parts.join(QStringLiteral(" / "));
+}
+
+bool MainWindow::startAudioOutput(const QAudioFormat &fmt, AVStream *astream,
+                                  QString *psShort, QString *psDetail)
+{
+    Q_ASSERT(psShort != nullptr && psDetail != nullptr);
+    psShort->clear();
+    psDetail->clear();
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    // 先查设备再建 QAudioSink：没有默认设备时构造出来也只会给一个
+    // OpenError(1)，而"这台机器没有输出设备"和"设备打不开"该怎么处理完全不同。
+    const QAudioDevice dev = QMediaDevices::defaultAudioOutput();
+    if (dev.isNull())
+    {
+        diagnoseAudioFailure(fmt, kAudioNoDevice, astream, psShort, psDetail);
+        return false;
+    }
+    if (!dev.isFormatSupported(fmt))
+    {
+        diagnoseAudioFailure(fmt, kAudioFormatUnsupported, astream, psShort, psDetail);
+        return false;
+    }
+    audioOutput = new AudioOutputDevice(dev, fmt);
+#else
+    audioOutput = new AudioOutputDevice(fmt);
+#endif
+    audioOutput->setVolume(m_nVolume / 100.0f);
+    streamOut = audioOutput->start();
+    if (streamOut != nullptr)
+        return true;
+
+    const int nErr = int(audioOutput->error());
+    diagnoseAudioFailure(fmt, nErr, astream, psShort, psDetail);
+    // 启动失败的对象不能留着：state 停在 StoppedState，下次 start() 也不可用；
+    // 留着还会让 timeCallback 的条件判断误以为音频通道已就绪。
+    delete audioOutput;
+    audioOutput = nullptr;
+    streamOut = nullptr;
+    return false;
+}
+
+void MainWindow::diagnoseAudioFailure(const QAudioFormat &fmt, int nErr, AVStream *astream,
+                                      QString *psShort, QString *psDetail) const
+{
+    QString sReason;      // 一句话（statusBar / 宿主提示）
+    QStringList details;  // 多行：现象 + 文件信息 + 建议 + 技术细节
+    const QString sFileInfo = sourceSummary(pFormatCtx, astream);
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    const QList<QAudioDevice> outs = QMediaDevices::audioOutputs();
+    const QAudioDevice def = QMediaDevices::defaultAudioOutput();
+
+    if (nErr == kAudioNoDevice)
+    {
+        sReason = tr("系统中没有可用的音频输出设备");
+        details << tr("文件本身能正常解析（%1），问题出在系统的声音输出上。").arg(sFileInfo)
+                << tr("请连接耳机/扬声器，或在「Windows 设置 → 系统 → 声音」里启用一个输出设备，然后重新打开此文件。")
+                << tr("技术详情：系统报告 %1 个音频输出设备，默认输出设备为空；QAudioSink 未启动（QAudio::OpenError）。")
+                        .arg(outs.size());
+    }
+    else if (nErr == kAudioFormatUnsupported)
+    {
+        const QAudioFormat pref = def.preferredFormat();
+        sReason = tr("音频输出设备「%1」不支持 %2 Hz / %3 声道 / 16 位 PCM")
+                      .arg(def.description()).arg(fmt.sampleRate()).arg(fmt.channelCount());
+        details << tr("文件本身能正常解析（%1），问题出在音频格式与输出设备的匹配上。").arg(sFileInfo)
+                << tr("该设备的首选格式是 %1 Hz / %2 声道；播放器固定按 %3 Hz / %4 声道 / 16 位 PCM 输出。")
+                        .arg(pref.sampleRate()).arg(pref.channelCount())
+                        .arg(fmt.sampleRate()).arg(fmt.channelCount())
+                << tr("请在「Windows 设置 → 系统 → 声音」里把支持该格式的设备设为默认设备，或换一副耳机/扬声器后重新打开此文件。")
+                << tr("技术详情：QAudioDevice::isFormatSupported() 返回 false。");
+    }
+    else
+    {
+        sReason = tr("音频输出设备「%1」启动失败（QAudio::%2，错误码 %3）")
+                      .arg(def.isNull() ? tr("未知设备") : def.description())
+                      .arg(QString::fromLatin1(audioErrorName(nErr))).arg(nErr);
+        details << tr("文件本身能正常解析（%1），问题出在音频输出设备上。").arg(sFileInfo)
+                << tr("可能原因：设备被其它程序独占、设备已拔出、驱动异常，或 Windows 音频服务没有运行。")
+                << tr("可在「Windows 设置 → 系统 → 声音」里换一个输出设备后重新打开此文件。")
+                << tr("技术详情：QAudioSink::start() 返回空，error=%1（QAudio::%2）。")
+                        .arg(nErr).arg(QString::fromLatin1(audioErrorName(nErr)));
+    }
+#else
+    sReason = tr("音频输出设备启动失败（QAudio::%1，错误码 %2）")
+                  .arg(QString::fromLatin1(audioErrorName(nErr))).arg(nErr);
+    details << tr("文件本身能正常解析（%1），问题出在音频输出设备上。").arg(sFileInfo)
+            << tr("请检查系统声音输出设备是否已连接/启用后重新打开此文件。")
+            << tr("技术详情：QAudioOutput::start() 返回空，error=%1（QAudio::%2）。")
+                    .arg(nErr).arg(QString::fromLatin1(audioErrorName(nErr)));
+#endif
+
+    *psShort = sReason;
+    // failOpen() 会把 sReason 当作标题放在第一行，这里只追加正文，别重复一遍。
+    *psDetail = details.join(QLatin1Char('\n'));
+}
+
 bool MainWindow::stopPlaybackAndWait()
 {
+    // P0-4：先作废排队任务，再请求停止/等待，避免“停止确认后旧任务又跑起来”。
+    invalidateDecodeRun();
     // 宿主返回前必须确认 worker 已退出，否则不能 unmap 归档映射。
     if (m_videoWorker && !stopWorkerAndWait(2000))
     {
@@ -1042,6 +1377,9 @@ void MainWindow::stopPlayback()
 
 void MainWindow::clearFFmpegResources(bool force)
 {
+    // P0-4：先作废排队中的旧任务，再停止线程；否则 stop 确认后旧任务仍可能
+    // 读取即将释放的上下文。
+    invalidateDecodeRun();
     // 停止视频解码线程
     const bool stopped = stopWorkerAndWait(2000);
     if (!stopped && !force)
@@ -1101,19 +1439,26 @@ MainWindow::~MainWindow()
 {
     if (timer->isActive()) timer->stop();
 
-    // 1) 先请求 worker 退出 doDecode，确认它不再访问 FFmpeg 上下文后才能释放资源。
+    // P0-5：m_videoThread 现在没有父对象（构造时 new QThread()），由这里显式管理。
+    // 关键约束：**绝不能 delete 仍在运行的 QThread**（Qt 明确不支持，进程可能直接终止）。
+    invalidateDecodeRun();
     bool safelyStopped = true;
     if (m_videoWorker)
-    {
-        QMetaObject::invokeMethod(m_videoWorker, "requestStop", Qt::DirectConnection);
         safelyStopped = m_videoWorker->waitForDecodingStopped(3000);
-    }
 
     if (!safelyStopped)
     {
-        // worker 卡住且仍持有上下文的裸指针副本：释放资源或 delete worker 都会 UAF。
-        // 进程即将结束，宁可泄漏也不崩，交由操作系统回收。
-        qWarning() << "[Media] 解码线程未在 3s 内退出，跳过资源释放与 worker 删除";
+        // worker 卡住且仍持有上下文的裸指针副本：释放上下文、delete worker、
+        // delete QThread 三者都会 UAF / 导致进程终止。进程即将结束，全部保留
+        // （脱离父子关系，避免 QObject 析构间接触发删除）。
+        qWarning() << "[Media] 解码线程未在 3s 内退出：保留 worker/线程/上下文，不删除";
+        if (m_videoThread)
+        {
+            m_videoThread->setParent(nullptr);
+            m_videoThread = nullptr;
+        }
+        m_videoWorker = nullptr;
+        m_bCleanupPending = true;
         delete ui;
         return;
     }
@@ -1121,23 +1466,34 @@ MainWindow::~MainWindow()
     // force=true：析构后不再有后续播放，正常路径必须释放干净
     clearFFmpegResources(true);
 
-    // 2) 结束 QThread 事件循环
+    // 结束 QThread 事件循环；quit + wait 失败时同样不能 delete 线程。
+    bool threadStopped = true;
     if (m_videoThread && m_videoThread->isRunning())
     {
         m_videoThread->quit();
-        if (!m_videoThread->wait(3000))
+        threadStopped = m_videoThread->wait(3000);
+        if (!threadStopped)
         {
-            qWarning() << "[Media] QThread 未退出，跳过 worker 删除";
+            qWarning() << "[Media] QThread 事件循环未退出：保留线程与 worker，不删除";
+            m_videoThread->setParent(nullptr);
+            m_videoThread = nullptr;
             m_videoWorker = nullptr;
+            delete ui;
+            return;
         }
     }
 
-    // 3) worker 无 parent，线程已静止，显式回收；
-    //    m_videoThread 有 parent(this)，由 QObject 析构自动删除。
+    // 线程已静止，worker 与线程都可显式回收。
+    // （worker 无 parent；线程无 parent，必须在这里 delete，不能指望 QObject 析构。）
     if (m_videoWorker)
     {
         delete m_videoWorker;
         m_videoWorker = nullptr;
+    }
+    if (m_videoThread)
+    {
+        delete m_videoThread;
+        m_videoThread = nullptr;
     }
     delete ui;
 }
@@ -1287,6 +1643,8 @@ void MainWindow::on_stopBtn_clicked(void)
     const bool workerStopped = stopWorkerAndWait(2000);
     if (!workerStopped)
         qWarning() << "[Stop] 解码线程未在 2s 内退出，跳过 FFmpeg 上下文重置";
+    else
+        m_ioInterrupt.store(0, std::memory_order_relaxed);   // 下面的 av_seek_frame 不能被中断
 
     // 重置进度（worker 已停止，此时操作上下文安全）
     if (workerStopped && pFormatCtx)
@@ -1377,6 +1735,9 @@ void MainWindow::doSeek(qint64 ms)
         return;
     }
 
+    // 停止成功后解除中断标志：接下来的 av_seek_frame 不能被“停止”中断。
+    m_ioInterrupt.store(0, std::memory_order_relaxed);
+
     // stream_index = -1 时，av_seek_frame 期望时间戳单位为 AV_TIME_BASE (微秒)；
     // UI 是相对时间轴，容器 PTS 起点非 0 时要补上起始偏移。
     int64_t target_ts_us = (ms + m_nStartMs) * 1000;
@@ -1397,9 +1758,13 @@ void MainWindow::doSeek(qint64 ms)
     {
         // 递增播放世代，使 seek 前的旧帧信号被 onFrameDecoded / onAudioPtsUpdated 过滤掉
         QMetaObject::invokeMethod(m_videoWorker, "updateGenId", Qt::DirectConnection, Q_ARG(int, genId));
+        // P0-4：seek 也是一次新的播放世代（新的 runId），旧排队任务立即失效
+        ++m_runId;
+        QMetaObject::invokeMethod(m_videoWorker, "setContextRunId", Qt::DirectConnection,
+                                  Q_ARG(quint64, m_runId));
         QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
         QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
-        QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);
+        queueDecode(m_runId);
         timer->start(20);
     };
 
@@ -1517,6 +1882,9 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     if (byPath.isEmpty() && (szFileData == nullptr || nFileLen <= 0))
         return -1;
 
+    // v6：新的打开尝试开始，先丢掉上一次的失败原因，避免宿主读到陈旧说明
+    clearLastError();
+
     if (timer->isActive()) timer->stop();
 
     // 提前递增播放世代：本次打开之前排队在 UI 线程事件队列里的旧帧信号
@@ -1530,7 +1898,11 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     {
         // 上一次的解码线程尚未退出，FFmpeg 上下文仍被 worker 引用；
         // 此刻不能覆盖指针，否则既泄漏又可能 UAF。等 decodingFinished 补做清理。
-        qWarning() << "[ShowVideo] 上一个解码线程仍在停止中，暂不打开新文件";
+        // 失败同样要有原因（v6）：这属于"稍后再试"，不是"文件有问题"。
+        m_sLastError = tr("上一个文件的解码线程尚未退出，暂时无法打开新文件");
+        m_sFailureDetail = m_sLastError + QLatin1Char('\n')
+                + tr("请稍等一两秒后重新打开该文件。");
+        qWarning() << "[ShowVideo]" << m_sLastError;
         return -1;
     }
 
@@ -1543,11 +1915,12 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     pFormatCtx = avformat_alloc_context();
     if (!pFormatCtx)
-    {
-        qWarning() << "[ShowVideo] avformat_alloc_context 失败.";
-        clearFFmpegResources();
-        return -1;
-    }
+        return failOpen(tr("内存不足，无法创建媒体解析上下文"));
+    // P1-18：给打开/探测阶段装上中断回调。stop/换文件时 m_ioInterrupt 置 1，
+    // 阻塞中的 avformat_open_input / find_stream_info 会尽快返回而不是一直卡住。
+    pFormatCtx->interrupt_callback.callback = fwIoInterruptCallback;
+    pFormatCtx->interrupt_callback.opaque = &m_ioInterrupt;
+    m_ioInterrupt.store(0, std::memory_order_relaxed);
 
     if (byPath.isEmpty())
     {
@@ -1565,11 +1938,7 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
             // 将传入的数据拷贝为独立的内存数据源
             m_avioBuffer = (unsigned char *)av_malloc(nFileLen);
             if (!m_avioBuffer)
-            {
-                qWarning() << "[ShowVideo] AVIO buffer allocation failed.";
-                clearFFmpegResources();
-                return -1;
-            }
+                return failOpen(tr("内存不足，无法分配媒体读取缓冲（%1 字节）").arg(nFileLen));
             memcpy(m_avioBuffer, szFileData, nFileLen);
             m_memIO.data = m_avioBuffer;
             m_memIO.size = nFileLen;
@@ -1582,51 +1951,41 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         const int avioBufSize = 64 * 1024;
         m_avioInternalBuffer = (unsigned char *)av_malloc(avioBufSize);
         if (!m_avioInternalBuffer)
-        {
-            qWarning() << "[ShowVideo] AVIO read buffer allocation failed.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("内存不足，无法分配媒体读取缓冲区"));
         m_avioCtx = avio_alloc_context(m_avioInternalBuffer, avioBufSize, 0,
                                        &m_memIO, &memIORead, nullptr, &memIOSeek);
         if (!m_avioCtx)
         {
-            qWarning() << "[ShowVideo] AVIO context allocation failed.";
             // 创建失败时 AVIOContext 尚未接管 buffer，需要自行释放
             av_freep(&m_avioInternalBuffer);
-            clearFFmpegResources();
-            return -1;
+            return failOpen(tr("无法创建媒体读取上下文（内存不足）"));
         }
         m_avioCtx->seekable = AVIO_SEEKABLE_NORMAL;
         pFormatCtx->pb = m_avioCtx;
         // 标记自定义 IO：avformat_close_input 将不负责释放 pb，
         // 由我们手动 avio_context_free 释放，避免双重释放导致崩溃。
         pFormatCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
-        if (avformat_open_input(&pFormatCtx, nullptr, nullptr, nullptr) != 0)
-        {
-            qWarning() << "[ShowVideo] 无法打开输入流.";
-            clearFFmpegResources();
-            return -1;
-        }
+        const int nOpenRet = avformat_open_input(&pFormatCtx, nullptr, nullptr, nullptr);
+        if (nOpenRet < 0)
+            return failOpen(tr("无法识别该文件的媒体格式：%1").arg(avErrText(nOpenRet)),
+                            tr("文件可能已损坏、被截断，或使用了当前不支持的封装格式。"));
     }
     else
     {
         // —— 大文件路径通道：FFmpeg 直接按文件流式读取，无需把数 GB 内容读入内存 ——
         const QByteArray pathUtf8 = byPath.toUtf8();
-        if (avformat_open_input(&pFormatCtx, pathUtf8.constData(), nullptr, nullptr) != 0)
-        {
-            qWarning() << "[ShowVideo] 无法打开输入文件:" << byPath;
-            clearFFmpegResources();
-            return -1;
-        }
+        const int nOpenRet = avformat_open_input(&pFormatCtx, pathUtf8.constData(), nullptr, nullptr);
+        if (nOpenRet < 0)
+            return failOpen(tr("无法打开媒体文件 %1：%2").arg(QFileInfo(byPath).fileName(), avErrText(nOpenRet)),
+                            tr("文件可能已损坏、被截断，或使用了当前不支持的封装格式。"));
     }
 
-    if (avformat_find_stream_info(pFormatCtx, nullptr) < 0)
-    {
-        qWarning() << "[ShowVideo] 媒体流获取失败.";
-        clearFFmpegResources();
-        return -1;
-    }
+    const int nInfoRet = avformat_find_stream_info(pFormatCtx, nullptr);
+    if (nInfoRet < 0)
+        return failOpen(tr("无法读取媒体流信息：%1").arg(avErrText(nInfoRet)),
+                        tr("文件头之后的内容无法解析，文件可能已损坏或被截断。没找到可播放的音频/视频流。\n"
+                           "这次解析了 %1 个流，但没有任何一个能确定参数。")
+                            .arg(pFormatCtx ? pFormatCtx->nb_streams : 0));
 
     // 用 av_find_best_stream 选择默认/最佳视频与音频流（比首个匹配更稳健）
     AVStream *vstream = nullptr, *astream = nullptr;
@@ -1639,11 +1998,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     // 视频与音频至少要有一种流才能播放（支持纯视频 / 纯音频 / 音视频都有）
     if (videoindex < 0 && audioindex < 0)
-    {
-        qWarning() << "[ShowVideo] 找不到视频或音频流.";
-        clearFFmpegResources();
-        return -1;
-    }
+        return failOpen(tr("文件里没有可播放的音频或视频流"),
+                        tr("解析成功，但只找到字幕/封面/数据流。这个查看器只播放音频与视频。"));
     m_bAudioOnly = (videoindex < 0);
 
     // 流信息确定后再次刷新画面区：纯音频文件没有视频流，画面区应显示提示文字，
@@ -1665,9 +2021,17 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         fmt.setByteOrder(QAudioFormat::LittleEndian);
         fmt.setSampleType(QAudioFormat::SignedInt);
 #endif
-        audioOutput = new AudioOutputDevice(fmt);
-        audioOutput->setVolume(m_nVolume / 100.0f);
-        streamOut = audioOutput->start();
+        // P1-20：设备启动失败必须可见且**说明真实原因**。纯音频文件没有声音
+        // 就等于「打不开」，不能显示成正在播放；带视频文件可以无声降级，
+        // 但要在状态栏说清楚是"这台机器没有输出设备"还是"文件有问题"。
+        QString sAudioWhy, sAudioDetail;
+        if (!startAudioOutput(fmt, astream, &sAudioWhy, &sAudioDetail))
+        {
+            if (videoindex < 0)
+                return failOpen(sAudioWhy, sAudioDetail);
+            qWarning() << "[ShowVideo] 音频输出不可用，降级为无声播放:" << sAudioWhy;
+            statusBar()->showMessage(tr("音频输出不可用：%1 —— 将以无声方式播放。").arg(sAudioWhy), 12000);
+        }
     }
 
     // ========== 视频解码（仅当存在视频流时）==========
@@ -1675,11 +2039,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     {
         pCodecCtx = avcodec_alloc_context3(nullptr);
         if (!pCodecCtx || avcodec_parameters_to_context(pCodecCtx, vstream->codecpar) < 0)
-        {
-            qWarning() << "[ShowVideo] 视频解码器上下文初始化失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("视频解码器初始化失败（内存不足或流参数异常，codec_id=%1）")
+                                .arg(vstream->codecpar ? vstream->codecpar->codec_id : 0));
 
         // 解码包的时间基必须与所属流一致。libavcodec 用 pkt_timebase 把
         // skip_samples / discard_padding（MP3 LAME/Xing、AAC priming、Opus pre-skip
@@ -1697,17 +2058,13 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
         const AVCodec *videoCodec = avcodec_find_decoder(pCodecCtx->codec_id);
         if (!videoCodec)
-        {
-            qWarning() << "[ShowVideo] 找不到视频解码器.";
-            clearFFmpegResources();
-            return -1;
-        }
-        if (avcodec_open2(pCodecCtx, videoCodec, nullptr) < 0)
-        {
-            qWarning() << "[ShowVideo] 打开视频解码器失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("找不到可用的视频解码器：%1").arg(QString::fromUtf8(avcodec_get_name(pCodecCtx->codec_id))),
+                            tr("当前插件自带的 FFmpeg 不含该编码的解码器。"));
+        const int nVCodecRet = avcodec_open2(pCodecCtx, videoCodec, nullptr);
+        if (nVCodecRet < 0)
+            return failOpen(tr("视频解码器无法打开：%1").arg(avErrText(nVCodecRet)),
+                            tr("解码器：%1").arg(QString::fromUtf8(videoCodec->long_name ? videoCodec->long_name
+                                                                                       : videoCodec->name)));
     }
 
     // ========== 音频解码（仅当存在音频流时）==========
@@ -1715,28 +2072,21 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     {
         aCodecCtx = avcodec_alloc_context3(nullptr);
         if (!aCodecCtx || avcodec_parameters_to_context(aCodecCtx, astream->codecpar) < 0)
-        {
-            qWarning() << "[ShowVideo] 音频解码器上下文初始化失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("音频解码器初始化失败（内存不足或流参数异常，codec_id=%1）")
+                                .arg(astream->codecpar ? astream->codecpar->codec_id : 0));
 
         // 同视频解码器：不设置 pkt_timebase 会让 gapless 跳过样本无法修正 PTS
         aCodecCtx->pkt_timebase = astream->time_base;
 
         const AVCodec *audioCodec = avcodec_find_decoder(aCodecCtx->codec_id);
         if (!audioCodec)
-        {
-            qWarning() << "[ShowVideo] 找不到音频解码器.";
-            clearFFmpegResources();
-            return -1;
-        }
-        if (avcodec_open2(aCodecCtx, audioCodec, nullptr) < 0)
-        {
-            qWarning() << "[ShowVideo] 打开音频解码器失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("找不到可用的音频解码器：%1").arg(QString::fromUtf8(avcodec_get_name(aCodecCtx->codec_id))),
+                            tr("当前插件自带的 FFmpeg 不含该编码的解码器。"));
+        const int nACodecRet = avcodec_open2(aCodecCtx, audioCodec, nullptr);
+        if (nACodecRet < 0)
+            return failOpen(tr("音频解码器无法打开：%1").arg(avErrText(nACodecRet)),
+                            tr("解码器：%1").arg(QString::fromUtf8(audioCodec->long_name ? audioCodec->long_name
+                                                                                         : audioCodec->name)));
     }
 
     byteBuf.clear();
@@ -1746,19 +2096,11 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     {
         pFrame = av_frame_alloc();
         if (!pFrame)
-        {
-            qWarning() << "[ShowVideo] 视频帧内存分配失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("内存不足，无法分配视频解码帧"));
     }
     pAudioFrame = av_frame_alloc();
     if (!pAudioFrame)
-    {
-        qWarning() << "[ShowVideo] 音频帧内存分配失败.";
-        clearFFmpegResources();
-        return -1;
-    }
+        return failOpen(tr("内存不足，无法分配音频解码帧"));
 
     // 音频重采样设置（仅在有音频流时）
     out_sample_rate = AUDIO_OUT_SAMPLE_RATE;
@@ -1814,11 +2156,7 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         audio_out_buffer = (uint8_t *)av_malloc(
             av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS, audio_out_samples_max, AUDIO_OUT_FORMAT, 1));
         if (!audio_out_buffer)
-        {
-            qWarning() << "[ShowVideo] 音频输出缓冲分配失败.";
-            clearFFmpegResources();
-            return -1;
-        }
+            return failOpen(tr("内存不足，无法分配音频输出缓冲"));
     }
 
     // === 计算视频输出尺寸（保持宽高比，仅视频文件） ===
@@ -1837,21 +2175,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
     }
 
     // 总时长(毫秒)：容器 -> 流 -> 按比特率/文件大小估算 -> 兜底
-    m_nDurationMs = 0;
-    if (pFormatCtx->duration > 0)
-        m_nDurationMs = pFormatCtx->duration / 1000;
-    AVStream *durStream = (videoindex >= 0) ? vstream : astream;
-    if (m_nDurationMs <= 0 && durStream && durStream->duration > 0)
-        m_nDurationMs = (qint64)(durStream->duration * av_q2d(durStream->time_base) * 1000);
-    if (m_nDurationMs <= 0 && pFormatCtx->bit_rate > 0)
-    {
-        // 按路径打开时 FFmpeg 自建的是 pFormatCtx->pb，m_avioCtx 为 nullptr；
-        // 内存通道时 pFormatCtx->pb 就是 m_avioCtx。统一用 pb 两种通道都有效，
-        // 否则大文件按路径打开且容器无时长时会退化为兜底的 60000ms。
-        int64_t fileSize = avio_size(pFormatCtx->pb);
-        if (fileSize > 0)
-            m_nDurationMs = (qint64)(fileSize * 8.0 * 1000.0 / pFormatCtx->bit_rate);
-    }
+    // 与失败页共用 probeDurationMs()，避免两处算法漂移。
+    m_nDurationMs = probeDurationMs(pFormatCtx, vstream, astream);
     if (m_nDurationMs <= 0) m_nDurationMs = 60000;
     qDebug() << "[ShowVideo] 总时长(ms) = " << m_nDurationMs;
 
@@ -1886,6 +2211,9 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
 
     // 播放世代已在函数开头递增过（用于让上一文件排队中的帧信号失效），
     // 此处直接把当前世代交给 worker，使新帧的 genId 与 m_genCounter 一致。
+    // P0-4：同时分配新的 runId —— 上下文、排队任务、停止等待都绑定到它。
+    ++m_runId;
+    m_ioInterrupt.store(0, std::memory_order_relaxed);
     m_videoWorker->setContexts(pFormatCtx,
                                pCodecCtx, videoindex,
                                aCodecCtx, audioindex,
@@ -1896,7 +2224,8 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
                                swr_ctx, audio_out_buffer,
                                &m_audioMutex, &byteBuf, out_sample_rate,
                                m_genCounter,
-                               audio_out_samples_max);
+                               audio_out_samples_max,
+                               m_runId);
 
     // 请求解码线程按目标尺寸输出（setContexts 已清空旧请求，必须在其之后调用）。
     // 之后窗口缩放时由 updateVideoOutputSize() 再次请求新尺寸。
@@ -1906,8 +2235,9 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
         m_videoWorker->requestOutputSize(outW, outH);
     }
 
-    // 启动视频解码线程（异步）
-    QMetaObject::invokeMethod(m_videoWorker, "doDecode", Qt::QueuedConnection);
+    // 启动视频解码线程（异步）。queueDecode 会把当前 runId 交给任务，
+    // 过期任务在入口即被 worker 丢弃。
+    queueDecode(m_runId);
 
     // 启动定时器（用于音频播放 + UI 更新）
     timer->start(20);

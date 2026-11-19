@@ -1,0 +1,7 @@
+本目录存放主题用到的小图标。
+
+当前只有标签页关闭按钮的两个 XPM（close_light.xpm / close_light_hover.xpm）：
+XPM 是纯文本图片格式，Qt 内建解码器直接支持，因此不需要为 100%/125%/150% 分别准备 @2x 位图，
+也能跟着 light.qss 一起打进 qrc（前缀 /theme/icons）。
+
+后续做深色模式（P1-6）时，把深色版图标放在这里，并在 dark.qss 里用 :/theme/icons/... 引用。

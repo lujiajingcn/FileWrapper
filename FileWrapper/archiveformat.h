@@ -43,8 +43,32 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QStorageInfo>
+#include <QCoreApplication>   // fileDialogFilter() 用 translate（命名空间里没有 tr()）
 
 namespace FwArc {
+
+// 归档的专属后缀：与文件头魔数 "FWDA" 同名，避免 .dat 这种通配后缀带来的混淆。
+// 识别归档始终靠魔数（见 parseFromDevice），后缀只影响对话框过滤与人的判断。
+static const char *const FILE_SUFFIX = ".fwda";
+static const char *const LEGACY_SUFFIX = ".dat";   // v2 之前/早期版本用的后缀
+
+// 「加载 / 另存为 / 拆分」三个对话框共用的文件过滤器。
+// 新后缀在前，旧的 .dat 继续列出：老归档不用改名也仍然能在对话框里看到，
+// 否则会出现「另存成了 .fwda，但加载框只认 *.dat，找不到文件」。
+inline QString fileDialogFilter()
+{
+    return QCoreApplication::translate(
+        "FwArc", "FileWrapper 归档 (*.fwda *.dat);;All Files (*.*)");
+}
+
+// 文件名是否看起来是归档（只看后缀，用于界面提示；
+// 真正判定归档用的是文件头魔数）
+inline bool hasArchiveSuffix(const QString &sPath)
+{
+    const QString sLower = sPath.toLower();
+    return sLower.endsWith(QLatin1String(FILE_SUFFIX))
+           || sLower.endsWith(QLatin1String(LEGACY_SUFFIX));
+}
 
 static const char MAGIC[4] = {'F', 'W', 'D', 'A'};
 static const quint32 VERSION_V1       = 1;
@@ -175,7 +199,14 @@ inline bool isAbsolutePath(const QString &p)
     return false;
 }
 
-// 严格 UTF-8 合法性校验
+// 严格 UTF-8 合法性校验（P2-2）
+//
+// 只做「字节序列是否合法 UTF-8」的判断，不做替换。必须完整拒绝：
+//   * 三/四字节 overlong（E0 80..9F、F0 80..8F）；
+//   * UTF-16 代理区（ED A0..BF）与大于 U+10FFFF 的码点（F4 90..BF 及以上）；
+//   * 截断序列与 5/6 字节历史形式。
+// 旧实现只检查「后续字节高两位是 10」，会把上述非法序列当成合法 UTF-8，
+// 随后被 Qt 替换成 U+FFFD，造成名称混淆（归档路径、文本预览共用同一判据）。
 inline bool isValidUtf8(const QByteArray &data)
 {
     const unsigned char *p = reinterpret_cast<const unsigned char *>(data.constData());
@@ -183,33 +214,74 @@ inline bool isValidUtf8(const QByteArray &data)
     qsizetype i = 0;
     while (i < n) {
         const unsigned char c = p[i];
-        int extra = 0;
         if (c < 0x80) { ++i; continue; }
-        else if ((c & 0xE0) == 0xC0) { extra = 1; if (c < 0xC2) return false; }
-        else if ((c & 0xF0) == 0xE0) extra = 2;
-        else if ((c & 0xF8) == 0xF0) { extra = 3; if (c > 0xF4) return false; }
-        else return false;
-        if (i + extra >= n) return false;
-        for (int k = 1; k <= extra; ++k)
+
+        int extra = 0;
+        unsigned char lo = 0x80, hi = 0xBF;   // 第二字节允许范围
+        if ((c & 0xE0) == 0xC0)      { extra = 1; if (c < 0xC2) return false; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2;
+            if (c == 0xE0) lo = 0xA0;          // 拒绝 overlong
+            if (c == 0xED) hi = 0x9F; }        // 拒绝 UTF-16 代理
+        else if ((c & 0xF8) == 0xF0) { extra = 3;
+            if (c > 0xF4) return false;        // > U+10FFFF
+            if (c == 0xF0) lo = 0x90;          // 拒绝 overlong
+            if (c == 0xF4) hi = 0x8F; }        // 到 U+10FFFF 为止
+        else return false;                     // 0xF8..0xFF / 孤立的续字节
+
+        if (i + extra >= n) return false;      // 截断
+        if (p[i + 1] < lo || p[i + 1] > hi) return false;
+        for (int k = 2; k <= extra; ++k)
             if ((p[i + k] & 0xC0) != 0x80) return false;
         i += extra + 1;
     }
     return true;
 }
 
+// Windows 保留设备名（P1-11）：按「去掉尾部空格/点、截到第一个点」后的基名判断。
+// 旧实现只用在最后一段，且不处理 "CON." / "CON " / "COM1.txt" 之后的变体，
+// 结果是中间目录叫 CON 或段名带尾随点/空格时仍能通过校验，写出后无法再创建。
 inline bool isReservedDeviceName(const QString &baseName)
 {
     QString b = baseName;
-    const int dot = b.indexOf('.');
+    while (b.endsWith(QLatin1Char('.')) || b.endsWith(QLatin1Char(' ')))
+        b.chop(1);
+    const int dot = b.indexOf(QLatin1Char('.'));
     if (dot >= 0) b = b.left(dot);
     b = b.trimmed().toUpper();
+    if (b.isEmpty()) return false;
     static const QStringList names = { "CON", "PRN", "AUX", "NUL",
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" };
     return names.contains(b);
 }
 
-// 相对路径安全性检查：拒绝绝对路径、.. 回溯、非法字符、控制字符、设备名
+// 单个路径段是否可作为 Windows 文件名（P1-11）。
+// 归档内的路径段最终都会落到磁盘，必须在写归档/导出/分割之前统一收紧：
+//   * 拒绝 "." / ".."、空段、控制字符、< > : " | ? * \、NUL；
+//   * 拒绝尾随点/空格（资源管理器会静默改名，后续按原路径已找不到）；
+//   * 拒绝任何一段使用保留设备名（含 "CON."、"COM1 " 这类变体）；
+//   * 拒绝超过 255 个 UTF-16 单元的段（NTFS 单段上限）。
+inline bool isSafePathSegment(const QString &seg, QString *err = nullptr)
+{
+    auto fail = [err](const QString &m) { if (err) *err = m; return false; };
+    if (seg.isEmpty()) return fail(QStringLiteral("路径含空段"));
+    if (seg == "." || seg == "..") return fail(QStringLiteral("路径含 '.' 或 '..' 段"));
+    if (seg.size() > 255) return fail(QStringLiteral("路径段过长: %1").arg(seg.left(40)));
+    if (seg.contains(QChar(0))) return fail(QStringLiteral("路径含 NUL 字符"));
+    static const QString illegal = QStringLiteral("<>:\"|?*\\");
+    for (int i = 0; i < seg.size(); ++i) {
+        const QChar ch = seg.at(i);
+        if (ch.unicode() < 32) return fail(QStringLiteral("路径含控制字符"));
+        if (illegal.contains(ch)) return fail(QStringLiteral("路径含非法字符"));
+    }
+    if (seg.endsWith(QLatin1Char('.')) || seg.endsWith(QLatin1Char(' ')))
+        return fail(QStringLiteral("路径段不能以点或空格结尾: %1").arg(seg.left(40)));
+    if (isReservedDeviceName(seg))
+        return fail(QStringLiteral("路径使用系统保留设备名: %1").arg(seg));
+    return true;
+}
+
+// 相对路径安全性检查：逐段走 isSafePathSegment，拒绝绝对路径与回溯
 inline bool isSafeRelativePath(const QString &rel, QString *err = nullptr)
 {
     auto fail = [err](const QString &m) { if (err) *err = m; return false; };
@@ -219,18 +291,43 @@ inline bool isSafeRelativePath(const QString &rel, QString *err = nullptr)
     if (rel.contains(QChar(0))) return fail(QStringLiteral("路径含 NUL 字符"));
 
     const QString s = normalizePath(rel);
-    const QStringList segs = s.split('/', Qt::SkipEmptyParts);
+    const QStringList segs = s.split(QLatin1Char('/'), Qt::SkipEmptyParts);
     if (segs.isEmpty()) return fail(QStringLiteral("路径为空"));
-    static const QString illegal = QStringLiteral("<>:\"|?*\\");
     for (const QString &seg : segs) {
-        if (seg == "." || seg == "..") return fail(QStringLiteral("路径含 '.' 或 '..' 段"));
-        for (int i = 0; i < illegal.size(); ++i)
-            if (seg.contains(illegal.at(i))) return fail(QStringLiteral("路径含非法字符"));
-        for (int i = 0; i < seg.size(); ++i)
-            if (seg.at(i).unicode() < 32) return fail(QStringLiteral("路径含控制字符"));
+        QString why;
+        if (!isSafePathSegment(seg, &why)) return fail(why);
     }
-    if (isReservedDeviceName(segs.last())) return fail(QStringLiteral("路径使用系统保留设备名"));
     return true;
+}
+
+// ============================================================
+// 统一的 checked 尺寸运算（P1-11）
+//
+// 归档头部里的大小/偏移都是 quint64，而 Qt 容器与 API 使用 qint64/qsizetype。
+// 直接累加或强制转换在 32 位构建、或伪造的超大长度下会回绕，进而出现
+// 「小分配 + 大读取」或负偏移。所有跨类型运算集中走这里。
+// ============================================================
+inline bool checkedAdd64(qint64 a, qint64 b, qint64 *pOut)
+{
+    if (pOut == nullptr) return false;
+    if (b > 0 && a > (std::numeric_limits<qint64>::max)() - b) return false;
+    if (b < 0 && a < (std::numeric_limits<qint64>::min)() - b) return false;
+    *pOut = a + b;
+    return true;
+}
+
+inline bool checkedAddU64(quint64 a, quint64 b, quint64 *pOut)
+{
+    if (pOut == nullptr) return false;
+    if (a > (std::numeric_limits<quint64>::max)() - b) return false;
+    *pOut = a + b;
+    return true;
+}
+
+// 能否安全地从 quint64 长度转换成 qsizetype（内存块/QByteArray 尺寸）。
+inline bool fitsInQsizetype(quint64 v)
+{
+    return v <= quint64((std::numeric_limits<qsizetype>::max)());
 }
 
 // 把任意路径改造成安全的相对路径

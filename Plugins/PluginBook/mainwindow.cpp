@@ -100,6 +100,15 @@ static bool expandZipEntries(ZipReader &reader, QMap<QString, QByteArray> &entri
 // 读取完成后由 showBook()/loadChapter() 统一显示提示。
 static const char kTruncatedProperty[]        = "fwBookTruncated";
 static const char kTruncatedReasonsProperty[] = "fwBookTruncatedReasons";
+// P2-12：MOBI 临时文件创建 / 本地编码路径 / libmobi 加载失败的具体原因。
+// 同样挂在动态属性上，由 showBook() 的失败提示统一带出，避免 qWarning 之后
+// 界面只剩一句笼统的“解析失败”。
+static const char kMobiErrorProperty[]        = "fwBookMobiError";
+
+static void setMobiError(QObject *owner, const QString &reason)
+{
+    owner->setProperty(kMobiErrorProperty, reason);
+}
 
 static void resetTruncation(QObject *owner)
 {
@@ -190,7 +199,9 @@ static QList<QMap<QString, QString>> findTagsLimited(const QString &xml, const Q
     // (?:<|:) 允许命名空间前缀；(?=[>\s/]) 防止把 title-info 误判为 title
     QString pat = "(?:<|:)" + QRegularExpression::escape(tag) + "(?=[>\\s/])([^>]*)";
     QRegularExpression re(pat, QRegularExpression::CaseInsensitiveOption);
-    QRegularExpression are("([\\w:-]+)\\s*=\\s*\"([^\"]*)\"");
+    // P2-11：属性值可能用单引号（部分 OPF/container.xml 生成器如此），
+    // 双引号和单引号都要接受；captured(2)=双引号内容，captured(3)=单引号内容。
+    QRegularExpression are("([\\w:-]+)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')");
     QRegularExpressionMatchIterator it = re.globalMatch(xml);
     while (it.hasNext())
     {
@@ -207,7 +218,7 @@ static QList<QMap<QString, QString>> findTagsLimited(const QString &xml, const Q
         while (ait.hasNext())
         {
             QRegularExpressionMatch am = ait.next();
-            amap[am.captured(1)] = am.captured(2);
+            amap[am.captured(1)] = am.hasCaptured(2) ? am.captured(2) : am.captured(3);
         }
         res.append(amap);
     }
@@ -324,6 +335,7 @@ MainWindow::~MainWindow()
 void MainWindow::reset()
 {
     resetTruncation(this);
+    setProperty(kMobiErrorProperty, QString());   // P2-12：换书时清掉上一次的 MOBI 失败原因
     m_entries.clear();
     m_fb2Images.clear();
     m_chapterHtml.clear();
@@ -406,6 +418,11 @@ void MainWindow::showBook(char *szBuf, qint64 nFileLen)
     if (!ok)
     {
         QString msg = QStringLiteral("解析电子书失败，文件可能已损坏或不是受支持的格式。");
+        // P2-12：MOBI 分支的具体失败原因（临时文件/编码/libmobi 错误码）一并显示，
+        // 不再只有 qWarning 里可见。
+        const QString mobiError = property(kMobiErrorProperty).toString();
+        if (!mobiError.isEmpty())
+            msg += QStringLiteral("\n\n") + mobiError;
         const QString tip = truncationTip(this);
         if (!tip.isEmpty()) msg += QStringLiteral("\n\n") + tip;
         showMessage(msg);
@@ -694,22 +711,59 @@ bool MainWindow::loadMobi(const QByteArray &data)
     // 被下一次加载复用。QUuid 只用于消歧，不承担安全随机性。
     const QString tmpPath = QDir::temp().absoluteFilePath(
         QStringLiteral("fw_mobi_%1.mobi").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
+
+    // P2-12：临时文件在函数所有退出路径上都要删除（包括后面 libmobi 失败、
+    // 内存不足等分支），用 RAII 兜底，避免残留垃圾文件。
+    struct TempFileGuard
+    {
+        QString path;
+        ~TempFileGuard() { if (!path.isEmpty()) QFile::remove(path); }
+    } tempGuard{tmpPath};
+
     {
         QFile tf(tmpPath);
-        if (!tf.open(QIODevice::WriteOnly | QIODevice::NewOnly) || tf.write(data) != data.size())
+        if (!tf.open(QIODevice::WriteOnly | QIODevice::NewOnly))
         {
-            tf.remove();
+            qWarning() << "[PluginBook] 无法创建 MOBI 临时文件:" << tmpPath << tf.errorString();
+            setMobiError(this, QStringLiteral("无法创建 MOBI 解析所需的临时文件：%1").arg(tf.errorString()));
             return false;
+        }
+        if (tf.write(data) != data.size())
+        {
+            qWarning() << "[PluginBook] 写入 MOBI 临时文件失败:" << tmpPath << tf.errorString();
+            setMobiError(this, QStringLiteral("写入 MOBI 临时文件失败：%1").arg(tf.errorString()));
+            return false;   // 临时文件由 tempGuard 删除
         }
         tf.close();
     }
 
-    MOBIData *m = mobi_init();
-    if (!m) { QFile::remove(tmpPath); return false; }
+    // libmobi 内部用 fopen() 读文件，只认本地 8 位编码的路径：
+    // 先确认转换结果可用，而不是把空路径/替换成 '?' 的路径交给库去静默失败。
+    const QByteArray localPath = tmpPath.toLocal8Bit();
+    if (localPath.isEmpty() || localPath.contains('\0'))
+    {
+        qWarning() << "[PluginBook] MOBI 临时文件路径无法转换为本地编码:" << tmpPath;
+        setMobiError(this, QStringLiteral("MOBI 临时文件路径含当前系统编码无法表示的字符，无法解析。"));
+        return false;
+    }
 
-    MOBI_RET ret = mobi_load_filename(m, tmpPath.toLocal8Bit().constData());
-    QFile::remove(tmpPath);
-    if (ret != MOBI_SUCCESS) { mobi_free(m); return false; }
+    MOBIData *m = mobi_init();
+    if (!m)
+    {
+        qWarning() << "[PluginBook] mobi_init() 失败（内存不足）";
+        setMobiError(this, QStringLiteral("MOBI 解析库初始化失败（内存不足）。"));
+        return false;
+    }
+
+    MOBI_RET ret = mobi_load_filename(m, localPath.constData());
+    if (ret != MOBI_SUCCESS)
+    {
+        qWarning() << "[PluginBook] mobi_load_filename() 失败, code =" << int(ret);
+        setMobiError(this, QStringLiteral("MOBI 文件加载失败（错误码 %1）：文件可能已损坏或被 DRM 保护。")
+                               .arg(int(ret)));
+        mobi_free(m);
+        return false;
+    }
 
     // 书名
     char *title = mobi_meta_get_title(m);

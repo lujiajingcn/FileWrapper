@@ -6,6 +6,8 @@
 #include <QFileInfo>
 #include <QStorageInfo>
 #include <QDateTime>
+#include <QElapsedTimer>
+#include <QRandomGenerator>
 #include <QSet>
 #include <algorithm>
 #include <cstring>
@@ -14,6 +16,214 @@
 #define MAXBUFFERSIZE (1024 * 1024 * 16)
 static const qint64 kCopyChunk = 1024 * 1024;      // 流式复制缓冲 1 MB
 static const qint64 kCrcChunk  = 1024 * 1024;      // 头部区校验缓冲
+// 进度事件最多每 100 ms 泵一次：文件 I/O 期间仍能刷新进度/响应取消，
+// 但把 processEvents() 带来的重入窗口压到原来的十分之一（P1-1）。
+static const qint64 kProgressPumpIntervalMs = 100;
+
+namespace {
+
+// P0-1：本次操作创建并独占的辅助文件。只清理由操作自己登记的文件，
+// 绝不预先删除一个「按固定规则推导出来、可能属于别人」的路径。
+struct OwnedAuxFiles
+{
+    QStringList paths;
+
+    void add(const QString &sPath)
+    {
+        if (!sPath.isEmpty() && !paths.contains(sPath))
+            paths.append(sPath);
+    }
+
+    void release(const QString &sPath) { paths.removeAll(sPath); }
+
+    void removeNow(const QString &sPath)
+    {
+        if (sPath.isEmpty()) return;
+        QFile::remove(sPath);
+        paths.removeAll(sPath);
+    }
+
+    ~OwnedAuxFiles()
+    {
+        for (const QString &sPath : paths)
+            if (!sPath.isEmpty())
+                QFile::remove(sPath);
+    }
+};
+
+QString randomToken()
+{
+    return QString::number(QRandomGenerator::global()->generate64(), 16)
+           + QStringLiteral("-")
+           + QString::number(QCoreApplication::applicationPid());
+}
+
+// 路径是否指向同一个文件（绝对路径 + canonical 双比较，兼容大小写/相对路径）
+bool sameFilePath(const QString &a, const QString &b)
+{
+    if (a.isEmpty() || b.isEmpty()) return false;
+    const QString aCanon = QFileInfo(a).canonicalFilePath();
+    const QString bCanon = QFileInfo(b).canonicalFilePath();
+    if (!aCanon.isEmpty() && !bCanon.isEmpty()
+        && aCanon.compare(bCanon, Qt::CaseInsensitive) == 0)
+        return true;
+    return QFileInfo(a).absoluteFilePath().compare(
+               QFileInfo(b).absoluteFilePath(), Qt::CaseInsensitive) == 0;
+}
+
+// 在目标目录中以「随机名 + NewOnly」原子创建临时文件，返回路径。
+// NewOnly 保证不会复用/截断一个已存在的路径（并发进程也抢不走同一个名字）。
+bool createUniqueTempFile(const QString &sTargetPath, QString &sTmpPath, QString &sErr)
+{
+    const QFileInfo fi(sTargetPath);
+    const QDir dir(fi.absolutePath());
+    if (!dir.exists())
+    {
+        sErr = QObject::tr("输出目录不存在：%1").arg(dir.absolutePath());
+        return false;
+    }
+
+    for (int i = 0; i < 16; ++i)
+    {
+        const QString sCandidate = dir.filePath(
+            QStringLiteral(".fwda-tmp-%1-%2").arg(randomToken()).arg(i));
+        QFile probe(sCandidate);
+        if (probe.open(QIODevice::ReadWrite | QIODevice::NewOnly))
+        {
+            probe.close();
+            sTmpPath = sCandidate;
+            return true;
+        }
+    }
+    sErr = QObject::tr("无法在输出目录创建唯一的临时文件：%1").arg(dir.absolutePath());
+    return false;
+}
+
+// 把现有目标文件移动到一个唯一备份名（随机 + NewOnly 语义）。
+// 不预先删除任何固定路径；失败时给出具体原因。
+bool moveToUniqueBackup(const QString &sTargetPath, QString &sBakPath, QString &sErr)
+{
+    for (int i = 0; i < 16; ++i)
+    {
+        const QString sCandidate = sTargetPath
+            + QStringLiteral(".bak-%1-%2").arg(randomToken()).arg(i);
+        if (QFileInfo::exists(sCandidate))
+            continue;
+        if (QFile::rename(sTargetPath, sCandidate))
+        {
+            sBakPath = sCandidate;
+            return true;
+        }
+        if (!QFileInfo::exists(sTargetPath))
+        {
+            sErr = QObject::tr("原文件在替换前已不存在：%1").arg(sTargetPath);
+            return false;
+        }
+    }
+    sErr = QObject::tr("无法为 %1 生成唯一的备份文件名（目录写入受限？）").arg(sTargetPath);
+    return false;
+}
+
+// 回滚：把备份换回目标路径。目标（新文件）先挪到唯一临时名再删除，
+// 避免「删新文件失败 → 备份也换不回去」的两难；失败时返回可照做的绝对路径。
+bool restoreFromBackup(const QString &sTargetPath, const QString &sBakPath,
+                       QString &sRollbackErr)
+{
+    QString sReplaced;
+    if (QFileInfo::exists(sTargetPath))
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            sReplaced = sTargetPath + QStringLiteral(".failed-%1-%2")
+                            .arg(randomToken()).arg(i);
+            if (QFileInfo::exists(sReplaced)) continue;
+            if (QFile::rename(sTargetPath, sReplaced)) break;
+            sReplaced.clear();
+        }
+        if (sReplaced.isEmpty())
+        {
+            sRollbackErr = QObject::tr("无法移走损坏的新文件：%1").arg(sTargetPath);
+            return false;
+        }
+    }
+
+    if (!QFile::rename(sBakPath, sTargetPath))
+    {
+        // 换不回去：至少把损坏的新文件放回原位并保留备份，用户仍可手动恢复
+        if (!sReplaced.isEmpty() && !QFileInfo::exists(sTargetPath))
+            QFile::rename(sReplaced, sTargetPath);
+        sRollbackErr = QObject::tr("无法把备份 %1 换回 %2")
+                           .arg(sBakPath, sTargetPath);
+        return false;
+    }
+
+    if (!sReplaced.isEmpty())
+        QFile::remove(sReplaced);
+    return true;
+}
+
+// P0-1：同一输出文件的跨进程写锁。
+//
+// 不用 QLockFile：它在受限权限/沙箱环境里会因 CreateFile 的附加权限请求失败
+// （QLockFile::PermissionError），把正常的保存全部挡死。这里用最保守的
+// 「NewOnly 原子创建 + 内容写 PID + 30 秒陈旧判定」实现同等语义：
+//   * 创建成功 = 拿到锁；
+//   * 已存在且未超过 30 秒 = 另一个实例正在写；
+//   * 超过 30 秒视为崩溃残留，删除后重试一次；
+//   * 环境连锁文件都建不了时按无锁继续（不能因为锁而让用户无法保存）。
+class OutputWriteLock
+{
+public:
+    bool acquire(const QString &sTargetPath, QString &sErr)
+    {
+        m_path = QFileInfo(sTargetPath).absoluteFilePath() + QStringLiteral(".fwdalock");
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            QFile f(m_path);
+            if (f.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+            {
+                f.write(QByteArray::number(qint64(QCoreApplication::applicationPid())));
+                f.close();
+                m_locked = true;
+                return true;
+            }
+            if (!QFileInfo::exists(m_path))
+            {
+                qWarning() << "[FileManager] 无法创建输出锁文件，按无锁继续:" << m_path
+                           << f.errorString();
+                return true;
+            }
+
+            const QFileInfo fi(m_path);
+            const qint64 nAgeMs = fi.lastModified().isValid()
+                ? fi.lastModified().msecsTo(QDateTime::currentDateTime())
+                : 0;
+            if (nAgeMs > 30000)
+            {
+                QFile::remove(m_path);   // 崩溃残留的陈旧锁
+                continue;
+            }
+            sErr = QObject::tr("另一个 FileWrapper 实例正在写入该文件，请稍后重试：%1")
+                       .arg(sTargetPath);
+            return false;
+        }
+        sErr = QObject::tr("无法获取输出写锁（锁文件已存在）：%1").arg(sTargetPath);
+        return false;
+    }
+
+    ~OutputWriteLock()
+    {
+        if (m_locked)
+            QFile::remove(m_path);
+    }
+
+private:
+    QString m_path;
+    bool    m_locked = false;
+};
+
+} // namespace
+
 
 // 「按原路径」时把归档 displayPath 还原为绝对路径：
 //   - 拒绝 "." / ".." 段，避免导出/分割写出归档指定目录之外；
@@ -345,9 +555,53 @@ bool FileManager::parseFile(const QString &sPath, FwArc::Meta &meta, QString &sE
     return parseFromDevice(f, meta, sErr);
 }
 
+// P1-1：每个操作使用自己的 QFile。以前 entryHead()/entryContent()/QGetFileContent()
+// 都复用 m_qFile，而 streamCopy() 又在循环里 processEvents()；重入时第二次 seek
+// 会把外层复制游标改到别的条目位置，v1 归档没有内容 CRC，错误字节会被静默写进
+// 新归档。独占句柄后，共享游标不再是正确性依赖。
+bool FileManager::openEntrySource(const QString &sFilePath, const FILEINFO &fi,
+                                  QFile &localFile, qint64 &srcPos, QString &sErr) const
+{
+    srcPos = 0;
+    if (m_setPendingFiles.contains(sFilePath))
+    {
+        localFile.setFileName(sFilePath);
+        if (!localFile.open(QIODevice::ReadOnly))
+        {
+            sErr = tr("读取新增文件失败：%1 (%2)").arg(sFilePath, localFile.errorString());
+            return false;
+        }
+        // P1-6：新增文件加入归档后被外部改写时，旧实现只复制缓存的旧长度前缀。
+        // 长度变化必须明确失败，而不是静默保存一个不完整的条目。
+        if (fi.nFileLen >= 0 && localFile.size() != fi.nFileLen)
+        {
+            sErr = tr("文件在加入归档后已发生变化（加入时 %1 B，当前 %2 B）：%3\n"
+                      "请删除该条目后重新添加。")
+                       .arg(fi.nFileLen).arg(localFile.size()).arg(sFilePath);
+            return false;
+        }
+        return true;
+    }
+
+    const QString sArchive = m_qFile.fileName();
+    if (sArchive.isEmpty() || !m_qFile.isOpen())
+    {
+        sErr = tr("归档文件未打开");
+        return false;
+    }
+    localFile.setFileName(sArchive);
+    if (!localFile.open(QIODevice::ReadOnly))
+    {
+        sErr = tr("打开归档失败：%1 (%2)").arg(sArchive, localFile.errorString());
+        return false;
+    }
+    srcPos = fi.nContentPositon;
+    return true;
+}
+
 bool FileManager::validateMergedFile(QString sFilePath)
 {
-    return validateMergedFile(sFilePath, nullptr);
+    return validateMergedFile(sFilePath, static_cast<QString *>(nullptr));
 }
 
 bool FileManager::validateMergedFile(QString sFilePath, QString *psErrMsg)
@@ -355,6 +609,18 @@ bool FileManager::validateMergedFile(QString sFilePath, QString *psErrMsg)
     FwArc::Meta meta;
     QString err;
     const bool ok = parseFile(sFilePath, meta, err);
+    if (psErrMsg) *psErrMsg = ok ? QString() : err;
+    if (!ok) setError(QStringLiteral("归档校验失败: %1").arg(err));
+    return ok;
+}
+
+// P1-9：校验与加载共用一次解析结果
+bool FileManager::validateMergedFile(QString sFilePath, FwArc::Meta *pMeta, QString *psErrMsg)
+{
+    FwArc::Meta meta;
+    QString err;
+    const bool ok = parseFile(sFilePath, meta, err);
+    if (ok && pMeta != nullptr) *pMeta = meta;
     if (psErrMsg) *psErrMsg = ok ? QString() : err;
     if (!ok) setError(QStringLiteral("归档校验失败: %1").arg(err));
     return ok;
@@ -416,31 +682,21 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
         ~TempFileGuard() { if (!keep) QFile::remove(path); }
     } tempGuard{sOutPath};
 
-    QFile *pSrc = nullptr;
-    QFile diskSrc;
+    // P1-1：本操作独占的源句柄（不使用共享的 m_qFile）
+    QFile localSrc;
     qint64 srcPos = 0;
-    if (m_setPendingFiles.contains(sDisplayName))
+    if (!openEntrySource(sDisplayName, fi, localSrc, srcPos, sErr))
     {
-        diskSrc.setFileName(sDisplayName);
-        if (!diskSrc.open(QIODevice::ReadOnly))
-        {
-            sErr = QStringLiteral("读取新增文件失败: %1 (%2)").arg(sDisplayName, diskSrc.errorString());
-            return false;
-        }
-        pSrc = &diskSrc;
-    }
-    else
-    {
-        if (!m_qFile.isOpen()) { sErr = QStringLiteral("归档文件未打开"); return false; }
-        pSrc = &m_qFile;
-        srcPos = fi.nContentPositon;
+        QFile::remove(sOutPath);
+        return false;
     }
 
     FwArc::Crc32 crc;
     qint64 copiedTotal = 0;
-    const bool bOk = streamCopy(*pSrc, srcPos, fi.nFileLen, fOut, crc,
+    const bool bOk = streamCopy(localSrc, srcPos, fi.nFileLen, fOut, crc,
                                 copiedTotal, qMax<qint64>(fi.nFileLen, 1),
                                 QStringLiteral("正在准备: ") + fi.sFileName, sErr);
+    localSrc.close();
     fOut.close();
     if (!bOk)
     {
@@ -462,12 +718,23 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
 // 加载 / 卸载 / 状态重置（P1-5 / P1-6）
 // ============================================================
 
-bool FileManager::QLoadMergedFile(QString sFilePath)
+bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPreParsed)
 {
-    // 先在临时结构上做完整解析；任何失败都保持原归档、原视图、原脏状态不变
+    // 先在临时结构上做完整解析；任何失败都保持原归档、原视图、原脏状态不变。
+    // P1-9：调用方已经 validate 过时直接复用解析结果，避免头部与条目区解析两遍。
     FwArc::Meta meta;
     QString err;
-    if (!parseFile(sFilePath, meta, err))
+    if (pPreParsed != nullptr)
+    {
+        meta = *pPreParsed;
+        // 预解析结果必须仍对应当前文件（两次调用之间文件可能被改写）
+        if (QFileInfo(sFilePath).size() != qint64(meta.fileSize))
+        {
+            setError(QStringLiteral("文件在解析后发生变化，已拒绝加载：%1").arg(sFilePath));
+            return false;
+        }
+    }
+    else if (!parseFile(sFilePath, meta, err))
     {
         setError(QStringLiteral("加载失败: %1").arg(err));
         return false;
@@ -750,7 +1017,9 @@ bool FileManager::finalizeV2Header(QFile &fOut, qint64 headerSize,
     return true;
 }
 
-// 流式复制 [srcPos, srcPos+len)，同时计算内容 CRC、上报进度、响应取消
+// 流式复制 [srcPos, srcPos+len)，同时计算内容 CRC、上报进度、响应取消。
+// 注意：fSrc 必须是**本操作独占**的文件句柄（P1-1）。共享 m_qFile 的游标会在
+// processEvents() 期间被 entryHead()/entryContent() 再次 seek，导致错位读取。
 bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst,
                              FwArc::Crc32 &crc, qint64 &copiedTotal, qint64 totalBytes,
                              const QString &sStatusPrefix, QString &sErr)
@@ -762,6 +1031,8 @@ bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst
     buf.resize(int(kCopyChunk));
     qint64 done = 0;
     int nLastPercent = -1;
+    QElapsedTimer pumpTimer;
+    pumpTimer.start();
     while (done < len)
     {
         if (m_bCancelRequested) return fail(QStringLiteral("操作已取消"));
@@ -785,7 +1056,13 @@ bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst
             emit progressChanged(copiedTotal, totalBytes,
                 QStringLiteral("%1  (%2 / %3)")
                     .arg(sStatusPrefix, FwArc::formatSize(copiedTotal), FwArc::formatSize(totalBytes)));
-            QApplication::processEvents();
+            // 限频泵事件：仍能让进度框刷新/响应取消，但不再每 1 MB 就给
+            // 重入窗口一次机会（P1-1 的根因已由独占句柄消除，这里进一步收窄）。
+            if (pumpTimer.elapsed() >= kProgressPumpIntervalMs)
+            {
+                pumpTimer.restart();
+                QApplication::processEvents();
+            }
         }
     }
     return true;
@@ -849,6 +1126,16 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
+    // P0-1：同一输出文件的跨进程写锁。没有它，两个实例会同时把对方正在写的
+    // 辅助文件/备份当成自己的旧文件处理。
+    OutputWriteLock outputLock;
+    QString sLockErr;
+    if (!outputLock.acquire(outInfo.absoluteFilePath(), sLockErr))
+    {
+        finish(false, sLockErr);
+        return;
+    }
+
     // ---- 收集输入：已合并的 .dat（FWDA）先拆分成条目，再一起合并 ----
     // 把 .dat 当成普通文件嵌进输出会变成"归档套归档"，用户还要再拆一层；
     // 这里直接读它的索引，把每个条目作为独立输入展开。
@@ -864,6 +1151,12 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         QString sStoredPath;      // 写入输出归档的路径（由 sOriginPath 推导）
         QString sDisplayName;     // 进度与错误提示
         bool    bFromArchive = false;
+        // P1-2：来源归档条目的内容 CRC。复制完必须与它比对，否则「结构完好但
+        // 内容已损坏」的 v2 输入会在二次合并后被重新算出 CRC、变成看似完好的归档。
+        quint32 nContentCrc = 0;
+        bool    bHasContentCrc = false;
+        // P1-6：收集时记录来源大小，复制前后各核对一次，防止静默保存旧长度前缀。
+        qint64  nSourceSize = -1;
     };
 
     QVector<MergeSource> sources;
@@ -914,6 +1207,9 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                     : e.displayPath;
                 s.sDisplayName = QFileInfo(e.relPath).fileName();
                 s.bFromArchive = true;
+                s.nContentCrc = e.contentCrc;
+                s.bHasContentCrc = e.hasContentCrc;
+                s.nSourceSize = qint64(meta.fileSize);
                 sources.append(s);
                 allOrigins << s.sOriginPath;
                 ++nArchiveEntries;
@@ -927,6 +1223,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         s.nLength      = fi.size();
         s.sOriginPath  = fi.absoluteFilePath();
         s.sDisplayName = fi.fileName();
+        s.nSourceSize  = fi.size();
         sources.append(s);
         allOrigins << s.sOriginPath;
     }
@@ -1049,9 +1346,15 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     const qint64 rootBytes = qint64(sRoot.toUtf8().size());
     qint64 needBytes = FwArc::GLOBAL_HDR + 4 + rootBytes
-                     + FwArc::ENTRY_FIXED_V2 * infos.size() + totalBytes;
+                     + qint64(FwArc::ENTRY_FIXED_V2) * qint64(infos.size()) + totalBytes;
     for (const QString &s : storedPaths)
-        needBytes += s.toUtf8().size();
+    {
+        if (!FwArc::checkedAdd64(needBytes, qint64(s.toUtf8().size()), &needBytes))
+        {
+            finish(false, tr("输出规模超出可表示范围"));
+            return;
+        }
+    }
 
     // 磁盘空间预检（P3-2）
     const qint64 freeBytes = FwArc::availableBytes(sOutputFile);
@@ -1062,9 +1365,29 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
-    // 始终写临时文件，成功并校验后才原子替换（P0-1 第 3 点）
-    const QString sTmp = sOutputFile + QStringLiteral(".tmp.fwda");
-    QFile::remove(sTmp);
+    // P0-1：在输出目录里以「随机名 + NewOnly」原子创建临时文件，
+    // 由本次操作独占持有；绝不再使用 <输出>.tmp.fwda 这种固定名，
+    // 也不再预先 remove() 一个不是本次创建的路径。
+    OwnedAuxFiles aux;
+    QString sTmp;
+    QString sAuxErr;
+    if (!createUniqueTempFile(sOutputFile, sTmp, sAuxErr))
+    {
+        finish(false, tr("创建临时文件失败：%1").arg(sAuxErr));
+        return;
+    }
+    aux.add(sTmp);
+
+    // 防御性检查：任何输入都不能恰好是本次刚创建的辅助文件
+    for (const MergeSource &s : sources)
+    {
+        if (sameFilePath(s.sSourcePath, sTmp))
+        {
+            finish(false, tr("输入文件与本次操作的临时文件冲突：%1").arg(s.sSourcePath));
+            return;
+        }
+    }
+
     QFile fTmp(sTmp);
     // 需要回读头部区来重算 CRC，因此临时文件必须以读写方式打开
     if (!fTmp.open(QIODevice::ReadWrite | QIODevice::Truncate))
@@ -1079,7 +1402,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
                        &storedPaths))
     {
-        fTmp.close(); QFile::remove(sTmp);
+        fTmp.close();
         finish(false, tr("写入归档头部失败：%1").arg(err));
         return;
     }
@@ -1097,10 +1420,34 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             err = tr("打开输入文件失败：%1 (%2)").arg(s.sSourcePath, src.errorString());
             bOk = false; break;
         }
+        // P1-6：来源在收集后被外部修改（变长/变短）就直接失败，
+        // 不静默保存「旧长度前缀」或读半截。
+        if (s.nSourceSize >= 0 && src.size() != s.nSourceSize)
+        {
+            err = tr("来源文件在合并过程中发生变化（收集时 %1 B，当前 %2 B）：%3")
+                      .arg(s.nSourceSize).arg(src.size()).arg(s.sSourcePath);
+            bOk = false; break;
+        }
         FwArc::Crc32 eCrc;
         bOk = streamCopy(src, s.nOffset, s.nLength, fTmp, eCrc,
                          copiedTotal, totalBytes,
                          tr("正在合并: %1\n").arg(s.sOriginPath), err);
+        if (!bOk) break;
+        // 复制期间来源不能变化（以文件大小作为低成本检查；内容 CRC 另算）
+        if (s.nSourceSize >= 0 && src.size() != s.nSourceSize)
+        {
+            err = tr("来源文件在合并过程中被修改：%1").arg(s.sSourcePath);
+            bOk = false; break;
+        }
+        // P1-2：v2 来源条目的内容 CRC 必须与来源记录一致。结构完好的头部
+        // 不能证明内容区没坏，不比对就会把损坏内容重新盖章成新归档。
+        if (s.bHasContentCrc && eCrc.value() != s.nContentCrc)
+        {
+            err = tr("来源归档内容校验失败（CRC32 不匹配）：%1\n"
+                     "该条目在来源归档中已损坏，拒绝把它合并成新归档。")
+                      .arg(s.sOriginPath);
+            bOk = false; break;
+        }
         contentCrcs.append(eCrc.value());
         src.close();
     }
@@ -1115,35 +1462,74 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     }
     if (!bOk)
     {
-        QFile::remove(sTmp);
         finish(false, m_bCancelRequested ? tr("操作已取消") : tr("文件合并失败：%1").arg(err));
         return;
     }
 
-    // 原子替换（先备份，失败可还原），给出具体系统错误
-    const QString sBak = sOutputFile + QStringLiteral(".bak.fwda");
-    QFile::remove(sBak);
+    // 事务替换（P0-1 / P1-3）：原文件先移到唯一备份，新文件换入后**重新解析成功**
+    // 才算成功；备份在确认成功后才删除。回滚失败时把备份绝对路径告诉用户。
+    QString sBak;
     if (QFileInfo::exists(sOutputFile))
     {
-        if (!QFile::rename(sOutputFile, sBak))
+        QString bakErr;
+        if (!moveToUniqueBackup(sOutputFile, sBak, bakErr))
         {
-            QFile::remove(sTmp);
-            finish(false, tr("备份已有输出文件失败：%1\n文件可能被其它程序占用。").arg(sOutputFile));
+            finish(false, tr("备份已有输出文件失败：%1\n%2").arg(sOutputFile, bakErr));
+            return;
+        }
+        aux.add(sBak);
+    }
+
+    if (!QFile::rename(sTmp, sOutputFile))
+    {
+        QString rollbackErr;
+        if (!sBak.isEmpty())
+        {
+            if (restoreFromBackup(sOutputFile, sBak, rollbackErr))
+            {
+                aux.release(sBak);
+                finish(false, tr("替换输出文件失败：%1（目标可能被占用、只读或权限不足）")
+                           .arg(sOutputFile));
+            }
+            else
+            {
+                aux.release(sBak);   // 保留备份供手工恢复
+                finish(false, tr("替换输出文件失败，且回滚失败：%1\n原文件备份保留在：%2\n%3")
+                           .arg(sOutputFile, sBak, rollbackErr));
+            }
+            return;
+        }
+        finish(false, tr("替换输出文件失败：%1（目标可能被占用、只读或权限不足）")
+                   .arg(sOutputFile));
+        return;
+    }
+    aux.release(sTmp);
+
+    // 换入后必须能按新路径完整解析，否则回滚
+    {
+        FwArc::Meta chk;
+        QString chkErr;
+        if (!parseFile(sOutputFile, chk, chkErr))
+        {
+            QString rollbackErr;
+            const bool restored = !sBak.isEmpty()
+                                  && restoreFromBackup(sOutputFile, sBak, rollbackErr);
+            if (!sBak.isEmpty()) aux.release(sBak);
+            finish(false, restored
+                ? tr("输出归档校验失败，已回滚到原文件：%1").arg(chkErr)
+                : tr("输出归档校验失败：%1\n原文件备份保留在：%2").arg(chkErr, sBak));
             return;
         }
     }
-    if (!QFile::rename(sTmp, sOutputFile))
-    {
-        if (QFileInfo::exists(sBak)) QFile::rename(sBak, sOutputFile);
-        QFile::remove(sTmp);
-        finish(false, tr("替换输出文件失败：%1（目标可能被占用、只读或权限不足）")
-               .arg(sOutputFile));
-        return;
-    }
-    QFile::remove(sBak);
+    if (!sBak.isEmpty())
+        aux.removeNow(sBak);
 
     QString sDone = tr("文件合并成功：共 %1 个文件，%2")
                         .arg(sources.size()).arg(FwArc::formatSize(totalBytes));
+    // 输出路径必须回显成绝对路径：相对路径（用户填 "a"）是按进程当前目录解析的，
+    // 从 IDE 启动时那就是 build/.../debug。提示里不写这一行，用户只能靠猜
+    // 才知道 14 GB 的结果落在哪（2026-11-19 就发生过一次）。
+    sDone += tr("\n输出文件：%1").arg(QFileInfo(sOutputFile).absoluteFilePath());
     if (nArchiveEntries > 0)
         sDone += tr("\n其中 %1 个条目来自 %2 个已合并归档（已先拆分再合并，不是嵌套归档）。")
                      .arg(nArchiveEntries).arg(nArchiveInputs);
@@ -1385,14 +1771,27 @@ bool FileManager::rewriteArchive()
     const QString sArchivePath = m_qFile.fileName();
     const QVector<FILEINFO> infos = m_vtFileInfos;
 
-    // 只有「删除」且归档已是 v2 时走快速路径；新增文件仍需完整重写（顺带清理墓碑）
-    if (m_meta.version == FwArc::VERSION_V2
-        && m_setPendingFiles.isEmpty()
-        && infos.size() < m_meta.entries.size())
+    // P1-3：v2 墓碑快速删除已停用（原地改头部没有崩溃恢复日志）。
+    // 删除与新增统一走下面的完整事务重写。
+
+    // P1-6：归档在加载后被外部改写（大小变化）时，内存里的条目偏移已不可信。
+    // 继续保存会把「按旧偏移读出来的字节」当成新归档内容，直接中止。
+    const qint64 nArchiveSizeNow = QFileInfo(sArchivePath).size();
+    if (nArchiveSizeNow < 0 || quint64(nArchiveSizeNow) != m_meta.fileSize)
     {
-        QString fastErr;
-        if (markDeletedOnly(fastErr)) return true;
-        qWarning() << "[FileManager] 快速删除不可用，回退完整重写:" << fastErr;
+        setError(tr("归档文件在加载后被外部修改（加载时 %1 B，当前 %2 B），"
+                    "为避免写入错误内容已中止保存。请重新加载归档后重试。")
+                 .arg(m_meta.fileSize).arg(nArchiveSizeNow));
+        return false;
+    }
+
+    // P0-1：同一归档的跨进程写锁
+    OutputWriteLock outputLock;
+    QString sLockErr;
+    if (!outputLock.acquire(QFileInfo(sArchivePath).absoluteFilePath(), sLockErr))
+    {
+        setError(sLockErr);
+        return false;
     }
 
     QString sRoot;
@@ -1406,13 +1805,40 @@ bool FileManager::rewriteArchive()
 
     qint64 totalBytes = 0;
     for (const FILEINFO &fi : infos)
-        totalBytes += fi.nFileLen;
+    {
+        if (fi.nFileLen < 0
+            || !FwArc::checkedAdd64(totalBytes, fi.nFileLen, &totalBytes))
+        {
+            setError(tr("条目总大小超出可表示范围，无法保存"));
+            return false;
+        }
+    }
 
     // 头部按实际存储路径精确计算（含每条路径字节），避免空间预检偏小
-    qint64 headerBytes = FwArc::GLOBAL_HDR + 4 + qint64(sRoot.toUtf8().size());
+    qint64 headerBytes = 0;
+    if (!FwArc::checkedAdd64(FwArc::GLOBAL_HDR + 4,
+                             qint64(sRoot.toUtf8().size()), &headerBytes))
+    {
+        setError(tr("归档头部过大"));
+        return false;
+    }
     for (const QString &rel : storedPaths)
-        headerBytes += FwArc::ENTRY_FIXED_V2 + rel.toUtf8().size();
-    const qint64 needBytes = headerBytes + totalBytes;
+    {
+        qint64 one = 0;
+        if (!FwArc::checkedAdd64(qint64(FwArc::ENTRY_FIXED_V2),
+                                 qint64(rel.toUtf8().size()), &one)
+            || !FwArc::checkedAdd64(headerBytes, one, &headerBytes))
+        {
+            setError(tr("归档头部过大"));
+            return false;
+        }
+    }
+    qint64 needBytes = 0;
+    if (!FwArc::checkedAdd64(headerBytes, totalBytes, &needBytes))
+    {
+        setError(tr("保存规模超出可表示范围"));
+        return false;
+    }
     const qint64 freeBytes = FwArc::availableBytes(sArchivePath);
     if (freeBytes >= 0 && freeBytes < needBytes)
     {
@@ -1421,8 +1847,17 @@ bool FileManager::rewriteArchive()
         return false;
     }
 
-    const QString sTmp = sArchivePath + QStringLiteral(".tmp.fwda");
-    QFile::remove(sTmp);
+    // P0-1：唯一临时文件，由本次操作独占；不再使用 <归档>.tmp.fwda
+    OwnedAuxFiles aux;
+    QString sTmp;
+    QString sAuxErr;
+    if (!createUniqueTempFile(sArchivePath, sTmp, sAuxErr))
+    {
+        setError(tr("创建临时归档失败：%1").arg(sAuxErr));
+        return false;
+    }
+    aux.add(sTmp);
+
     QFile fTmp(sTmp);
     // 需要回读头部区来重算 CRC，因此临时文件必须以读写方式打开
     if (!fTmp.open(QIODevice::ReadWrite | QIODevice::Truncate))
@@ -1437,8 +1872,18 @@ bool FileManager::rewriteArchive()
     if (!writeV2Header(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
                        &storedPaths))
     {
-        fTmp.close(); QFile::remove(sTmp);
+        fTmp.close();
         setError(tr("写入归档头部失败：%1").arg(err));
+        return false;
+    }
+
+    // P1-1：整次保存使用一个本操作独占的源归档句柄（不共享 m_qFile）。
+    // 这样即使进度泵/延迟渲染在本函数期间重入 entryHead()，也不会把复制游标改走。
+    QFile srcArc(sArchivePath);
+    if (!srcArc.open(QIODevice::ReadOnly))
+    {
+        fTmp.close();
+        setError(tr("打开归档失败：%1 (%2)").arg(sArchivePath, srcArc.errorString()));
         return false;
     }
 
@@ -1450,34 +1895,46 @@ bool FileManager::rewriteArchive()
     {
         const FILEINFO &fi = infos.at(i);
         FwArc::Crc32 eCrc;
+        QFile pendingSrc;
+        qint64 srcPos = 0;
+        QFile *pSrc = &srcArc;
         if (m_setPendingFiles.contains(fi.sFilePath))
         {
-            QFile src(fi.sFilePath);
-            if (!src.open(QIODevice::ReadOnly))
+            QString srcErr;
+            if (!openEntrySource(fi.sFilePath, fi, pendingSrc, srcPos, srcErr))
             {
-                err = tr("读取新增文件失败：%1 (%2)").arg(fi.sFilePath, src.errorString());
+                err = srcErr;
                 bOk = false; break;
             }
-            bOk = streamCopy(src, 0, fi.nFileLen, fTmp, eCrc, copiedTotal, totalBytes,
-                             tr("正在保存: %1").arg(fi.sFileName), err);
-            src.close();
+            pSrc = &pendingSrc;
         }
         else
         {
-            bOk = streamCopy(m_qFile, fi.nContentPositon, fi.nFileLen, fTmp, eCrc,
-                             copiedTotal, totalBytes,
-                             tr("正在保存: %1").arg(fi.sFileName), err);
-            // 保存时不能把已损坏的内容重新盖章；与加载时记录的 CRC 比对。
-            if (bOk && m_mapContentCrc.contains(fi.sFilePath)
-                && eCrc.value() != m_mapContentCrc.value(fi.sFilePath))
-            {
-                err = tr("内容 CRC 与加载时不一致，归档可能已损坏：%1").arg(fi.sFilePath);
-                bOk = false;
-            }
+            srcPos = fi.nContentPositon;
+        }
+
+        bOk = streamCopy(*pSrc, srcPos, fi.nFileLen, fTmp, eCrc, copiedTotal, totalBytes,
+                         tr("正在保存: %1").arg(fi.sFileName), err);
+        // 复制期间新增文件被外部改写：不能把「读到的半截内容」当成完整条目
+        if (bOk && pSrc == &pendingSrc && pendingSrc.size() != fi.nFileLen)
+        {
+            err = tr("文件在保存过程中被修改：%1").arg(fi.sFilePath);
+            bOk = false;
         }
         if (!bOk) break;
+
+        // 保存时不能把已损坏的内容重新盖章；与加载时记录的 CRC 比对。
+        if (!m_setPendingFiles.contains(fi.sFilePath)
+            && m_mapContentCrc.contains(fi.sFilePath)
+            && eCrc.value() != m_mapContentCrc.value(fi.sFilePath))
+        {
+            err = tr("内容 CRC 与加载时不一致，归档可能已损坏：%1").arg(fi.sFilePath);
+            bOk = false;
+            break;
+        }
         contentCrcs.append(eCrc.value());
     }
+    srcArc.close();
     if (bOk) bOk = finalizeV2Header(fTmp, headerSize, crcFieldPos, contentCrcs, err);
     fTmp.close();
 
@@ -1489,7 +1946,6 @@ bool FileManager::rewriteArchive()
     }
     if (!bOk)
     {
-        QFile::remove(sTmp);
         setError(m_bCancelRequested ? tr("保存已取消")
                                     : tr("保存失败：%1\n改动仍保留在内存中，可重试。").arg(err));
         return false;
@@ -1498,29 +1954,72 @@ bool FileManager::rewriteArchive()
     // Windows：必须先关闭自身句柄，否则 rename 会因共享冲突失败
     m_qFile.close();
 
-    const QString sBak = sArchivePath + QStringLiteral(".bak.fwda");
-    QFile::remove(sBak);
-    if (!QFile::rename(sArchivePath, sBak))
+    // P1-3：备份 -> 换入 -> 重新解析成功后才删除备份
+    QString sBak;
     {
-        QFile::remove(sTmp);
-        m_qFile.setFileName(sArchivePath);
-        m_qFile.open(QIODevice::ReadOnly);   // 保留内存状态与 dirty，不重新解析
-        setError(tr("备份原归档失败：%1\n文件可能被其它程序（资源管理器、杀毒软件或另一个实例）占用。"
-                    "\n改动仍保留在内存中，请关闭占用后重试。").arg(sArchivePath));
-        return false;
+        QString bakErr;
+        if (!moveToUniqueBackup(sArchivePath, sBak, bakErr))
+        {
+            // 备份失败：恢复自身只读句柄，保持内存状态与 dirty
+            m_qFile.setFileName(sArchivePath);
+            m_qFile.open(QIODevice::ReadOnly);
+            setError(tr("备份原归档失败：%1\n%2\n改动仍保留在内存中，可重试。")
+                     .arg(sArchivePath, bakErr));
+            return false;
+        }
+        aux.add(sBak);
     }
+
     if (!QFile::rename(sTmp, sArchivePath))
     {
-        QFile::rename(sBak, sArchivePath);
-        m_qFile.setFileName(sArchivePath);
-        m_qFile.open(QIODevice::ReadOnly);
-        setError(tr("替换原归档失败：%1\n改动仍保留在内存中，可重试。").arg(sArchivePath));
+        QString rollbackErr;
+        if (restoreFromBackup(sArchivePath, sBak, rollbackErr))
+        {
+            aux.release(sBak);
+            m_qFile.setFileName(sArchivePath);
+            m_qFile.open(QIODevice::ReadOnly);
+            setError(tr("替换原归档失败：%1\n改动仍保留在内存中，可重试。").arg(sArchivePath));
+        }
+        else
+        {
+            aux.release(sBak);   // 保留备份供手工恢复
+            setError(tr("替换原归档失败且回滚失败：%1\n原归档备份保留在：%2\n%3")
+                     .arg(sArchivePath, sBak, rollbackErr));
+        }
         return false;
     }
-    QFile::remove(sBak);
+    aux.release(sTmp);
 
-    // 重新解析刷新偏移，并顺带清掉 dirty / pending
-    QLoadMergedFile(sArchivePath);
+    // P1-3：重新加载成功才算保存成功（以前忽略 QLoadMergedFile 的返回值）
+    if (!QLoadMergedFile(sArchivePath))
+    {
+        const QString sLoadErr = lastError();
+        QString rollbackErr;
+        if (!sBak.isEmpty())
+        {
+            if (m_qFile.isOpen()) m_qFile.close();
+            if (restoreFromBackup(sArchivePath, sBak, rollbackErr))
+            {
+                aux.release(sBak);
+                QLoadMergedFile(sArchivePath);   // 恢复到原内容，保持可浏览
+                setError(tr("保存后的归档无法重新解析，已回滚到原文件：%1").arg(sLoadErr));
+            }
+            else
+            {
+                aux.release(sBak);
+                setError(tr("保存后的归档无法重新解析：%1\n原归档备份保留在：%2\n%3")
+                         .arg(sLoadErr, sBak, rollbackErr));
+            }
+        }
+        else
+        {
+            setError(tr("保存后的归档无法重新解析：%1").arg(sLoadErr));
+        }
+        return false;
+    }
+
+    if (!sBak.isEmpty())
+        aux.removeNow(sBak);
     return true;
 }
 
@@ -1619,7 +2118,14 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
     }
 
     qint64 totalBytes = 0;
-    for (const FwArc::Entry &e : meta.entries) totalBytes += qint64(e.size);
+    for (const FwArc::Entry &e : meta.entries)
+    {
+        if (!FwArc::checkedAdd64(totalBytes, qint64(e.size), &totalBytes))
+        {
+            finish(false, tr("归档条目总大小超出可表示范围"));
+            return;
+        }
+    }
 
     // 目标盘空间预检（按第一个输出目录估算；跨盘条目无法精确，尽力而为）。
     // 只有固定输出目录才能准确预检；按原路径时条目分散在多盘，不能用一个卷判断。
@@ -1658,16 +2164,42 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
             ++nFailed; continue;
         }
 
-        QFile fOut(sOut);
-        if (!fOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        // P1-5：用 NewOnly 原子创建，绝不「先 exists 再 Truncate」。
+        // chooseOutputPath 只是选名，真正的“不覆盖”由内核的 create-new 保证。
+        QFile fOut;
+        bool bOpenedOut = false;
+        QString sOutTry = sOut;
+        for (int attempt = 0; attempt < 32 && !bOpenedOut; ++attempt)
         {
-            if (sFirstError.isEmpty()) sFirstError = tr("打开输出文件失败：%1（%2）").arg(sOut, fOut.errorString());
-            ++nFailed; continue;
+            fOut.setFileName(sOutTry);
+            if (fOut.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+            {
+                bOpenedOut = true;
+                break;
+            }
+            // 目标在选名之后被其它进程/条目创建：换一个带序号的唯一名重试
+            if (!QFileInfo::exists(sOutTry))
+                break;   // 不是“已存在”，而是权限/路径错误，交给失败分支
+            const QFileInfo t(sOutTry);
+            const QString sSuffix = t.suffix().isEmpty()
+                                        ? QString() : QStringLiteral(".") + t.suffix();
+            sOutTry = t.absolutePath() + QStringLiteral("/") + t.completeBaseName()
+                      + QStringLiteral(" (") + QString::number(attempt + 2) + QStringLiteral(")")
+                      + sSuffix;
+            ++nRenamed;
         }
+        if (!bOpenedOut)
+        {
+            if (sFirstError.isEmpty())
+                sFirstError = tr("打开输出文件失败：%1（%2）").arg(sOutTry, fOut.errorString());
+            ++nFailed;
+            continue;
+        }
+        const QString sOutFinal = sOutTry;
 
         if (!fIn.seek(qint64(e.contentPos)))
         {
-            fOut.close(); QFile::remove(sOut);
+            fOut.close(); QFile::remove(sOutFinal);
             if (sFirstError.isEmpty()) sFirstError = tr("定位归档内容失败：%1").arg(e.relPath);
             ++nFailed; continue;
         }
@@ -1676,6 +2208,8 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         qint64 done = 0;
         bool bOk = true;
         int nLastPercent = -1;
+        QElapsedTimer splitPump;
+        splitPump.start();
         while (done < qint64(e.size))
         {
             if (m_bCancelRequested) { bOk = false; break; }
@@ -1695,19 +2229,23 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
                 // 路径过长由进度框只省略第一行路径，第二行保持完整。
                 emit progressChanged(copiedTotal, totalBytes,
                     tr("正在分割: %1\n  (%2 / %3)")
-                       .arg(QFileInfo(sOut).absoluteFilePath(), FwArc::formatSize(copiedTotal),
+                       .arg(QFileInfo(sOutFinal).absoluteFilePath(), FwArc::formatSize(copiedTotal),
                             FwArc::formatSize(totalBytes)));
-                QApplication::processEvents();
+                if (splitPump.elapsed() >= kProgressPumpIntervalMs)
+                {
+                    splitPump.restart();
+                    QApplication::processEvents();
+                }
             }
         }
         fOut.close();
 
         if (!bOk || done != qint64(e.size))
         {
-            QFile::remove(sOut);
+            QFile::remove(sOutFinal);
             if (!m_bCancelRequested)
             {
-                if (sFirstError.isEmpty()) sFirstError = tr("写入/读取失败：%1").arg(sOut);
+                if (sFirstError.isEmpty()) sFirstError = tr("写入/读取失败：%1").arg(sOutFinal);
                 ++nFailed;
             }
             if (m_bCancelRequested) break;
@@ -1716,10 +2254,10 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         // 内容 CRC 校验（v1 无校验字段，跳过但会在汇总里说明）
         if (e.hasContentCrc && crc.value() != e.contentCrc)
         {
-            QFile::remove(sOut);
+            QFile::remove(sOutFinal);
             ++nCrcBad;
             emit warningOccurred(tr("第 %1 个文件内容校验失败（CRC32 不匹配），已删除输出：%2")
-                                .arg(i + 1).arg(sOut));
+                                .arg(i + 1).arg(sOutFinal));
             continue;
         }
         ++nDone;
@@ -1736,9 +2274,16 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
                     .arg(nDone).arg(nSkipped).arg(nFailed).arg(nRenamed);
     if (nCrcBad > 0) msg += tr("，内容校验失败 %1 个").arg(nCrcBad);
     if (!sFirstError.isEmpty()) msg += tr("；首个错误：%1").arg(sFirstError);
-    if (meta.version == FwArc::VERSION_V1)
-        msg += tr("（v1 归档无内容校验字段，未做逐条 CRC 校验）");
-    finish(nFailed == 0 && nCrcBad == 0, msg);
+    // P1-4：完全成功必须同时满足「无跳过、无失败、无 CRC 失败，且计数覆盖全部条目」。
+    // 以前只看 failed/CRC，全部条目都被跳过时仍会发 operationFinished(true)。
+    const int nTotal = meta.entries.size();
+    const int nAccounted = nDone + nSkipped + nFailed + nCrcBad;
+    const bool bAllDone = (nSkipped == 0 && nFailed == 0 && nCrcBad == 0
+                           && nDone == nTotal && nAccounted == nTotal);
+    if (!bAllDone)
+        msg += tr("\n本次为部分完成：共 %1 个条目，成功 %2、跳过 %3、失败 %4、校验失败 %5。")
+                   .arg(nTotal).arg(nDone).arg(nSkipped).arg(nFailed).arg(nCrcBad);
+    finish(bAllDone, msg);
 }
 
 // ============================================================
@@ -1777,34 +2322,24 @@ QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QS
     const FILEINFO fi = it.value();
     if (fi.nFileLen <= 0) return QByteArray();
 
-    QFile *pSrc = nullptr;
-    QFile  diskSrc;
+    QFile localSrc;
     qint64 srcPos = 0;
-    if (m_setPendingFiles.contains(sFilePath))
+    QString sOpenErr;
+    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
     {
-        diskSrc.setFileName(sFilePath);
-        if (!diskSrc.open(QIODevice::ReadOnly))
-        {
-            if (psErr) *psErr = tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString());
-            return QByteArray();
-        }
-        pSrc = &diskSrc;
-    }
-    else
-    {
-        if (!m_qFile.isOpen())
-        {
-            if (psErr) *psErr = tr("归档文件未打开");
-            return QByteArray();
-        }
-        pSrc = &m_qFile;
-        srcPos = fi.nContentPositon;
+        if (psErr) *psErr = sOpenErr;
+        return QByteArray();
     }
 
     const qint64 nWant = qMin<qint64>(fi.nFileLen, nMaxBytes);
-    if (!pSrc->seek(srcPos))
+    if (!FwArc::fitsInQsizetype(quint64(nWant)))
     {
-        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, pSrc->errorString());
+        if (psErr) *psErr = tr("读取长度超出可处理范围：%1").arg(sFilePath);
+        return QByteArray();
+    }
+    if (!localSrc.seek(srcPos))
+    {
+        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString());
         return QByteArray();
     }
 
@@ -1814,7 +2349,7 @@ QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QS
     while (done < nWant)
     {
         const qint64 n = qMin<qint64>(nWant - done, MAXBUFFERSIZE);
-        const qint64 got = pSrc->read(out.data() + done, n);
+        const qint64 got = localSrc.read(out.data() + done, n);
         if (got <= 0) break;
         done += got;
     }
@@ -1844,30 +2379,19 @@ QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
     }
     if (fi.nFileLen == 0)
         return QByteArray();                        // 0 字节是合法情况
-
-    QFile *pSrc = nullptr;
-    QFile  diskSrc;
-    qint64 srcPos = 0;
-    if (m_setPendingFiles.contains(sFilePath))
+    if (!FwArc::fitsInQsizetype(quint64(fi.nFileLen)))
     {
-        diskSrc.setFileName(sFilePath);
-        if (!diskSrc.open(QIODevice::ReadOnly))
-        {
-            if (psErr) *psErr = tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString());
-            return QByteArray();
-        }
-        pSrc = &diskSrc;
-        srcPos = 0;
+        if (psErr) *psErr = tr("文件过大，超出当前平台可一次性读取的范围：%1").arg(sFilePath);
+        return QByteArray();
     }
-    else
+
+    QFile localSrc;
+    qint64 srcPos = 0;
+    QString sOpenErr;
+    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
     {
-        if (!m_qFile.isOpen())
-        {
-            if (psErr) *psErr = tr("归档文件未打开");
-            return QByteArray();
-        }
-        pSrc = &m_qFile;
-        srcPos = fi.nContentPositon;
+        if (psErr) *psErr = sOpenErr;
+        return QByteArray();
     }
 
     QByteArray out;
@@ -1882,9 +2406,9 @@ QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
         return QByteArray();
     }
 
-    if (!pSrc->seek(srcPos))
+    if (!localSrc.seek(srcPos))
     {
-        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, pSrc->errorString());
+        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString());
         return QByteArray();
     }
 
@@ -1892,7 +2416,7 @@ QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
     while (done < fi.nFileLen)
     {
         const qint64 n = qMin<qint64>(fi.nFileLen - done, MAXBUFFERSIZE);
-        const qint64 got = pSrc->read(out.data() + done, n);
+        const qint64 got = localSrc.read(out.data() + done, n);
         if (got <= 0)
         {
             if (psErr) *psErr = tr("读取文件内容不完整：%1（期望 %2 B，实际 %3 B）")
@@ -1937,25 +2461,18 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
         return;
     }
 
-    QFile *pSrc = nullptr;
-    QFile  diskSrc;
+    QFile localSrc;
     qint64 srcPos = 0;
-    if (m_setPendingFiles.contains(sFilePath))
+    QString sOpenErr;
+    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
     {
-        diskSrc.setFileName(sFilePath);
-        if (!diskSrc.open(QIODevice::ReadOnly))
-        {
-            setError(tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString()));
-            return;
-        }
-        pSrc = &diskSrc;
-        srcPos = 0;
+        setError(sOpenErr);
+        return;
     }
-    else
+    if (!FwArc::fitsInQsizetype(quint64(fi.nFileLen)))
     {
-        if (!m_qFile.isOpen()) { setError(tr("归档文件未打开")); return; }
-        pSrc = &m_qFile;
-        srcPos = fi.nContentPositon;
+        setError(tr("文件过大，超出当前平台可一次性读取的范围：%1").arg(sFilePath));
+        return;
     }
 
     // std::nothrow：畸形头部或超大文件不再让进程因 bad_alloc 终止（P1-1）
@@ -1968,10 +2485,10 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
     }
 
     // 分块读取，避免一次 read 超大长度
-    if (!pSrc->seek(srcPos))
+    if (!localSrc.seek(srcPos))
     {
         delete[] pBuf;
-        setError(tr("定位文件内容失败：%1 (%2)").arg(sFilePath, pSrc->errorString()));
+        setError(tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString()));
         return;
     }
     qint64 done = 0;
@@ -1979,7 +2496,7 @@ void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFile
     while (done < fi.nFileLen)
     {
         const qint64 n = qMin<qint64>(fi.nFileLen - done, MAXBUFFERSIZE);
-        const qint64 got = pSrc->read(pBuf + done, n);
+        const qint64 got = localSrc.read(pBuf + done, n);
         if (got <= 0) { bOk = false; break; }
         done += got;
     }
@@ -2042,61 +2559,61 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
         }
     }
 
-    // 绝不静默覆盖已有文件
-    if (QFileInfo::exists(sOut))
+    // P1-5：绝不静默覆盖已有文件，也不「先 exists 再 Truncate」。
+    // 选名只是启发式，真正的互斥由 open(NewOnly) 内核创建保证：
+    // 目标在检查与打开之间被别的进程创建时会换名重试；达到上限必须失败。
+    QFile fOut;
+    bool bOpened = false;
+    QString sCandidate = sOut;
+    bool bRenamed = false;
+    for (int attempt = 0; attempt < 1000 && !bOpened; ++attempt)
     {
-        const QFileInfo t(sOut);
-        const QString dir = t.absolutePath();
-        const QString base = t.completeBaseName();
-        const QString ext = t.suffix();
-        QString cand;
-        int n = 1;
-        do {
-            cand = dir + "/" + base + " (" + QString::number(n) + ")"
-                 + (ext.isEmpty() ? QString() : "." + ext);
-            ++n;
-        } while (QFileInfo::exists(cand) && n < 100000);
-        sOut = cand;
-        emit warningOccurred(tr("目标文件已存在，为避免覆盖已自动重命名为：%1").arg(sOut));
+        fOut.setFileName(sCandidate);
+        if (fOut.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+        {
+            bOpened = true;
+            break;
+        }
+        if (!QFileInfo::exists(sCandidate))
+            break;   // 不是“已存在”（权限/路径错误），直接报错
+        const QFileInfo t(sCandidate);
+        const QString sSuffix = t.suffix().isEmpty()
+                                    ? QString() : QStringLiteral(".") + t.suffix();
+        sCandidate = t.absolutePath() + QStringLiteral("/") + t.completeBaseName()
+                     + QStringLiteral(" (") + QString::number(attempt + 1) + QStringLiteral(")")
+                     + sSuffix;
+        bRenamed = true;
     }
-
-    QFile fOut(sOut);
-    if (!fOut.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    if (!bOpened)
     {
-        setError(tr("打开输出文件失败：%1 (%2)").arg(sOut, fOut.errorString()));
+        const bool bExhausted = QFileInfo::exists(sCandidate);
+        setError(bExhausted
+            ? tr("目标文件已存在且自动改名达到上限（1000 次），已取消导出：%1").arg(sOut)
+            : tr("打开输出文件失败：%1 (%2)").arg(sCandidate, fOut.errorString()));
         return;
     }
+    sOut = sCandidate;
+    if (bRenamed)
+        emit warningOccurred(tr("目标文件已存在，为避免覆盖已自动重命名为：%1").arg(sOut));
 
-    QFile *pSrc = nullptr;
-    QFile diskSrc;
+    // P1-1：本操作独占的源句柄（不再共享 m_qFile 游标）
+    QFile localSrc;
     qint64 srcPos = 0;
-    if (m_setPendingFiles.contains(sFilePath))
+    QString sOpenErr;
+    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
     {
-        diskSrc.setFileName(sFilePath);
-        if (!diskSrc.open(QIODevice::ReadOnly))
-        {
-            fOut.close(); QFile::remove(sOut);
-            setError(tr("读取新增文件失败：%1 (%2)").arg(sFilePath, diskSrc.errorString()));
-            return;
-        }
-        pSrc = &diskSrc; srcPos = 0;
-    }
-    else
-    {
-        if (!m_qFile.isOpen())
-        {
-            fOut.close(); QFile::remove(sOut);
-            setError(tr("归档文件未打开")); return;
-        }
-        pSrc = &m_qFile; srcPos = fi.nContentPositon;
+        fOut.close(); QFile::remove(sOut);
+        setError(sOpenErr);
+        return;
     }
 
     FwArc::Crc32 crc;
     qint64 copiedTotal = 0;
     QString err;
-    const bool bOk = streamCopy(*pSrc, srcPos, fi.nFileLen, fOut, crc,
+    const bool bOk = streamCopy(localSrc, srcPos, fi.nFileLen, fOut, crc,
                                 copiedTotal, qMax<qint64>(fi.nFileLen, 1),
                                 tr("正在导出: %1").arg(fi.sFileName), err);
+    localSrc.close();
     fOut.close();
 
     if (!bOk)

@@ -1,0 +1,18 @@
+/* XPM */
+static const char *close_light[] = {
+"12 12 2 1",
+"  c None",
+"X c #8A93A2",
+"            ",
+"            ",
+"            ",
+"   XX   XX  ",
+"    XX XX   ",
+"     XXX    ",
+"     XXX    ",
+"    XX XX   ",
+"   XX   XX  ",
+"            ",
+"            ",
+"            ",
+};

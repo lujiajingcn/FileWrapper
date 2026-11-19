@@ -5,20 +5,25 @@
 #include <QStandardItemModel>
 #include "filemanager.h"
 #include "plugininterface.h"
+#include "dlgfileproperty.h"   // 「属性」数据收集的返回值类型
 #include <QTreeView>
 #include <QStackedWidget>
 #include <QHeaderView>
 #include <QToolBar>
+#include <QLayout>
 #include <QAction>
 #include <QMenu>
 #include <QPoint>
 #include <QToolButton>
+#include <QTabBar>
+#include <QIcon>
 #include <QSet>
 #include <QHash>
 #include <QStringList>
 #include <QVector>
 #include <QMetaObject>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <QSharedPointer>
 #include <QPointer>
 #include <QMutex>
@@ -27,10 +32,70 @@
 
 class QProgressDialog;
 class QCloseEvent;
+class QResizeEvent;
 
 namespace Ui {
 class MainWindow;
 }
+
+// 会换行的"流式"布局：子项按可用宽度从左到右排列，排满自动换到下一行。
+// 用途：左侧文件列表的图标工具条——QToolBar 在窄栏里会把放不下的动作折进
+// 溢出菜单（"»"），按钮直接消失；换行后 8 个按钮在小窗口下也全都看得见。
+class FwFlowLayout : public QLayout
+{
+public:
+    explicit FwFlowLayout(QWidget *parent = nullptr, int nMargin = 0,
+                          int nHSpacing = 2, int nVSpacing = 2);
+    ~FwFlowLayout() override;
+
+    void addItem(QLayoutItem *item) override;
+    int count() const override;
+    QLayoutItem *itemAt(int index) const override;
+    QLayoutItem *takeAt(int index) override;
+    Qt::Orientations expandingDirections() const override;
+    bool hasHeightForWidth() const override;
+    int heightForWidth(int nWidth) const override;
+    void setGeometry(const QRect &rect) override;
+    QSize sizeHint() const override;
+    QSize minimumSize() const override;
+
+private:
+    int doLayout(const QRect &rect, bool bTestOnly) const;
+
+    QList<QLayoutItem *> m_items;
+    int m_nHSpace;
+    int m_nVSpace;
+};
+
+// 图标动作条：把 QAction 变成一排固定尺寸的 QToolButton，配合 FwFlowLayout 换行。
+// 动作的 enabled/checked 状态由 QAction 统一驱动（syncActionStates() 无需改动）。
+class FwActionBar : public QWidget
+{
+public:
+    explicit FwActionBar(QWidget *parent = nullptr);
+
+    void setIconSize(const QSize &size);
+    void addAction(QAction *pAction);
+    void addSeparator();
+    // 兼容原 QToolBar 调用点；本控件固定为图标模式、不可拖动
+    void setToolButtonStyle(Qt::ToolButtonStyle style);
+    void setMovable(bool bMovable);
+    void setFloatable(bool bFloatable);
+
+    QSize sizeHint() const override;
+    QSize minimumSizeHint() const override;
+
+protected:
+    void resizeEvent(QResizeEvent *pEvent) override;
+
+private:
+    int preferredHeightForWidth(int nWidth) const;
+
+    FwFlowLayout         *m_pLayout = nullptr;
+    QList<QToolButton *>  m_buttons;
+    QSize                 m_iconSize = QSize(18, 18);
+    bool                  m_bInHeightFix = false;
+};
 
 class MainWindow : public QMainWindow
 {
@@ -39,6 +104,13 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
+
+    // 插件拒绝打开时的用户可见说明（接口 v6）。
+    // sWhy 非空 = 插件回报了**真实原因**（没有音频输出设备 / 解码器不支持该编码 /
+    // 文件已损坏…），按原因说；为空 = 老插件没提供原因，退回通用提示。
+    // 独立成静态函数：文案是这次修复的核心（以前一律显示"插件无法显示该文件"），
+    // 需要能被测试直接断言。
+    static QString pluginFailureText(const QString &sFileName, const QString &sWhy);
 
 protected:
     void initWidgetFilePath();
@@ -75,6 +147,8 @@ private slots:
 
     void onTabCloseRequested(int index);
     void onTabCurrentChanged(int index);
+    // P0-2：用户拖动标签后原子地同步文档数组，避免“标签顺序与 m_vTabDocs 失配”
+    void onTabBarTabMoved(int from, int to);
     void onTreeViewCustomContextMenu(const QPoint &pos);
     void onActionNewTabTriggered();
 
@@ -104,6 +178,14 @@ protected:
     // 校验并加载归档（加载文件与"打开合并结果"共用；失败时保持当前归档不变）
 protected:
     void loadArchiveFile(const QString &sFileName);   // 测试派生类需要直接加载归档
+    // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 属性；目录行 = 属性。
+    // 返回的菜单归调用方 delete；返回 nullptr 表示该行没有可用操作。
+    // （protected 是为了让测试派生类能检查菜单项，不弹出真实的模态菜单。）
+    QMenu *buildFileListContextMenu(const QModelIndex &index);
+    // 「属性」数据收集：把 FILEINFO / 目录子树整理成对话框要展示的字段。
+    // 与 show 分离，测试派生类可以直接校验数值而不进入模态对话框。
+    DlgFileProperty::Data filePropertyData(const FILEINFO &info) const;
+    DlgFileProperty::Data folderPropertyData(const QModelIndex &index) const;
 private:
     // 文件列表筛选（按路径/文件名，大小写不敏感）
     bool matchesFilter(const FILEINFO &info) const;
@@ -112,6 +194,22 @@ private:
     void restoreUiState();
     // 文件列表双击的统一处理（目录 -> 展开/收起，文件 -> 打开）
     void handleFileListDoubleClick(const QModelIndex &index);
+    // 「属性」对话框的数据收集：文件按 FILEINFO，文件夹按当前列表子树汇总
+    void showFileProperty(const FILEINFO &info);
+    void showFolderProperty(const QModelIndex &index);
+    // 递归统计目录节点下的文件 / 子文件夹数量（属性对话框与测试共用）
+    static void countFolderItems(const QStandardItem *pDir, int &nFiles, int &nDirs);
+
+    // 窗口标题：显示归档名，并在有未保存改动时追加 "*"
+    void updateWindowTitle();
+    // 标签页图标：按后缀生成彩色角标（运行时绘制，不依赖额外图片资源）
+    static QIcon tabIconForFile(const QString &sFileName);
+    // 把「新建标签页 +」按钮贴到最后一个标签右侧（标签增删/窗口缩放后重新定位）
+    void updateNewTabButton();
+    // 「文件路径」列宽：跟随视口宽，但不低于最小宽度（窄面板出横向滚动条）
+    void adjustPathColumnWidth();
+    // 停靠面板标题栏的「浮动 / 关闭」按钮：放大到 22×22 并换成主题线性图标
+    void polishDockTitleButtons();
 
     // 长操作的进度对话框连接管理（避免每次 disconnect 掉其它常驻连接）
     void beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QString *psResultMsg);
@@ -136,12 +234,16 @@ private:
 
     QStandardItemModel      *m_hModelFilePath;
     QLineEdit               *m_leFilter = nullptr;
+    QTimer                  *m_filterDebounce = nullptr;   // P1-9：筛选去抖
     QString                  m_sFilter;
     FileManager             *m_fileManager;
 
     QStackedWidget          *m_swShowArea;
     QTreeView               *m_tvFilePath;
-    QToolBar                *m_tbFilePath;
+    FwActionBar             *m_tbFilePath;
+    QToolButton             *m_btnNewTab = nullptr;   // 贴在标签栏末尾的「+」
+    bool                     m_bNewTabBtnPending = false;
+    bool                     m_bAdjustingPathColumn = false;   // 防止列宽回调递归
     QAction                 *m_acViewTree;
     QAction                 *m_acViewFlat;
     QAction                 *m_acShowFilePath;
@@ -194,6 +296,11 @@ private:
 
     QVector<TabDoc>          m_vTabDocs;
     QSet<QWidget*>           m_setPluginWidgets;
+    // P0-3：停止失败（后台仍可能访问宿主映射）的实例。它们绝不能进入
+    // delete / unmap / QPluginLoader::unload 路径，必须在后续时机重试停止。
+    QSet<PluginInterface*>   m_setStopUnsafe;
+    // 已从标签页摘除、但因停止失败而无法销毁的独占实例（延期清理）
+    QVector<PluginInterface*> m_vtDeferredInstances;
     // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗
     QSet<QString>            m_setWarnedPlugins;
     QSet<QString>            m_setBuiltinTextPlugins;   // 用户选择“以文本查看”的插件，允许再次兜底
@@ -220,6 +327,14 @@ private:
     void renderFile(const FILEINFO& info, PluginInterface* iface);
     void destroyTabAt(int index);
     void stopCurrentPlaybackAndInvalidate();
+    // P0-2：标签下标 -> 文档下标。优先按插件窗口指针定位（拖动标签后仍然正确），
+    // 占位/空标签页回退到顺序下标。
+    int docIndexForTab(int tabIndex) const;
+    // P0-3：只有 stopPlaybackAndWait() 确认后台已退出，才允许 unmap / delete / 卸载 DLL。
+    // 返回 false 表示该实例必须保留（映射、实例、loader 都不动），等待重试或退出。
+    bool ensureInstanceStopped(PluginInterface *iface);
+    // 批量尝试停止：返回是否所有实例都可安全销毁
+    bool ensureAllInstancesStopped();
     void closeAllTabs();
     void newEmptyTab();
     bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);

@@ -28,8 +28,9 @@ public:
     bool findText(const QString &sText, bool bForward = true);
 
 private:
-    // 按编码（BOM -> UTF-8 -> 系统本地编码 GBK）解码文本，避免 .sql 等文件乱码
-    static QString decodeText(const QByteArray &data);
+    // 按编码（BOM -> 严格 UTF-8 -> 系统本地编码 GBK）解码文本，避免 .sql 等文件乱码。
+    // pbTruncatedTail（可空）：末尾多字节序列不完整、只解码了有效前缀时置 true（P2-2）。
+    static QString decodeText(const QByteArray &data, bool *pbTruncatedTail = nullptr);
     // 文件名未知时，用内容嗅探判断是不是 HTML
     static bool looksLikeHtml(const QString &text);
 

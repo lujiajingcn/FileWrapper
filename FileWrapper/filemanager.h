@@ -28,7 +28,9 @@ public:
 
     // 先解析到临时结构，全部校验成功后才替换内存状态与句柄；
     // 失败时保留原有归档、视图数据与脏标记不变（P1-6）
-    bool QLoadMergedFile(QString sFilePath);
+    // pPreParsed 非空时直接使用调用方已经完成的解析结果，避免「先 validate 再 load」
+    // 对头部与条目区重复解析两遍（P1-9）。调用方必须保证该结果来自同一文件。
+    bool QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPreParsed = nullptr);
     void unLoadMergedFile();
     void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
 
@@ -50,6 +52,8 @@ public:
     // 完整解析 + 合法性校验（不只是头部 CRC），供加载 / 分割 / 校验共用（P2-3）
     bool validateMergedFile(QString sFilePath);
     bool validateMergedFile(QString sFilePath, QString *psErrMsg);
+    // P1-9：一次解析同时返回 meta，加载时不再重新解析头部与条目区
+    bool validateMergedFile(QString sFilePath, FwArc::Meta *pMeta, QString *psErrMsg = nullptr);
 
     bool isArchiveLoaded() const;
 
@@ -77,6 +81,8 @@ public:
     // 校验当前归档的内容区 CRC（v1 无校验字段，会明确报告「无法校验」）
     bool verifyArchive(QString *psReport);
     FwArc::Meta archiveMeta() const;
+    // 只取归档格式版本（v1/v2）：不用为了读一个字段把整个 Meta（含条目表）复制一份
+    quint32 archiveVersion() const { return m_meta.version; }
 
     // 读取任意归档的元数据（不做状态变更），供分割「按原路径」二次确认展示
     static bool inspectArchive(const QString &sPath, FwArc::Meta &meta, QString &sErr);
@@ -106,7 +112,6 @@ public slots:
 private:
     QString getFileName(QString sFilePath);
     bool rewriteArchive();
-
     // 计算写归档用的 root 与每个条目的存储路径（与合并逻辑保持一致）：
     // - 所有条目在同一公共根下：root = 公共根，条目存相对路径（保留目录结构）
     // - 跨盘 / 无公共根：root 为空，盘符当首段（"E:/x" -> "E/x"）
@@ -114,13 +119,22 @@ private:
     static bool computeStoredPaths(const QVector<FILEINFO> &infos,
                                    QString &sRoot, QStringList &storedPaths,
                                    QString &sErr);
-    // v2 快速删除：只把被删条目的 PathLength 置为 0（墓碑）并重算头部 CRC，
-    // 不触碰内容区，避免为一个小删除重写整个 10 GB 归档（P1-3）
+    // P1-3：v2 墓碑式「原地改头部」快速删除已停用。
+    // 它没有崩溃恢复日志：进程在 half-updated 头部时被终止，整个归档会无法加载。
+    // 删除现在统一走 rewriteArchive() 的完整事务重写（临时文件 + 校验 + 替换 +
+    // 重新解析 + 备份回滚），代价是大归档删除需要重写内容区。
+    // 下面这个实现仅保留供后续「写前日志 + 恢复」方案参考，禁止从保存路径调用。
     bool markDeletedOnly(QString &sErr);
+
 
     static bool parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr);
     bool parseFile(const QString &sPath, FwArc::Meta &meta, QString &sErr) const;
     void setError(const QString &sMsg);
+
+    // P1-1：每个读操作使用自己的 QFile（不再共享 m_qFile 的可变游标）。
+    // 同时完成 P1-6 的「新增文件加入后是否被外部改动」检查。
+    bool openEntrySource(const QString &sFilePath, const FILEINFO &fi,
+                         QFile &localFile, qint64 &srcPos, QString &sErr) const;
 
     // 写 v2 头部（CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
     // pStoredPaths 非空时直接用它作为每条目的存储路径（合并时展开已有归档用）。

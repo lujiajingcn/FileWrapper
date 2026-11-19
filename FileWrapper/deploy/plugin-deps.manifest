@@ -28,6 +28,9 @@ qt-bin|Qt6Network.dll|Qt6Network.dll|Qt6Pdf 的运行依赖（加载时自动链
 qt-bin|Qt6Multimedia.dll|Qt6Multimedia.dll|音频输出：PluginMedia（QAudioSink/QAudioOutput）
 qt-bin|Qt6Svg.dll|Qt6Svg.dll|SVG 图像解码的运行库：qsvg 插件依赖
 
+// ---- Qt 翻译：标准按钮（确定/取消/保存/丢弃）中文化 ----
+qt-trans|qtbase_zh_CN.qm|translations/qtbase_zh_CN.qm|Qt 标准对话框按钮的中文翻译
+
 // ---- Qt 插件：程序/插件运行期按需加载 ----
 qt-plug|platforms/qwindows.dll|platforms/qwindows.dll|Qt 平台插件：程序启动必需
 qt-plug|styles/qmodernwindowsstyle.dll|styles/qmodernwindowsstyle.dll|Windows 11 原生控件样式（缺省退回 Fusion 外观）

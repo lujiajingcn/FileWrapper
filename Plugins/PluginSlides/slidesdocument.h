@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QImage>
 #include <QMap>
+#include <QSet>
 #include <QString>
 #include <QVector>
 
@@ -41,6 +42,8 @@ public:
 
     QString kind() const { return m_kind; }       // "pptx" / "odp"
     int slideCount() const { return m_slides.size(); }
+    // P1-9/P2-9：截断原因（空 = 未触发），供上层报告使用
+    QString truncatedReason() const { return m_truncatedReason; }
 
 private:
     struct Block {
@@ -61,16 +64,24 @@ private:
     bool parseOdp(QString *error);
     void addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
                   const QString &sKey = QString(), bool *pbNewDecoded = nullptr);
+    // P1-15：先查缓存/失败缓存，再决定是否从 ZIP 解压；避免重复引用反复 inflate
+    void addImageFromZip(const QString &mediaPath, double wPt, double hPt, Block *block,
+                         bool *pbNewDecoded = nullptr);
     QString normalizePath(const QString &baseDir, const QString &rel) const;
+
+    // 截断记账（保留第一次的原因）
+    void markTruncated(const QString &reason);
 
     ZipReader        m_zip;
     QVector<Slide>   m_slides;
     QMap<QString, QImage> m_images;   // URL -> 图像
-    QHash<QString, QString> m_imageByKey; // zip 内路径 -> URL（重复引用去重）
+    QHash<QString, QString> m_imageByKey; // zip 内路径（小写）-> URL（重复引用去重）
+    QSet<QString>    m_failedImages;  // P1-15：判定不可用的 zip 路径（负缓存）
     QString          m_kind;
     int              m_imageSeq = 0;
     QString          m_urlPrefix = QStringLiteral("simg://slide/");
     bool             m_truncated = false;
+    QString          m_truncatedReason;
     bool             m_ok = false;
 };
 

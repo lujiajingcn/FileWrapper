@@ -26,6 +26,7 @@ VPATH += $$SRC
 SOURCES += \
     $$SRC/builtinviewer.cpp \
     $$SRC/dlgabout.cpp \
+    $$SRC/dlgfileproperty.cpp \
     $$SRC/dlgmergefile.cpp \
     $$SRC/dlgoutputfile.cpp \
     $$SRC/dlgpluginmap.cpp \
@@ -41,6 +42,7 @@ HEADERS += \
     $$SRC/archiveformat.h \
     $$SRC/builtinviewer.h \
     $$SRC/dlgabout.h \
+    $$SRC/dlgfileproperty.h \
     $$SRC/dlgmergefile.h \
     $$SRC/dlgoutputfile.h \
     $$SRC/dlgpluginmap.h \
@@ -50,7 +52,13 @@ HEADERS += \
     $$SRC/mainwindow.h \
     $$PWD/../include/plugininterface.h \
     $$SRC/pluginmanager.h \
-    $$SRC/plugindiag.h
+    $$SRC/plugindiag.h \
+    $$PWD/../Plugins/common/zipreader.h
+
+# ZIP 读取器与插件共用同一份源码：AUDIT 组直接对 ZipReader 做预算/CRC 单测
+INCLUDEPATH += $$PWD/../Plugins/common
+SOURCES += $$PWD/../Plugins/common/zipreader.cpp
+LIBS += -lz
 
 FORMS += \
     $$SRC/dlgabout.ui \

@@ -165,4 +165,9 @@
   <file alias="view_tree_48.png">icons/view_tree_48.png</file>
   <file alias="view_tree_64.png">icons/view_tree_64.png</file>
 </qresource>
+<qresource prefix="/theme">
+  <file alias="light.qss">theme/light.qss</file>
+  <file alias="icons/close_light.xpm">theme/icons/close_light.xpm</file>
+  <file alias="icons/close_light_hover.xpm">theme/icons/close_light_hover.xpm</file>
+</qresource>
 </RCC>

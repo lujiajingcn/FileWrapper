@@ -1,6 +1,7 @@
 #include "rtfdocument.h"
 
 #include <QRegularExpression>
+#include <QList>
 #include <QSet>
 #include <QStringList>
 #include <QtGlobal>
@@ -112,7 +113,7 @@ void RtfDocument::reset()
     m_pendingBytes.clear();
     m_fonts.clear();
     m_colors.clear();
-    m_defaultSizePt = 10.5;
+    m_defaultSizePt = 12.0;      // P2-8：缺省 12pt（见 rtfdocument.h 的说明）
     m_ok = false;
     m_skipUnicodeFallback = false;
     m_ucCount = 1;
@@ -212,18 +213,30 @@ static void parseColorTable(const QByteArray &data, QHash<int, QString> *colors)
     const int end = data.indexOf('}', start);
     const QByteArray block = data.mid(start, end < 0 ? data.size() - start : end - start);
 
+    // P2-8：颜色表的索引按 ';' 分隔的**条目**推进，不能按正则匹配个数推进。
+    // 空条目（自动色 / 占位）同样占一个索引，否则 \red..\green..\blue 之间只要出现
+    // 一个空项，后面所有 \cfN 都会整体错位、显示成别的颜色。
+    // 约定：{\colortbl;…} 里第一个 ';' 之前是 auto 项（索引 0，不写入表），
+    // 之后每条（含空）依次占用索引 1、2、3…
     static const QRegularExpression re(
         QStringLiteral("\\\\red(\\d+)\\\\green(\\d+)\\\\blue(\\d+)"));
-    int index = 0;   // RTF 颜色索引从 1 开始，0 表示 auto
-    QRegularExpressionMatchIterator it = re.globalMatch(QString::fromLatin1(block));
-    while (it.hasNext())
+    // 只取 {\colortbl 之后的内容，避免把控制字本身算作一个条目
+    const QByteArray body = block.mid(10);
+    const QList<QByteArray> entries = body.split(';');
+    int index = 0;
+    for (const QByteArray &entry : entries)
     {
-        const QRegularExpressionMatch m = it.next();
+        if (index > 0 && !entry.trimmed().isEmpty())
+        {
+            const QRegularExpressionMatch m = re.match(QString::fromLatin1(entry));
+            if (m.hasMatch())
+                colors->insert(index, QStringLiteral("#%1%2%3")
+                    .arg(m.captured(1).toInt(), 2, 16, QLatin1Char('0'))
+                    .arg(m.captured(2).toInt(), 2, 16, QLatin1Char('0'))
+                    .arg(m.captured(3).toInt(), 2, 16, QLatin1Char('0')));
+            // 非法条目同样占用索引：不插入即可，后续索引照样对齐
+        }
         ++index;
-        colors->insert(index, QStringLiteral("#%1%2%3")
-            .arg(m.captured(1).toInt(), 2, 16, QLatin1Char('0'))
-            .arg(m.captured(2).toInt(), 2, 16, QLatin1Char('0'))
-            .arg(m.captured(3).toInt(), 2, 16, QLatin1Char('0')));
     }
 }
 
@@ -267,11 +280,14 @@ void RtfDocument::handleControlWord(const QString &word, bool hasParam, int para
 {
     const bool on = hasParam ? (param != 0) : true;
 
+    // P2-8：\tab/\line/\cell/\row 会往正文里追加控制字符，必须先把待解码的高字节
+    // （\'hh 或裸高字节）落地。否则 GBK 双字节字符会被控制字符劈成两半，解码成乱码。
+    // \par 走 flushParagraph -> flushRun，本身已包含解码，无需重复处理。
     if (word == QLatin1String("par"))   { flushParagraph(); return; }
-    if (word == QLatin1String("line"))  { appendText(QStringLiteral("\n")); return; }
-    if (word == QLatin1String("tab"))   { appendText(QStringLiteral("\t")); return; }
-    if (word == QLatin1String("cell"))  { appendText(QStringLiteral(" | ")); return; }
-    if (word == QLatin1String("row"))   { appendText(QStringLiteral("\n")); return; }
+    if (word == QLatin1String("line"))  { decodePendingBytes(); appendText(QStringLiteral("\n")); return; }
+    if (word == QLatin1String("tab"))   { decodePendingBytes(); appendText(QStringLiteral("\t")); return; }
+    if (word == QLatin1String("cell"))  { decodePendingBytes(); appendText(QStringLiteral(" | ")); return; }
+    if (word == QLatin1String("row"))   { decodePendingBytes(); appendText(QStringLiteral("\n")); return; }
 
     if (word == QLatin1String("b"))      { flushRun(); m_state.b = on; return; }
     if (word == QLatin1String("i"))      { flushRun(); m_state.i = on; return; }

@@ -11,6 +11,7 @@
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
 #include "dlgpluginmap.h"
+#include "dlgfileproperty.h"
 #include "builtinviewer.h"
 #include "pluginmanager.h"
 #include "plugindiag.h"
@@ -26,9 +27,11 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QProgressDialog>
+#include <QProgressBar>
 #include <QMenu>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QSet>
 #include <functional>
 #include <QList>
@@ -49,11 +52,23 @@
 #include <QFile>
 #include <QMutexLocker>
 #include <QDeadlineTimer>
+#include <QPainter>
+#include <QStyleOptionTab>
+#include <QTabWidget>
+#include <QDockWidget>
+#include <QKeySequence>
+#include <QFontMetrics>
+#include <QLayout>
+#include <QResizeEvent>
+#include <QFrame>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
 // 超过该阈值的文件优先走「临时文件 + 路径」通道，避免整块载入内存（P1-2）
 static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
+
+// 文件列表「文件路径」列的最小宽度：面板再窄也保留这么宽，超出部分交给横向滚动条
+static const int kMinPathColumnWidth = 140;
 
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
@@ -137,6 +152,389 @@ static void compactSingleChainDirs(QStandardItem *pDir)
     }
 }
 
+// ============================================================================
+// FwFlowLayout / FwActionBar：会换行的图标工具条
+// 背景：QToolBar 在窄栏里会把放不下的动作折进溢出菜单（"»"），按钮直接消失；
+// 左侧文件列表面板宽度变化很大，改成流式布局后 8 个按钮始终可见。
+// ============================================================================
+
+FwFlowLayout::FwFlowLayout(QWidget *parent, int nMargin, int nHSpacing, int nVSpacing)
+    : QLayout(parent), m_nHSpace(nHSpacing), m_nVSpace(nVSpacing)
+{
+    setContentsMargins(nMargin, nMargin, nMargin, nMargin);
+}
+
+FwFlowLayout::~FwFlowLayout()
+{
+    QLayoutItem *pItem = nullptr;
+    while ((pItem = takeAt(0)) != nullptr)
+        delete pItem;
+}
+
+void FwFlowLayout::addItem(QLayoutItem *item)
+{
+    m_items.append(item);
+}
+
+int FwFlowLayout::count() const
+{
+    return m_items.size();
+}
+
+QLayoutItem *FwFlowLayout::itemAt(int index) const
+{
+    return m_items.value(index);
+}
+
+QLayoutItem *FwFlowLayout::takeAt(int index)
+{
+    if (index >= 0 && index < m_items.size())
+        return m_items.takeAt(index);
+    return nullptr;
+}
+
+Qt::Orientations FwFlowLayout::expandingDirections() const
+{
+    return {};
+}
+
+bool FwFlowLayout::hasHeightForWidth() const
+{
+    return true;
+}
+
+int FwFlowLayout::heightForWidth(int nWidth) const
+{
+    return doLayout(QRect(0, 0, nWidth, 0), true);
+}
+
+void FwFlowLayout::setGeometry(const QRect &rect)
+{
+    QLayout::setGeometry(rect);
+    doLayout(rect, false);
+}
+
+QSize FwFlowLayout::sizeHint() const
+{
+    return minimumSize();
+}
+
+QSize FwFlowLayout::minimumSize() const
+{
+    QSize size;
+    for (const QLayoutItem *pItem : m_items)
+        size = size.expandedTo(pItem->minimumSize());
+    const QMargins m = contentsMargins();
+    return size + QSize(m.left() + m.right(), m.top() + m.bottom());
+}
+
+// 按可用宽度排布：放不下就换行；返回本宽度下需要的总高度（bTestOnly 时只算不摆）
+int FwFlowLayout::doLayout(const QRect &rect, bool bTestOnly) const
+{
+    const QMargins m = contentsMargins();
+    const QRect rcArea = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom());
+    int x = rcArea.x();
+    int y = rcArea.y();
+    int nLineHeight = 0;
+
+    for (QLayoutItem *pItem : m_items)
+    {
+        const QSize sz = pItem->sizeHint();
+        const bool bWrap = (x + sz.width() > rcArea.right() + 1) && (nLineHeight > 0);
+        if (bWrap)
+        {
+            x = rcArea.x();
+            y += nLineHeight + m_nVSpace;
+            nLineHeight = 0;
+        }
+        if (!bTestOnly)
+            pItem->setGeometry(QRect(QPoint(x, y), sz));
+        x += sz.width() + m_nHSpace;
+        nLineHeight = qMax(nLineHeight, sz.height());
+    }
+    return y + nLineHeight - rect.y() + m.bottom();
+}
+
+FwActionBar::FwActionBar(QWidget *parent) : QWidget(parent)
+{
+    setObjectName(QStringLiteral("fileActionBar"));
+    setAttribute(Qt::WA_StyledBackground, true);
+
+    m_pLayout = new FwFlowLayout(this, 0, 2, 2);
+    m_pLayout->setContentsMargins(6, 4, 6, 4);
+
+    QSizePolicy policy(QSizePolicy::Preferred, QSizePolicy::Minimum);
+    policy.setHeightForWidth(true);
+    setSizePolicy(policy);
+}
+
+void FwActionBar::setIconSize(const QSize &size)
+{
+    m_iconSize = size;
+    for (QToolButton *pBtn : m_buttons)
+        pBtn->setIconSize(size);
+}
+
+void FwActionBar::addAction(QAction *pAction)
+{
+    if (pAction == nullptr)
+        return;
+    auto *pBtn = new QToolButton(this);
+    pBtn->setDefaultAction(pAction);          // 使能/勾选状态由 QAction 统一驱动
+    pBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    pBtn->setAutoRaise(true);
+    pBtn->setIconSize(m_iconSize);
+    pBtn->setFixedSize(QSize(30, 30));
+    pBtn->setFocusPolicy(Qt::NoFocus);
+    pBtn->setCursor(Qt::PointingHandCursor);
+    m_buttons.append(pBtn);
+    m_pLayout->addWidget(pBtn);
+    updateGeometry();
+}
+
+void FwActionBar::addSeparator()
+{
+    auto *pSep = new QWidget(this);
+    pSep->setObjectName(QStringLiteral("actionSep"));
+    pSep->setFixedSize(QSize(9, 30));
+    auto *pLine = new QFrame(pSep);
+    pLine->setObjectName(QStringLiteral("actionSepLine"));
+    pLine->setGeometry(4, 7, 1, 16);
+    pLine->setFrameShape(QFrame::NoFrame);
+    m_pLayout->addWidget(pSep);
+    updateGeometry();
+}
+
+// 兼容原 QToolBar 调用点：本控件固定图标模式、不可拖动
+void FwActionBar::setToolButtonStyle(Qt::ToolButtonStyle)
+{
+}
+
+void FwActionBar::setMovable(bool)
+{
+}
+
+void FwActionBar::setFloatable(bool)
+{
+}
+
+int FwActionBar::preferredHeightForWidth(int nWidth) const
+{
+    return m_pLayout != nullptr ? m_pLayout->heightForWidth(nWidth) : 38;
+}
+
+QSize FwActionBar::sizeHint() const
+{
+    return QSize(240, preferredHeightForWidth(240));
+}
+
+QSize FwActionBar::minimumSizeHint() const
+{
+    return QSize(30, 30);
+}
+
+// 父布局若不按 heightForWidth 分配，就在宽度变化后自己把高度调到需要值，
+// 保证换行后的第二行不会被裁掉。相等时不重设，避免布局循环。
+void FwActionBar::resizeEvent(QResizeEvent *pEvent)
+{
+    QWidget::resizeEvent(pEvent);
+    if (m_bInHeightFix)
+        return;
+    const int nNeed = preferredHeightForWidth(width());
+    if (nNeed > 0 && height() != nNeed)
+    {
+        m_bInHeightFix = true;
+        setFixedHeight(nNeed);
+        m_bInHeightFix = false;
+    }
+}
+
+// ============================================================================
+// 标签页「新建 +」按钮：贴在最后一个标签右侧（替代 setCornerWidget 甩到窗口最右）
+// ============================================================================
+void MainWindow::updateNewTabButton()
+{
+    if (m_btnNewTab == nullptr)
+        return;
+    QTabBar *pBar = ui->tabWidget->tabBar();
+    if (pBar == nullptr)
+        return;
+
+    if (pBar->count() <= 0)
+    {
+        m_btnNewTab->hide();
+        return;
+    }
+
+    const QRect rcLast = pBar->tabRect(pBar->count() - 1);
+    if (!rcLast.isValid() || rcLast.isEmpty())
+    {
+        m_btnNewTab->hide();
+        return;
+    }
+
+    const int nSize = qMin(24, qMax(18, rcLast.height() - 6));
+    // QTabBar 自身宽度只等于所有标签的宽度之和，右侧空白属于 QTabWidget，
+    // 所以「+」挂在 QTabWidget 上，用 mapTo 换算坐标。
+    const QPoint ptLast = pBar->mapTo(ui->tabWidget, rcLast.topLeft());
+    const int nX = ptLast.x() + rcLast.width() + 6;
+    const int nY = ptLast.y() + (rcLast.height() - nSize) / 2;
+    if (nX + nSize > ui->tabWidget->width() - 2)
+    {
+        // 标签已经占满整行：藏起来，避免压住标签文字
+        m_btnNewTab->hide();
+        return;
+    }
+    const QRect rcTarget(nX, nY, nSize, nSize);
+    if (m_btnNewTab->geometry() != rcTarget)
+        m_btnNewTab->setGeometry(rcTarget);
+    m_btnNewTab->show();
+    m_btnNewTab->raise();
+}
+
+// 运行期绘制的标签页类型角标：品牌色圆角方块 + 一个字母。
+// 不依赖额外的图片资源，任何 DPI 下都清晰。
+static QIcon makeTypeBadge(const QString &sLetter, const QColor &clrBadge)
+{
+    QIcon icon;
+    for (int nSize : {16, 24, 32})
+    {
+        QPixmap pm(nSize, nSize);
+        pm.fill(Qt::transparent);
+
+        QPainter painter(&pm);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(clrBadge);
+        const qreal dRadius = nSize * 0.28;
+        painter.drawRoundedRect(QRectF(0.5, 0.5, nSize - 1.0, nSize - 1.0), dRadius, dRadius);
+
+        QFont font(QStringLiteral("Segoe UI"));
+        font.setBold(true);
+        font.setPixelSize(qMax(8, int(nSize * 0.62)));
+        painter.setFont(font);
+        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawText(QRect(0, 0, nSize, nSize), Qt::AlignCenter, sLetter);
+        painter.end();
+
+        icon.addPixmap(pm);
+    }
+    return icon;
+}
+
+// 停靠面板标题栏「浮动 / 关闭」按钮的图标：中性灰线性图形，运行期绘制。
+// 不用系统自带的 SP_TitleBarNormalButton / SP_TitleBarCloseButton——Fusion 给的
+// 那两枚图标自身带一圈立体边框，压进 16px 就成了一团灰色小方块，和本主题的扁平
+// 风格也打架。X 的取色与 resources/theme/icons/close_light.xpm 保持一致。
+static QIcon makeDockTitleIcon(bool bClose)
+{
+    QIcon icon;
+    for (int nSize : {16, 24, 32, 48})
+    {
+        QPixmap pm(nSize, nSize);
+        pm.fill(Qt::transparent);
+
+        QPainter painter(&pm);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QPen pen(QColor(QStringLiteral("#8A93A2")));
+        pen.setWidthF(qMax(1.0, nSize / 11.0));
+        pen.setCapStyle(Qt::RoundCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        painter.setPen(pen);
+        painter.setBrush(Qt::NoBrush);
+
+        if (bClose)
+        {
+            const qreal dInset = nSize * 0.22;
+            painter.drawLine(QPointF(dInset, dInset), QPointF(nSize - dInset, nSize - dInset));
+            painter.drawLine(QPointF(nSize - dInset, dInset), QPointF(dInset, nSize - dInset));
+        }
+        else
+        {
+            // 两个错位的圆角方框 = 「浮出成独立窗口」（VS Code / Office 同款语义）。
+            // 交叠处先用 Clear 抠掉再画前框，两条描边不会糊成一团。
+            const qreal dUnit = nSize * 0.14;
+            const qreal dRadius = dUnit * 0.5;
+            const QRectF rcBack(dUnit, dUnit, nSize - 3 * dUnit, nSize - 3 * dUnit);
+            const QRectF rcFront(2 * dUnit, 2 * dUnit, nSize - 3 * dUnit, nSize - 3 * dUnit);
+            painter.drawRoundedRect(rcBack, dRadius, dRadius);
+
+            const qreal dGap = pen.widthF() + 0.5;
+            painter.save();
+            painter.setCompositionMode(QPainter::CompositionMode_Clear);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(Qt::black);
+            painter.drawRoundedRect(rcFront.adjusted(-dGap, -dGap, dGap, dGap), dRadius, dRadius);
+            painter.restore();
+
+            painter.setPen(pen);
+            painter.drawRoundedRect(rcFront, dRadius, dRadius);
+        }
+        painter.end();
+
+        icon.addPixmap(pm);
+    }
+    return icon;
+}
+
+// 按后缀把文件归到 9 类，返回对应角标（未知类型给灰色问号）
+QIcon MainWindow::tabIconForFile(const QString &sFileName)
+{
+    struct BadgeRule
+    {
+        const char *szLetters;      // 后缀列表，逗号分隔
+        const char *szBadgeLetter;  // 角标上的字母
+        const char *szColor;        // 角标底色
+    };
+    static const BadgeRule kRules[] = {
+        {"pdf",                                             "P", "#E5484D"},
+        {"doc,docx,odt,rtf,dot,dotx,docm,wps",              "W", "#2B6CB0"},
+        {"xls,xlsx,ods,csv,xlsm,et",                        "X", "#1F8A54"},
+        {"ppt,pptx,odp,dps",                                "S", "#D97706"},
+        {"jpg,jpeg,png,gif,bmp,webp,tif,tiff,ico,svg,xpm",  "I", "#7C3AED"},
+        {"mp4,mkv,avi,mov,wmv,flv,webm,mp3,wav,flac,aac,"
+         "ogg,m4a,wma,m2ts,ts,mpg,mpeg,3gp,rm,rmvb",        "M", "#0E9AA7"},
+        {"epub,mobi,azw,azw3,fb2,lit,prc,pdb",              "B", "#B45309"},
+        {"txt,log,md,ini,cfg,json,xml,yaml,yml,cpp,h,cs,"
+         "py,js,ts,java,sql,sh,bat,ps1,html,htm,css",       "T", "#4B5563"},
+        {"zip,rar,7z,gz,tar,bz2",                           "Z", "#6D28D9"},
+    };
+    static QHash<QString, QIcon> s_mapIcons;
+    if (s_mapIcons.isEmpty())
+    {
+        for (const BadgeRule &rule : kRules)
+        {
+            const QIcon icon = makeTypeBadge(QString::fromLatin1(rule.szBadgeLetter),
+                                             QColor(QString::fromLatin1(rule.szColor)));
+            const QStringList listExts = QString::fromLatin1(rule.szLetters).split(',');
+            for (const QString &sExt : listExts)
+                s_mapIcons.insert(sExt.trimmed(), icon);
+        }
+    }
+
+    const QString sExt = QFileInfo(sFileName).suffix().toLower();
+    const auto it = s_mapIcons.constFind(sExt);
+    if (it != s_mapIcons.constEnd())
+        return it.value();
+
+    static const QIcon s_iconUnknown = makeTypeBadge(QStringLiteral("?"), QColor(QStringLiteral("#94A3B8")));
+    return s_iconUnknown;
+}
+
+// 窗口标题：归档名 + 未保存标记（和标签页的关闭确认逻辑保持一致）
+void MainWindow::updateWindowTitle()
+{
+    const QString sArchive = m_fileManager->archivePath();
+    if (!m_fileManager->isArchiveLoaded() || sArchive.isEmpty())
+    {
+        setWindowTitle(tr("文件查看器"));
+        return;
+    }
+    setWindowTitle(tr("文件查看器 - %1%2")
+                       .arg(QFileInfo(sArchive).fileName(),
+                            m_fileManager->needsSave() ? QStringLiteral(" *") : QString()));
+}
+
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::MainWindow)
@@ -149,6 +547,9 @@ MainWindow::MainWindow(QWidget *parent) :
     initWidgetFilePath();
     initWidgetFileContent();
     restoreUiState();
+
+    // 所有停靠窗创建完之后统一处理标题栏按钮（新增停靠窗时在这里能一并覆盖）
+    polishDockTitleButtons();
 
     // 启动时一次性加载所有插件（避免每次双击重复 reload）
     PluginManager::getInstance()->loadAllPlugins();
@@ -170,7 +571,9 @@ MainWindow::MainWindow(QWidget *parent) :
     m_acOutputFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
     ui->actionUnloadFile->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_U));
 
-    ui->menu_2->setIcon(FwIcons::get(QStringLiteral("plugin")));
+    // 注意：不要给菜单栏上的 QMenu 设图标。QMenuBar 计算菜单项宽度时只按文字算、
+    // 绘制时却把图标画在文字位置，结果「插件设置」会只剩一个图标、文字被挤没
+    // （2026-11-19 实测，150% DPI 同样复现）。菜单项（QAction）的图标不受影响。
 
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
     m_acVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
@@ -242,15 +645,21 @@ MainWindow::~MainWindow()
     // 析构期间不再触发 activateTab，避免销毁标签页时重入渲染逻辑
     disconnect(ui->tabWidget, nullptr, this, nullptr);
 
-    // 先停止后台播放，再销毁标签页，最后清理临时文件
-    if (m_pCurrentInterface != nullptr)
-    {
-        m_pCurrentInterface->stopPlaybackAndWait();
-        m_pCurrentInterface = nullptr;
-    }
+    // P0-3：先尝试停止**所有**标签页的实例（不仅是当前页）；停不下来的不能让
+    // 它们的映射/实例/DLL 进入释放路径。
+    ensureAllInstancesStopped();
     for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
         destroyTabAt(i);
-    releaseAllMappedInputs();   // 兜底：释放不在标签页里的映射
+
+    if (!m_setStopUnsafe.isEmpty() || !m_vtDeferredInstances.isEmpty())
+    {
+        // 进程即将退出：保留映射、实例和 loader，禁止 PluginManager 析构时 unload DLL
+        // （后台线程若仍在执行插件代码，unload 会立刻崩溃）。
+        PluginManager::getInstance()->setUnloadEnabled(false);
+        qWarning() << "[Lifecycle] 退出时仍有停播未确认的插件实例，保留映射并跳过 DLL 卸载";
+    }
+
+    releaseAllMappedInputs();   // 兜底：只释放已确认安全的映射
     cleanupTempFiles();
 
     if (m_tvFilePath)
@@ -275,6 +684,16 @@ void MainWindow::cleanupTempFiles()
 // 文件不再被占用。避免旧归档的临时副本一直占着磁盘。
 void MainWindow::discardTempCache()
 {
+    // P0-3/P1-8：停播未确认的实例仍可能按路径读取临时文件。
+    // 这些文件必须保留到进程退出，删除会让后台线程读到已删除/被替换的内容
+    // （Windows 上通常删不掉，但共享模式下也可能成功）。
+    if (!m_setStopUnsafe.isEmpty() || !m_vtDeferredInstances.isEmpty())
+    {
+        m_mapTempCache.clear();
+        m_listTempOrder.clear();
+        qWarning() << "[TempCache] 有停播未确认的插件实例，保留临时副本不删除";
+        return;
+    }
     for (const QString &p : m_setTempFiles)
         QFile::remove(p);
     m_setTempFiles.clear();
@@ -287,6 +706,17 @@ void MainWindow::onFileManagerWarning(const QString &sMsg)
     statusBar()->showMessage(sMsg, 10000);
 }
 
+// 插件拒绝打开时的说明（接口 v6）：插件给了真实原因就按原因说。
+// 以前不管什么原因，界面上一律是「插件无法显示该文件」—— 于是
+// "这台机器没有音频输出设备"被用户当成"文件坏了"，按提示永远修不好。
+QString MainWindow::pluginFailureText(const QString &sFileName, const QString &sWhy)
+{
+    const QString sReason = sWhy.trimmed();
+    if (sReason.isEmpty())
+        return tr("插件无法显示该文件：%1").arg(sFileName);
+    return tr("无法打开 %1：%2").arg(sFileName, sReason);
+}
+
 // 初始化【文件列表】窗口
 void MainWindow::initWidgetFilePath()
 {
@@ -297,16 +727,39 @@ void MainWindow::initWidgetFilePath()
     m_hModelFilePath->setHeaderData(2, Qt::Horizontal, tr("类型"));
     m_tvFilePath = ui->treeView;
     m_tvFilePath->setModel(m_hModelFilePath);
-    m_tvFilePath->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_tvFilePath->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    m_tvFilePath->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    // 列宽策略：
+    //   0 文件路径 —— 自己管理（Interactive），宽度 = 视口宽 - 其余两列，且不低于
+    //               kMinPathColumnWidth；这样面板拖窄时路径列不会被挤成一条缝，
+    //               放不下就出横向滚动条。
+    //   1 大小 / 2 类型 —— 按内容自适应。
+    QHeaderView *pHeader = m_tvFilePath->header();
+    pHeader->setStretchLastSection(false);
+    pHeader->setSectionResizeMode(0, QHeaderView::Interactive);
+    pHeader->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    pHeader->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    connect(pHeader, &QHeaderView::geometriesChanged, this, [this]() {
+        if (m_bAdjustingPathColumn)
+            return;
+        // 延后一拍：让 ResizeToContents 的两列先算出新宽度
+        QTimer::singleShot(0, this, [this]() { adjustPathColumnWidth(); });
+    });
     m_tvFilePath->setSortingEnabled(true);   // 平铺/树形都允许列排序；树形为同级排序
+    // 列表观感：统一行高、斑马纹、收敛缩进（缩进太大会把深层文件名挤没）。
+    // 注意 uniformRowHeights 必须在填充模型之前设置，否则视图可能不刷新行。
+    m_tvFilePath->setUniformRowHeights(true);
+    m_tvFilePath->setAlternatingRowColors(true);
+    m_tvFilePath->setIndentation(14);
+    m_tvFilePath->setAllColumnsShowFocus(true);
     // 表头的鼠标事件是发到 header 的 viewport 上的，过滤器必须装在 viewport 上，
     // 否则收不到按下列头的事件，排序后无法恢复展开状态。
     m_tvFilePath->header()->viewport()->installEventFilter(this);
 
-    // 添加工具栏
-    m_tbFilePath = new QToolBar(ui->dwFilePath);
+    // 文件列表工具条：图标化 + 按语义分组。
+    // 用 FwActionBar（流式布局）而不是 QToolBar：QToolBar 在窄栏里会把放不下的动作
+    // 折进溢出菜单（"»"）导致按钮直接消失；FwActionBar 改成排满换行，8 个按钮始终可见。
+    m_tbFilePath = new FwActionBar(ui->dockWidgetContents);
+    m_tbFilePath->setIconSize(QSize(18, 18));
+
     m_acViewTree = new QAction("树形显示", m_tbFilePath);
     m_acViewFlat = new QAction("平铺显示", m_tbFilePath);
     m_acShowFilePath = new QAction("显示路径", m_tbFilePath);
@@ -317,15 +770,22 @@ void MainWindow::initWidgetFilePath()
     m_acSaveFile = new QAction("保存文件", m_tbFilePath);
     m_acSaveFile->setEnabled(false);
 
-    m_acViewTree->setToolTip("按合并前的目录层级以树形展示");
-    m_acViewFlat->setToolTip("不显示层级，每个文件一行");
-    m_acShowFilePath->setToolTip("平铺模式下显示文件的完整路径");
-    m_acShowFileName->setToolTip("平铺模式下仅显示文件名");
+    m_acViewTree->setToolTip(tr("树形显示：按合并前的目录层级展示"));
+    m_acViewFlat->setToolTip(tr("平铺显示：不显示层级，每个文件一行"));
+    m_acShowFilePath->setToolTip(tr("平铺模式下显示文件的完整路径"));
+    m_acShowFileName->setToolTip(tr("平铺模式下仅显示文件名"));
+    m_acAddFile->setToolTip(tr("添加文件到当前归档"));
+    m_acDelFile->setToolTip(tr("从归档中删除选中的文件"));
+    m_acOutputFile->setToolTip(tr("把选中的文件导出到磁盘"));
+    m_acSaveFile->setToolTip(tr("保存对归档的改动（Ctrl+S）"));
 
+    // 视图（树/平铺）｜显示（路径/名称）｜文件（增删导出保存）
     m_tbFilePath->addAction(m_acViewTree);
     m_tbFilePath->addAction(m_acViewFlat);
+    m_tbFilePath->addSeparator();
     m_tbFilePath->addAction(m_acShowFilePath);
     m_tbFilePath->addAction(m_acShowFileName);
+    m_tbFilePath->addSeparator();
     m_tbFilePath->addAction(m_acAddFile);
     m_tbFilePath->addAction(m_acDelFile);
     m_tbFilePath->addAction(m_acOutputFile);
@@ -333,18 +793,43 @@ void MainWindow::initWidgetFilePath()
 
     // 文件列表 dock 可关闭且 saveState() 会持久化隐藏态；必须提供恢复入口，
     // 否则用户关掉后再启动就再也看不到列表（只能删 ini）。
+    // 同理给主工具栏一个 windowTitle：QMainWindow 的右键菜单会把它列成开关项，
+    // 而 QToolBar 的开关项文字取自 windowTitle，.ui 里没设就会变成一个只有勾选、
+    // 没有文字的空白项。
+    ui->mainToolBar->setWindowTitle(tr("主工具栏"));
     QMenu *pViewMenu = menuBar()->addMenu(tr("视图"));
+    pViewMenu->addAction(ui->mainToolBar->toggleViewAction());
     pViewMenu->addAction(ui->dwFilePath->toggleViewAction());
 
-    // 筛选框：按路径/文件名过滤列表（树形与平铺模式都生效）
-    m_leFilter = new QLineEdit(m_tbFilePath);
+    // 筛选框：单独占一行并拉满宽度（按路径/文件名过滤，树形与平铺模式都生效）
+    QWidget *pSearchRow = new QWidget(ui->dockWidgetContents);
+    pSearchRow->setObjectName(QStringLiteral("searchRow"));
+    QHBoxLayout *pSearchLayout = new QHBoxLayout(pSearchRow);
+    pSearchLayout->setContentsMargins(8, 8, 8, 3);
+    pSearchLayout->setSpacing(0);
+
+    m_leFilter = new QLineEdit(pSearchRow);
     m_leFilter->setObjectName(QStringLiteral("leFilter"));
-    m_leFilter->setPlaceholderText(tr("筛选文件名/路径…"));
+    m_leFilter->setPlaceholderText(tr("搜索文件名或路径…"));
     m_leFilter->setClearButtonEnabled(true);
-    m_leFilter->setMaximumWidth(200);
-    m_tbFilePath->addWidget(m_leFilter);
+    m_leFilter->setMinimumWidth(160);
+    pSearchLayout->addWidget(m_leFilter);
+    // P1-9：每次按键都全量重建树/列表，在大归档下会明显卡顿。
+    // 去抖 150 ms：连续输入只刷新最后一次；回车/清空仍然立刻生效。
+    m_filterDebounce = new QTimer(this);
+    m_filterDebounce->setSingleShot(true);
+    m_filterDebounce->setInterval(150);
+    connect(m_filterDebounce, &QTimer::timeout, this, [this]() {
+        m_sFilter = m_leFilter->text().trimmed();
+        refreshFilePathView();
+    });
     connect(m_leFilter, &QLineEdit::textChanged, this, [this](const QString &sText) {
-        m_sFilter = sText.trimmed();
+        Q_UNUSED(sText);
+        m_filterDebounce->start();
+    });
+    connect(m_leFilter, &QLineEdit::returnPressed, this, [this]() {
+        if (m_filterDebounce) m_filterDebounce->stop();
+        m_sFilter = m_leFilter->text().trimmed();
         refreshFilePathView();
     });
 
@@ -379,20 +864,28 @@ void MainWindow::initWidgetFilePath()
     m_acOutputFile->setIcon(FwIcons::get(QStringLiteral("export")));
     m_acSaveFile->setIcon(FwIcons::get(QStringLiteral("save")));
 
-    // 主工具栏：之前是空的，只保留最常用文件操作
-    ui->mainToolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    // 主工具栏：只保留最常用文件操作，且**只显示图标**——文字放在 tooltip 里，
+    // 鼠标悬停时才出现。菜单「文件处理」里仍是「图标 + 文字」，可发现性不受影响；
+    // tooltip 顺带标出快捷键，省得再去菜单里找。
+    ui->mainToolBar->setToolButtonStyle(Qt::ToolButtonIconOnly);
     ui->mainToolBar->setIconSize(QSize(24, 24));
+    ui->actionLoadFile->setToolTip(tr("加载文件（Ctrl+O）"));
+    ui->actionUnloadFile->setToolTip(tr("卸载文件（Ctrl+U）"));
+    ui->actionMergeFile->setToolTip(tr("合并文件（Ctrl+M）"));
+    ui->actionSplitFile->setToolTip(tr("分割文件"));
     ui->mainToolBar->addAction(ui->actionLoadFile);
     ui->mainToolBar->addAction(ui->actionUnloadFile);
     ui->mainToolBar->addSeparator();
     ui->mainToolBar->addAction(ui->actionMergeFile);
     ui->mainToolBar->addAction(ui->actionSplitFile);
 
-    // 将工具栏放置在文件列表栏的上头
-    QVBoxLayout *vbLytFilePath = new QVBoxLayout();
+    // 左侧面板三段式：搜索行 / 图标工具条 / 文件树
+    QVBoxLayout *vbLytFilePath = new QVBoxLayout(ui->dockWidgetContents);
+    vbLytFilePath->setContentsMargins(0, 0, 0, 0);
+    vbLytFilePath->setSpacing(0);
+    vbLytFilePath->addWidget(pSearchRow);
     vbLytFilePath->addWidget(m_tbFilePath);
-    vbLytFilePath->addWidget(m_tvFilePath);
-    ui->dockWidgetContents->setLayout(vbLytFilePath);
+    vbLytFilePath->addWidget(m_tvFilePath, 1);
 
     // 默认树形模式，故平铺模式专属的两个按钮置灰；同时统一刷新保存按钮等状态
     syncActionStates();
@@ -408,29 +901,114 @@ void MainWindow::initWidgetFilePath()
     m_tvFilePath->viewport()->installEventFilter(this);
 }
 
+// 停靠面板标题栏按钮（浮动 / 关闭）的尺寸与图标。
+// 实测（Qt 6.9.3 + Fusion + light.qss）：Fusion 自带的图标带立体边框，主题又给这
+// 两颗按钮 2px 内边距，结果按钮只有 18×10、图标被压到 6px 高——既看不清也点不准，
+// 高缩放下更糊。这里统一放大到 22×22（16px 图标 + 3px 留白），与主工具栏 24px、
+// 文件列表工具条 18px 的图标尺度对齐，并换成上面的线性图标。
+// 尺寸用 setFixedSize 而不是 QSS：QDockWidgetTitleButton::sizeHint() 已经把 style
+// 的 padding 算进去了，再在 QSS 里写 min-width 会和主题里已有的 padding 互相打架。
+void MainWindow::polishDockTitleButtons()
+{
+    const QSize szButton(22, 22);
+    const QSize szIconSize(16, 16);
+
+    auto polishOne = [&](QDockWidget *pDock, const char *szObjectName, bool bClose,
+                         const QString &sTip, const QString &sAccessibleName) {
+        auto *pBtn = pDock->findChild<QAbstractButton *>(QString::fromLatin1(szObjectName));
+        // 对象名是 Qt 的内部约定（QDockWidgetPrivate 里写死）；版本不同查不到时静默
+        // 跳过，退化成系统默认按钮，功能不受影响。
+        if (!pBtn)
+            return;
+        pBtn->setFixedSize(szButton);
+        pBtn->setIconSize(szIconSize);
+        pBtn->setIcon(makeDockTitleIcon(bClose));
+        pBtn->setToolTip(sTip);
+        pBtn->setAccessibleName(sAccessibleName);
+        pBtn->setCursor(Qt::PointingHandCursor);
+    };
+
+    for (QDockWidget *pDock : findChildren<QDockWidget *>())
+    {
+        polishOne(pDock, "qt_dockwidget_floatbutton", false,
+                  tr("浮动为独立窗口"), tr("浮动面板"));
+        polishOne(pDock, "qt_dockwidget_closebutton", true,
+                  tr("关闭面板（可从「视图」菜单重新打开）"), tr("关闭面板"));
+    }
+}
+
 // 初始化【文件内容】窗口（多标签页）
 void MainWindow::initWidgetFileContent()
 {
     // 清空 UI 默认自带的占位标签页
     ui->tabWidget->clear();
     ui->tabWidget->setTabsClosable(true);   // 允许关闭标签页
-    ui->tabWidget->setMovable(false);
+    ui->tabWidget->setMovable(true);        // 允许拖动标签排序
+
+    // 「新建标签页 +」贴在最后一个标签右侧（以前用 setCornerWidget 放在窗口最右边，
+    // 标签在左、按钮在右，鼠标要走大半个屏幕）。这里用叠在标签栏上的普通按钮实现，
+    // 标签增删/窗口缩放后由 updateNewTabButton() 重新定位。
+    m_btnNewTab = new QToolButton(ui->tabWidget);
+    m_btnNewTab->setObjectName(QStringLiteral("btnNewTab"));
+    m_btnNewTab->setText(QStringLiteral("+"));
+    m_btnNewTab->setToolTip(tr("新建标签页（Ctrl+T）"));
+    m_btnNewTab->setAutoRaise(true);
+    m_btnNewTab->setCursor(Qt::PointingHandCursor);
+    m_btnNewTab->setFixedSize(24, 24);
+    connect(m_btnNewTab, &QToolButton::clicked, this, &MainWindow::onActionNewTabTriggered);
+
+    // 标签栏事件：中键关闭 + 布局变化后重排「+」
+    ui->tabWidget->tabBar()->installEventFilter(this);
+    ui->tabWidget->installEventFilter(this);
+    ui->tabWidget->tabBar()->setElideMode(Qt::ElideMiddle);
+    ui->tabWidget->tabBar()->setUsesScrollButtons(true);
 
     connect(ui->tabWidget, &QTabWidget::tabCloseRequested,
             this, &MainWindow::onTabCloseRequested);
     connect(ui->tabWidget, &QTabWidget::currentChanged,
             this, &MainWindow::onTabCurrentChanged);
+    // P0-2：允许拖动标签，但必须同步 m_vTabDocs，否则后续按标签下标取文档
+    // 会取到另一个实例（关闭/停播/删除都可能作用到错误对象）。
+    connect(ui->tabWidget->tabBar(), &QTabBar::tabMoved,
+            this, &MainWindow::onTabBarTabMoved);
 
-    // 标签栏右上角“+”按钮：新建空白标签页
-    QToolButton *btnNewTab = new QToolButton(this);
-    btnNewTab->setText("+");
-    btnNewTab->setToolTip("新建标签页");
-    btnNewTab->setAutoRaise(true);
-    connect(btnNewTab, &QToolButton::clicked, this, &MainWindow::onActionNewTabTriggered);
-    ui->tabWidget->setCornerWidget(btnNewTab, Qt::TopRightCorner);
+    // 标签页相关快捷键（挂在窗口上，窗口激活即可用）
+    auto addWindowShortcut = [this](const QKeySequence &seq, const std::function<void()> &fn) {
+        QAction *pAction = new QAction(this);
+        pAction->setShortcut(seq);
+        pAction->setShortcutContext(Qt::WindowShortcut);
+        connect(pAction, &QAction::triggered, this, fn);
+        addAction(pAction);
+    };
+    addWindowShortcut(QKeySequence(Qt::CTRL | Qt::Key_W), [this]() {
+        const int nIndex = ui->tabWidget->currentIndex();
+        if (nIndex >= 0)
+            onTabCloseRequested(nIndex);
+    });
+    addWindowShortcut(QKeySequence(Qt::CTRL | Qt::Key_T), [this]() {
+        onActionNewTabTriggered();
+    });
+    addWindowShortcut(QKeySequence(Qt::CTRL | Qt::Key_Tab), [this]() {
+        const int nCount = ui->tabWidget->count();
+        if (nCount > 1)
+            ui->tabWidget->setCurrentIndex((ui->tabWidget->currentIndex() + 1) % nCount);
+    });
+    addWindowShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Tab), [this]() {
+        const int nCount = ui->tabWidget->count();
+        if (nCount > 1)
+            ui->tabWidget->setCurrentIndex((ui->tabWidget->currentIndex() - 1 + nCount) % nCount);
+    });
+    addWindowShortcut(QKeySequence(Qt::CTRL | Qt::Key_F), [this]() {
+        if (m_leFilter != nullptr)
+        {
+            m_leFilter->setFocus(Qt::ShortcutFocusReason);
+            m_leFilter->selectAll();
+        }
+    });
 
     // 默认新建一个空白标签页
     newEmptyTab();
+    updateNewTabButton();
 }
 
 // 新建一个空白标签页（无文件）
@@ -459,11 +1037,12 @@ void MainWindow::closeAllTabs()
     disconnect(ui->tabWidget, &QTabWidget::currentChanged, this, &MainWindow::onTabCurrentChanged);
     disconnect(ui->tabWidget, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
 
-    // 先停止当前实例的后台播放，再逐个销毁标签页（避免音视频在实例销毁前仍在后台运行）
-    if (m_pCurrentInterface != nullptr)
+    // P0-3：逐个停止**所有**实例（以前只停当前实例）。停播失败的实例会转入
+    // 延期清理：保留映射/实例/loader，不再走 delete 与 DLL 卸载。
+    if (!ensureAllInstancesStopped())
     {
-        m_pCurrentInterface->stopPlaybackAndWait();
-        m_pCurrentInterface = nullptr;
+        PluginManager::getInstance()->setUnloadEnabled(false);
+        qWarning() << "[Lifecycle] 关闭全部标签页时有实例停播未确认，禁止卸载插件 DLL";
     }
 
     // 逐个销毁标签页（含各自独占的插件实例，会连带销毁其内部窗口）
@@ -887,10 +1466,18 @@ void MainWindow::reloadAllPlugins()
 
     if (m_pCurrentInterface != nullptr)
     {
-        m_pCurrentInterface->stopPlaybackAndWait();
+        ensureInstanceStopped(m_pCurrentInterface);
         m_pCurrentInterface = nullptr;
     }
     closeAllTabs();                        // 销毁标签页持有的插件实例
+    if (!m_vtDeferredInstances.isEmpty() || !m_setStopUnsafe.isEmpty())
+    {
+        // P0-3：仍有实例停播未确认 —— 卸载 DLL 会让后台线程执行已卸载代码
+        QMessageBox::warning(this, QStringLiteral("重新加载插件"),
+            QStringLiteral("有插件的后台播放未能确认停止，为避免访问已卸载的代码，\n"
+                           "本次不重新加载插件。请稍后重试或重启程序。"));
+        return;
+    }
     m_setWarnedPlugins.clear();
     m_setBuiltinTextPlugins.clear();
     m_setPluginWidgets.clear();
@@ -998,7 +1585,8 @@ void MainWindow::openFileInNewTab(const FILEINFO &info)
     doc.needsRender = true;
     m_vTabDocs.append(doc);
 
-    int newIdx = ui->tabWidget->addTab(new QWidget(), info.sFileName);
+    int newIdx = ui->tabWidget->addTab(new QWidget(), tabIconForFile(info.sFileName),
+                                       info.sFileName);
     ui->tabWidget->setCurrentIndex(newIdx); // 触发 currentChanged -> activateTab
 }
 
@@ -1034,6 +1622,7 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
         m_vTabDocs[cur].info = info;
         m_vTabDocs[cur].needsRender = true;
         ui->tabWidget->setTabText(cur, info.sFileName);
+        ui->tabWidget->setTabIcon(cur, tabIconForFile(info.sFileName));
         activateTab(cur);
         return;
     }
@@ -1052,13 +1641,18 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
         m_vTabDocs[cur].info = info;
         m_vTabDocs[cur].needsRender = true;
         ui->tabWidget->setTabText(cur, info.sFileName);   // 标题跟随新文件
+        ui->tabWidget->setTabIcon(cur, tabIconForFile(info.sFileName));
         activateTab(cur);
         return;
     }
 
     // 其它情况：该页需要换成新的插件实例（可能换了插件类型）。
-    // 若旧实例正在播放，先停止，避免其解码线程/音频输出残留。
-    if (doc.interface != nullptr && doc.interface == m_pCurrentInterface)
+    // P0-3：先确认旧实例的后台线程已退出。停播失败时**不** delete、不摘映射，
+    // 实例转入延期清理（页面保持存活，随实例一起泄漏而不是悬空）。
+    bool bOldSafeToDestroy = true;
+    if (doc.interface != nullptr && doc.ownsInterface)
+        bOldSafeToDestroy = ensureInstanceStopped(doc.interface);
+    else if (doc.interface != nullptr && doc.interface == m_pCurrentInterface)
         stopCurrentPlaybackAndInvalidate();
 
     // 摘页并销毁旧的独占实例（连带其内部窗口）；共享实例与插件窗口不删
@@ -1067,15 +1661,14 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     ui->tabWidget->removeTab(cur);
 
     QWidget *pOldOwned = nullptr;
-    // 先摘下旧实例的归档映射（不能等到 delete 之后再用悬空指针作哈希键）
-    QSharedPointer<MappedInput> pOldMapped = doc.interface != nullptr
-                                  ? m_mapMappedInputs.take(doc.interface) : QSharedPointer<MappedInput>();
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOldOwned = doc.interface->getPluginWidget();
-        delete doc.interface;
+        if (bOldSafeToDestroy)
+            delete doc.interface;
+        else
+            m_vtDeferredInstances.append(doc.interface);
     }
-    pOldMapped.clear();   // 实例销毁（解码线程已停）后再释放映射
     if (pOldPage != nullptr && pOldPage != pOldOwned && !m_setPluginWidgets.contains(pOldPage))
         delete pOldPage;
 
@@ -1088,37 +1681,156 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     doc.needsRender = true;
     m_vTabDocs.insert(cur, doc);
 
-    ui->tabWidget->insertTab(cur, new QWidget(), info.sFileName);
+    ui->tabWidget->insertTab(cur, new QWidget(), tabIconForFile(info.sFileName), info.sFileName);
     ui->tabWidget->setCurrentIndex(cur); // 触发 currentChanged -> activateTab
     activateTab(cur);                    // 当前页未变化时 currentChanged 不触发，这里兜底显式激活
 }
 
+// P0-2：拖动标签后，标签顺序与 m_vTabDocs 必须保持一致。
+// tabMoved 在移动完成后发出，被拖动的标签数据/窗口已经位于 to 位置；
+// 按「该位置上的插件窗口」找到文档，再把它移动到同一位置。
+void MainWindow::onTabBarTabMoved(int from, int to)
+{
+    if (from == to || from < 0 || to < 0)
+        return;
+    if (to >= m_vTabDocs.size() || from >= m_vTabDocs.size())
+        return;
+
+    // 被拖动的标签页（to 位置）对应的文档下标。空标签页没有插件窗口，
+    // 直接使用 from（tabMoved 的语义就是同一元素从 from 移到 to）。
+    int nDoc = -1;
+    const QWidget *page = ui->tabWidget->widget(to);
+    if (page != nullptr)
+    {
+        for (int i = 0; i < m_vTabDocs.size(); ++i)
+        {
+            if (m_vTabDocs.at(i).interface != nullptr
+                && m_vTabDocs.at(i).interface->getPluginWidget() == page)
+            {
+                nDoc = i;
+                break;
+            }
+        }
+    }
+    if (nDoc < 0)
+        nDoc = from;
+    if (nDoc == to)
+        return;
+
+    m_vTabDocs.move(nDoc, to);
+}
+
+// 标签下标 -> 文档下标（P0-2）。插件页用窗口指针定位，占位页回退到顺序下标。
+int MainWindow::docIndexForTab(int tabIndex) const
+{
+    if (tabIndex < 0 || tabIndex >= ui->tabWidget->count())
+        return -1;
+    const QWidget *page = ui->tabWidget->widget(tabIndex);
+    if (page != nullptr)
+    {
+        for (int i = 0; i < m_vTabDocs.size(); ++i)
+        {
+            if (m_vTabDocs.at(i).interface != nullptr
+                && m_vTabDocs.at(i).interface->getPluginWidget() == page)
+                return i;
+        }
+    }
+    return (tabIndex < m_vTabDocs.size()) ? tabIndex : -1;
+}
+
+// P0-3：停止失败（返回 false）表示后台线程仍可能访问宿主的内存映射。
+// 此时必须保留映射、插件实例和 loader，任何 unmap/delete/卸载都是 UAF。
+bool MainWindow::ensureInstanceStopped(PluginInterface *iface)
+{
+    if (iface == nullptr)
+        return true;
+
+    // 已经确认停不下来：不再重复等待几十秒；实例保持延期清理状态。
+    if (m_setStopUnsafe.contains(iface))
+        return false;
+
+    if (m_pCurrentInterface == iface)
+        m_pCurrentInterface = nullptr;
+
+    if (!iface->stopPlaybackAndWait())
+    {
+        m_setStopUnsafe.insert(iface);
+        qWarning() << "[Lifecycle] 插件停播未确认，保留映射与实例:"
+                   << static_cast<const void *>(iface);
+        return false;
+    }
+
+    releaseMappedInput(iface);
+    return true;
+}
+
+bool MainWindow::ensureAllInstancesStopped()
+{
+    bool bAllSafe = true;
+    QSet<PluginInterface *> seen;
+    for (const TabDoc &doc : m_vTabDocs)
+    {
+        if (doc.interface == nullptr || seen.contains(doc.interface))
+            continue;
+        seen.insert(doc.interface);
+        if (!ensureInstanceStopped(doc.interface))
+            bAllSafe = false;
+    }
+    // 先前延期清理的实例也再试一次（成功就立即销毁）
+    for (int i = m_vtDeferredInstances.size() - 1; i >= 0; --i)
+    {
+        PluginInterface *p = m_vtDeferredInstances.at(i);
+        if (ensureInstanceStopped(p))
+        {
+            m_vtDeferredInstances.removeAt(i);
+            delete p;
+        }
+        else
+        {
+            bAllSafe = false;
+        }
+    }
+    return bAllSafe;
+}
+
 // 销毁某个标签页：先把页面从 tabWidget 摘下，再释放该页独占的插件实例（连带销毁其内部窗口），
 // 最后删除自建的占位页面。共享实例与插件（模板实例）窗口一律不删。
-void MainWindow::destroyTabAt(int index)
+void MainWindow::destroyTabAt(int nTabIndex)
 {
-    if (index < 0 || index >= m_vTabDocs.size() || index >= ui->tabWidget->count())
+    if (nTabIndex < 0 || nTabIndex >= ui->tabWidget->count())
+        return;
+    const int index = docIndexForTab(nTabIndex);
+    if (index < 0 || index >= m_vTabDocs.size())
         return;
 
     TabDoc doc = m_vTabDocs.at(index);
-    QWidget *pPage = ui->tabWidget->widget(index);
+    QWidget *pPage = ui->tabWidget->widget(nTabIndex);
 
     // 先同步文档列表，再摘页：removeTab 可能触发 currentChanged -> activateTab，
     // 此时 m_vTabDocs 的下标必须已与 tabWidget 对齐。
     m_vTabDocs.removeAt(index);
-    ui->tabWidget->removeTab(index);   // removeTab 不删除页面 widget
+    ui->tabWidget->removeTab(nTabIndex);   // removeTab 不删除页面 widget
 
     // 独占实例：delete 会连带 delete 其内部窗口（即该页面）
     QWidget *pOwnedWidget = nullptr;
-    // 先摘下映射，delete 后不能再拿悬空指针当 QHash 的键
-    QSharedPointer<MappedInput> pMapped = doc.interface != nullptr
-                               ? m_mapMappedInputs.take(doc.interface) : QSharedPointer<MappedInput>();
+    bool bSafeToDestroy = true;
     if (doc.interface != nullptr && doc.ownsInterface)
     {
         pOwnedWidget = doc.interface->getPluginWidget();
-        delete doc.interface;
+        // P0-3：先确认后台已退出。停止失败时**不**摘映射、不 delete、不卸载，
+        // 把实例转入延期清理（页面 widget 由实例持有，保持存活）。
+        bSafeToDestroy = ensureInstanceStopped(doc.interface);
+        if (bSafeToDestroy)
+        {
+            delete doc.interface;
+        }
+        else
+        {
+            m_vtDeferredInstances.append(doc.interface);
+            if (pPage != nullptr && pPage == pOwnedWidget)
+                pPage = nullptr;   // 不删除实例拥有的页面
+        }
     }
-    pMapped.clear();   // 插件实例销毁（解码线程已停）之后才能释放它引用的归档内存映射
 
     // 其余需要删除的页面：自建占位页（不是插件窗口、也不是已随实例销毁的窗口）
     if (pPage != nullptr && pPage != pOwnedWidget && !m_setPluginWidgets.contains(pPage))
@@ -1133,11 +1845,10 @@ void MainWindow::stopCurrentPlaybackAndInvalidate()
     if (pOld == nullptr)
         return;
 
-    const bool bSafeToUnmap = pOld->stopPlaybackAndWait();
-    // 只有 worker 确认退出才释放该实例的 mmap；否则保留映射，宁可由后续
-    // releaseAllMappedInputs 重试，也不能冒 UAF 风险。
-    if (bSafeToUnmap)
-        releaseMappedInput(pOld);
+    // P0-3：统一的停止入口。返回 false 时映射/实例都保持不动（已登记为延期清理），
+    // 不再像旧代码那样各路径各判断一次。
+    const bool bSafeToUnmap = ensureInstanceStopped(pOld);
+    Q_UNUSED(bSafeToUnmap);
 
     if (!pOld->hasBackgroundPlayback())
         return;
@@ -1158,15 +1869,22 @@ bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QStr
                                    bool *pbNoSpace)
 {
     if (pbNoSpace) *pbNoSpace = false;
+    // 缓存键：条目路径 + 长度 + 偏移（偏移变了说明归档内容区已重写）
+    auto cacheKeyOf = [](const FILEINFO &i) {
+        return QStringLiteral("%1|%2|%3")
+            .arg(i.sFilePath).arg(i.nFileLen).arg(i.nContentPositon);
+    };
+    const QString key = cacheKeyOf(info);
     // 同一条目重复打开时复用已抽取的副本，避免为 10 GB 条目反复复制几十 GB
-    const QString key = QStringLiteral("%1|%2|%3")
-            .arg(info.sFilePath).arg(info.nFileLen).arg(info.nContentPositon);
     auto cached = m_mapTempCache.constFind(key);
     if (cached != m_mapTempCache.constEnd()
         && QFileInfo::exists(cached.value())
         && QFileInfo(cached.value()).size() == info.nFileLen)
     {
         sOutPath = cached.value();
+        // P1-8：命中后移到队尾，让淘汰顺序是真正的 LRU 而不是 FIFO
+        m_listTempOrder.removeAll(sOutPath);
+        m_listTempOrder.append(sOutPath);
         return true;
     }
 
@@ -1192,20 +1910,43 @@ bool MainWindow::extractToTempFile(const FILEINFO &info, QString &sOutPath, QStr
         sErr = QStringLiteral("无法创建临时目录: %1").arg(dir.absolutePath());
         return false;
     }
-    // 上限淘汰：最多保留 8 个临时副本。删除失败说明仍被插件占用，
-    // 保留在 m_setTempFiles 里等析构时再清，但不再计入缓存与顺序表。
+    // 上限淘汰：最多保留 8 个临时副本。P1-8：**活动标签页仍在引用的路径不得淘汰**
+    // （接口契约是 path 在本次会话内一直有效；插件可能在后台线程继续读它）。
     static const int kMaxTempFiles = 8;
+    QSet<QString> pinnedKeys;
+    for (const TabDoc &doc : m_vTabDocs)
+        if (doc.hasFile)
+            pinnedKeys.insert(cacheKeyOf(doc.info));
+
     while (m_listTempOrder.size() >= kMaxTempFiles)
     {
-        const QString oldest = m_listTempOrder.takeFirst();
-        if (QFile::remove(oldest) || !QFileInfo::exists(oldest))
+        QString victim;
+        for (const QString &cand : m_listTempOrder)
         {
-            m_setTempFiles.remove(oldest);
+            QString candKey;
+            for (auto it = m_mapTempCache.constBegin(); it != m_mapTempCache.constEnd(); ++it)
+            {
+                if (it.value() == cand) { candKey = it.key(); break; }
+            }
+            if (!pinnedKeys.contains(candKey)) { victim = cand; break; }
+        }
+        if (victim.isEmpty())
+            break;   // 全部被活动标签页引用：允许暂时超过上限，绝不删活动文件
+
+        m_listTempOrder.removeAll(victim);
+        if (QFile::remove(victim) || !QFileInfo::exists(victim))
+        {
+            m_setTempFiles.remove(victim);
             for (auto it = m_mapTempCache.begin(); it != m_mapTempCache.end(); )
             {
-                if (it.value() == oldest) it = m_mapTempCache.erase(it);
+                if (it.value() == victim) it = m_mapTempCache.erase(it);
                 else ++it;
             }
+        }
+        else
+        {
+            // 删除失败说明仍被插件占用：保留在 m_setTempFiles 里，等析构再清理
+            qWarning() << "[TempCache] 临时文件仍被占用，保留到进程退出:" << victim;
         }
     }
 
@@ -1244,9 +1985,14 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             if (pArc->open(QIODevice::ReadOnly))
             {
                 uchar *pMapped = pArc->map(info.nContentPositon, info.nFileLen);
-                if (pMapped != nullptr
+                const bool bMappedAccepted = (pMapped != nullptr
                     && iface->sendFileMapped(reinterpret_cast<char *>(pMapped),
-                                             info.nFileLen, info.sFileName))
+                                             info.nFileLen, info.sFileName));
+                // v6：插件可能已经**认出**文件但播不了（没有音频输出设备、解码器
+                // 不支持该编码…）。这种失败再抽一遍临时文件重试毫无意义，还可能白写
+                // 几 GB；必须把插件给的真实原因直接说出去。
+                const QString sMappedWhy = bMappedAccepted ? QString() : iface->lastError().trimmed();
+                if (bMappedAccepted)
                 {
                     // 先交给插件开始播放；CRC 改为后台校验，不阻塞首帧。
                     auto sp = QSharedPointer<MappedInput>::create();
@@ -1273,8 +2019,21 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
                 if (pMapped != nullptr)
                     pArc->unmap(pMapped);
                 pArc->close();
+                delete pArc;
+                pArc = nullptr;
+                if (!sMappedWhy.isEmpty())
+                {
+                    releaseMappedInput(iface);
+                    syncActionStates();
+                    onFileManagerWarning(MainWindow::pluginFailureText(info.sFileName, sMappedWhy));
+                    return;
+                }
             }
-            delete pArc;
+            if (pArc != nullptr)
+            {
+                delete pArc;
+                pArc = nullptr;
+            }
         }
 
         QString sTemp, sErr;
@@ -1303,7 +2062,28 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
                 releaseMappedInput(iface);
                 return;
             }
-            // 插件拒绝该文件路径，回退到内存通道
+            // v6：插件给了真实原因说明它**读到了**数据但显示/播放不了
+            // （文件损坏、没有音频输出设备、编码不支持…）。这不是"路径通道打不开"，
+            // 不能再拿「文件过大…查看器无法通过文件路径读取它」敷衍用户。
+            const QString sPathWhy = iface->lastError().trimmed();
+            if (!sPathWhy.isEmpty())
+            {
+                releaseMappedInput(iface);
+                syncActionStates();
+                onFileManagerWarning(MainWindow::pluginFailureText(info.sFileName, sPathWhy));
+                return;
+            }
+            // P1-7：插件明确拒绝了路径载体。大文件不得再回退到「整块读入内存」——
+            // 偏好路径的插件反而会因此绕过大小闸门，损坏/加密文件会把进程打爆。
+            iface->sendFileData(nullptr, 0);
+            releaseMappedInput(iface);
+            syncActionStates();
+            QMessageBox::warning(this, tr("打不开文件"),
+                tr("文件过大（%1），查看器无法通过文件路径读取它。\n"
+                   "为避免把整个文件读入内存，已停止打开。\n\n"
+                   "可以先用「导出文件」或「分割文件」处理该文件。")
+                    .arg(FwArc::formatSize(info.nFileLen)));
+            return;
         }
         else if (bNoSpace)
         {
@@ -1324,7 +2104,17 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         }
         else
         {
-            onFileManagerWarning(QStringLiteral("大文件准备失败，将尝试内存方式：%1").arg(sErr));
+            // P1-7：路径准备失败的其它原因（临时目录不可写、映射失败、内容无效…）
+            // 同样不回退内存，直接把原因呈现给用户。
+            iface->sendFileData(nullptr, 0);
+            releaseMappedInput(iface);
+            syncActionStates();
+            QMessageBox::warning(this, tr("打不开文件"),
+                tr("文件较大（%1），未能准备流式读取通道：\n%2\n\n"
+                   "为避免一次性读入内存，已停止打开。")
+                    .arg(FwArc::formatSize(info.nFileLen),
+                         sErr.isEmpty() ? tr("未知原因") : sErr));
+            return;
         }
     }
 
@@ -1365,15 +2155,20 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         return;
     }
     // 插件在 sendFileData 返回前会同步复制/使用数据，返回后可安全释放。
-    // sendFile() 返回 false 表示插件明确放弃（格式不支持/解码失败），
+    // sendFile() 返回 false 表示插件明确放弃（格式不支持/解码失败/环境不满足），
     // 宿主必须给出可见提示，不能只留空白画面。
     if (!iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName)))
     {
-        // 与同函数其它失败出口一致：插件已明确放弃，必须复位内容区，
-        // 否则第三方插件不自清时会残留上一个文件的内容。
-        iface->sendFileData(nullptr, 0);
+        // v6：插件回报真实原因时按原因说。以前不管什么原因，界面上一律是
+        // 「插件无法显示该文件」—— 用户以为是文件坏了，实际可能只是没插耳机。
+        const QString sWhy = iface->lastError().trimmed();
+        // 拿到原因说明插件已经把说明写在自己的界面上了，这时**不能**再清屏，
+        // 否则那句说明会连同画面一起被抹掉（用户只看得到一块黑屏）。
+        // 老插件不报原因，仍按原逻辑复位内容区。
+        if (sWhy.isEmpty())
+            iface->sendFileData(nullptr, 0);
         syncActionStates();
-        onFileManagerWarning(tr("插件无法显示该文件：%1").arg(info.sFileName));
+        onFileManagerWarning(MainWindow::pluginFailureText(info.sFileName, sWhy));
     }
     // 新内容已生效：旧的内存映射不再被插件引用，可以释放（Windows 下不释放会阻止归档重写）
     releaseMappedInput(iface);
@@ -1505,13 +2300,20 @@ void MainWindow::releaseAllMappedInputs()
 {
     // 只在关闭/析构路径调用：此时标签页实例已或即将销毁，不能再解引用
     // 插件指针；正常切页的安全释放由 stopCurrentPlaybackAndInvalidate 负责。
-    m_mapMappedInputs.clear();
+    // P0-3：停播未确认的实例仍可能访问映射，必须保留。
+    for (auto it = m_mapMappedInputs.begin(); it != m_mapMappedInputs.end(); )
+    {
+        if (m_setStopUnsafe.contains(it.key()))
+            ++it;
+        else
+            it = m_mapMappedInputs.erase(it);
+    }
 }
 
 // 激活某个标签页：挂载该页独占的插件窗口，并按需渲染其文件
 void MainWindow::activateTab(int index)
 {
-    if (index < 0 || index >= ui->tabWidget->count() || index >= m_vTabDocs.size())
+    if (index < 0 || index >= ui->tabWidget->count())
     {
         // 索引无效（如最后一个标签页被移除时的 currentChanged(-1)）：
         // 仍要停止上一个实例的后台播放，避免无人接管的解码线程继续运行
@@ -1519,7 +2321,14 @@ void MainWindow::activateTab(int index)
         return;
     }
 
-    TabDoc &doc = m_vTabDocs[index];
+    // P0-2：按标签页上的实际窗口找文档，而不是盲信下标。
+    const int nDocIndex = docIndexForTab(index);
+    if (nDocIndex < 0 || nDocIndex >= m_vTabDocs.size())
+    {
+        stopCurrentPlaybackAndInvalidate();
+        return;
+    }
+    TabDoc &doc = m_vTabDocs[nDocIndex];
 
     // 空白标签页：停止上一个实例的后台播放，页面保持空白
     if (!doc.hasFile || doc.interface == nullptr)
@@ -1539,7 +2348,7 @@ void MainWindow::activateTab(int index)
         {
             QSignalBlocker blocker(ui->tabWidget);
             ui->tabWidget->removeTab(index);
-            ui->tabWidget->insertTab(index, w, doc.info.sFileName);
+            ui->tabWidget->insertTab(index, w, tabIconForFile(doc.info.sFileName), doc.info.sFileName);
             ui->tabWidget->setCurrentIndex(index);
         }
         // 仅删除自建占位页；插件窗口（本页独占或插件共享）不删
@@ -1559,16 +2368,18 @@ void MainWindow::activateTab(int index)
     if (doc.needsRender)
     {
         const quint64 nGen = ++m_nRenderGen;
-        const int nIndex = index;
+        const int nTabIndex = index;
         const QString sExpectPath = doc.info.sFilePath;
-        QTimer::singleShot(0, this, [this, nIndex, nGen, sExpectPath]() {
+        QTimer::singleShot(0, this, [this, nTabIndex, nGen, sExpectPath]() {
             if (nGen != m_nRenderGen)
                 return;                                  // 已被更新的切换取消
-            if (nIndex < 0 || nIndex >= m_vTabDocs.size())
-                return;
-            if (ui->tabWidget->currentIndex() != nIndex)
+            if (ui->tabWidget->currentIndex() != nTabIndex)
                 return;                                  // 用户已切走，保留 needsRender
-            TabDoc &d = m_vTabDocs[nIndex];
+            // P0-2：延迟回调里窗口可能已被拖动/关闭，重新按实际窗口定位文档。
+            const int nDoc = docIndexForTab(nTabIndex);
+            if (nDoc < 0 || nDoc >= m_vTabDocs.size())
+                return;
+            TabDoc &d = m_vTabDocs[nDoc];
             if (!d.needsRender || d.interface == nullptr
                 || d.info.sFilePath != sExpectPath)
                 return;
@@ -1587,16 +2398,16 @@ void MainWindow::activateTab(int index)
 // 用户点击标签页关闭按钮
 void MainWindow::onTabCloseRequested(int index)
 {
-    if (index < 0 || index >= ui->tabWidget->count() || index >= m_vTabDocs.size())
+    if (index < 0 || index >= ui->tabWidget->count())
+        return;
+    const int nDoc = docIndexForTab(index);
+    if (nDoc < 0 || nDoc >= m_vTabDocs.size())
         return;
 
-    // 关闭正在播放的页前，先停止其后台播放，避免解码线程/音频输出残留
-    if (m_vTabDocs.at(index).interface != nullptr
-        && m_vTabDocs.at(index).interface == m_pCurrentInterface)
-    {
-        m_pCurrentInterface->stopPlaybackAndWait();
-        m_pCurrentInterface = nullptr;
-    }
+    // 关闭前先停止该页实例（P0-3：停不下来时 destroyTabAt 会转入延期清理）
+    PluginInterface *pIface = m_vTabDocs.at(nDoc).interface;
+    if (pIface != nullptr)
+        ensureInstanceStopped(pIface);
 
     destroyTabAt(index);   // 摘页 + 释放该页独占的插件实例
 
@@ -1610,35 +2421,223 @@ void MainWindow::onTabCurrentChanged(int index)
     activateTab(index);
 }
 
+// 目录节点的完整路径：把从根到该节点的文本逐段拼起来。
+// 单链压缩后的节点文本本身可能含 '/'（如 "sub/deep"），直接按段拼接仍然正确。
+static QString folderPathOfItem(const QStandardItem *pItem)
+{
+    QStringList segs;
+    for (const QStandardItem *p = pItem; p != nullptr; p = p->parent())
+        segs.prepend(p->text());
+    return normalizePath(segs.join('/'));
+}
+
+// 目录子树字节合计：只在模型里没有缓存大小（BytesRole）时兜底使用。
+// 始终按叶子的 FILEINFO 现算，避免读到一个过期/缺失的列值。
+// 用显式栈而不是递归：归档路径允许很深（MAX_PATH_LEN/每段 255），递归遍历
+// 极端输入会把 native 栈耗尽（与 FileListModel::sort 的 kMaxDepth 同一个理由）。
+static qint64 folderBytesOfItem(const QStandardItem *pDir)
+{
+    qint64 nTotal = 0;
+    QVector<const QStandardItem *> stack;
+    if (pDir != nullptr)
+        stack.append(pDir);
+    while (!stack.isEmpty())
+    {
+        const QStandardItem *pCurrent = stack.takeLast();
+        for (int r = 0; r < pCurrent->rowCount(); ++r)
+        {
+            const QStandardItem *pChild = pCurrent->child(r, 0);
+            if (pChild == nullptr)
+                continue;
+            if (isFileLeafItem(pChild))
+                nTotal += pChild->data(FileListModel::InfoRole).value<FILEINFO>().nFileLen;
+            else
+                stack.append(pChild);
+        }
+    }
+    return nTotal;
+}
+
 // 文件列表右键菜单
 void MainWindow::onTreeViewCustomContextMenu(const QPoint &pos)
 {
-    QModelIndex index = m_tvFilePath->indexAt(pos);
-    if (!index.isValid())
-        return;
     if (!m_fileManager->isArchiveLoaded())
         return;
 
+    const QModelIndex index = m_tvFilePath->indexAt(pos);
+    if (!index.isValid())
+        return;
+
+    // 右键同时把该行设为当前行：选中态与"属性/打开"作用的对象一致，也方便随后的删除/导出
+    const QModelIndex itemIndex = index.siblingAtColumn(0);
+    m_tvFilePath->setCurrentIndex(itemIndex);
+
+    QMenu *pMenu = buildFileListContextMenu(itemIndex);
+    if (pMenu == nullptr)
+        return;
+    pMenu->exec(m_tvFilePath->viewport()->mapToGlobal(pos));
+    delete pMenu;
+}
+
+// 构造文件列表右键菜单（不 exec，便于单元测试检查菜单项）：
+//   文件：打开 / 打开新标签页 / ─── / 属性
+//   目录：属性（目录不能"打开"，双击只做展开/收起）
+QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
+{
+    if (!index.isValid() || m_hModelFilePath == nullptr)
+        return nullptr;
+
     // 右键可能落在"大小/类型"列：统一取同一行的第 0 列业务项
-    index = index.siblingAtColumn(0);
-    QStandardItem *item = m_hModelFilePath->itemFromIndex(index);
-    if (!item)
+    const QModelIndex itemIndex = index.siblingAtColumn(0);
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(itemIndex);
+    if (pItem == nullptr)
+        return nullptr;
+
+    const bool bFile = isFileLeafItem(pItem);
+    const bool bDir = pItem->data(FileListModel::IsDirRole).toBool();
+    if (!bFile && !bDir)
+        return nullptr;
+
+    const FILEINFO info = bFile ? pItem->data(FileListModel::InfoRole).value<FILEINFO>()
+                                : FILEINFO();
+
+    auto *pMenu = new QMenu(this);
+    if (bFile)
+    {
+        QAction *pOpen = pMenu->addAction(tr("打开"));
+        connect(pOpen, &QAction::triggered, this, [this, info]() {
+            openFileInCurrentTab(info);
+        });
+
+        QAction *pOpenNew = pMenu->addAction(tr("打开新标签页"));
+        connect(pOpenNew, &QAction::triggered, this, [this, info]() {
+            openFileInNewTab(info);
+        });
+        pMenu->addSeparator();
+    }
+
+    QAction *pProp = pMenu->addAction(tr("属性"));
+    if (bFile)
+    {
+        connect(pProp, &QAction::triggered, this, [this, info]() { showFileProperty(info); });
+    }
+    else
+    {
+        // 菜单可能停留一段时间：用持久索引，期间列表被重建也不会留下悬空指针
+        const QPersistentModelIndex persist(itemIndex);
+        connect(pProp, &QAction::triggered, this, [this, persist]() {
+            if (persist.isValid())
+                showFolderProperty(persist);
+        });
+    }
+    return pMenu;
+}
+
+// 统计目录子树里的文件数与子文件夹数（目录节点本身不计入）。
+// 与 folderBytesOfItem 一样用显式栈，避免极深目录把栈耗尽。
+void MainWindow::countFolderItems(const QStandardItem *pDir, int &nFiles, int &nDirs)
+{
+    QVector<const QStandardItem *> stack;
+    if (pDir != nullptr)
+        stack.append(pDir);
+    while (!stack.isEmpty())
+    {
+        const QStandardItem *pCurrent = stack.takeLast();
+        for (int r = 0; r < pCurrent->rowCount(); ++r)
+        {
+            const QStandardItem *pChild = pCurrent->child(r, 0);
+            if (pChild == nullptr)
+                continue;
+            if (isFileLeafItem(pChild))
+            {
+                ++nFiles;
+            }
+            else if (pChild->data(FileListModel::IsDirRole).toBool())
+            {
+                ++nDirs;
+                stack.append(pChild);
+            }
+        }
+    }
+}
+
+// 「属性」：归档内的文件条目（先收集字段，再交给对话框展示）
+DlgFileProperty::Data MainWindow::filePropertyData(const FILEINFO &info) const
+{
+    DlgFileProperty::Data data;
+    data.sName = info.sFileName;
+    data.sType = DlgFileProperty::typeTextForFile(info.sFileName);
+    data.nSize = info.nFileLen;
+
+    const QString sPath = normalizePath(info.sFilePath);
+    data.sEntryPath = sPath;
+    const int nSlash = sPath.lastIndexOf('/');
+    if (nSlash >= 0)
+    {
+        QString sDir = sPath.left(nSlash);
+        if (sDir.isEmpty())
+            sDir = QStringLiteral("/");   // 只有 POSIX 根会出现（Windows 路径至少带盘符）
+        else if (sDir.size() == 2 && sDir.at(1) == ':')
+            sDir += QLatin1Char('/');     // "E:" -> "E:/"
+        data.sLocation = sDir;
+    }
+
+    data.sArchivePath = normalizePath(m_fileManager->archivePath());
+    data.nArchiveVersion = m_fileManager->archiveVersion();
+    data.bPending = m_fileManager->isPendingEntry(info.sFilePath);
+    quint32 nCrc = 0;
+    data.bHasCrc = m_fileManager->contentCrcFor(info.sFilePath, &nCrc);
+    if (data.bHasCrc)
+        data.nCrc = nCrc;
+    return data;
+}
+
+void MainWindow::showFileProperty(const FILEINFO &info)
+{
+    const DlgFileProperty::Data data = filePropertyData(info);
+    DlgFileProperty dlg(data, this);
+    dlg.exec();
+}
+
+// 「属性」：树形列表里的目录节点（归档里没有真实目录条目，属性按当前可见子树汇总）
+DlgFileProperty::Data MainWindow::folderPropertyData(const QModelIndex &index) const
+{
+    DlgFileProperty::Data data;
+    if (m_hModelFilePath == nullptr)
+        return data;
+
+    const QModelIndex itemIndex = index.siblingAtColumn(0);
+    QStandardItem *pItem = m_hModelFilePath->itemFromIndex(itemIndex);
+    if (pItem == nullptr || !pItem->data(FileListModel::IsDirRole).toBool())
+        return data;   // 菜单打开期间列表被重建/换了内容：宁可不开，也不显示错的数据
+
+    data.bDir = true;
+    data.sName = pItem->text();
+    data.sType = tr("文件夹");
+    data.bFiltered = !m_sFilter.isEmpty();
+
+    // 大小与列表"大小"列同源（子树合计）；缺失时才现算
+    const QModelIndex sizeIndex = itemIndex.siblingAtColumn(1);
+    const QVariant vBytes = sizeIndex.data(FileListModel::BytesRole);
+    data.nSize = vBytes.isValid() ? vBytes.toLongLong() : folderBytesOfItem(pItem);
+    countFolderItems(pItem, data.nFileCount, data.nDirCount);
+
+    data.sEntryPath = folderPathOfItem(pItem);
+    if (pItem->parent() != nullptr)
+        data.sLocation = folderPathOfItem(pItem->parent());
+
+    data.sArchivePath = normalizePath(m_fileManager->archivePath());
+    data.nArchiveVersion = m_fileManager->archiveVersion();
+    return data;
+}
+
+void MainWindow::showFolderProperty(const QModelIndex &index)
+{
+    const DlgFileProperty::Data data = folderPropertyData(index);
+    if (data.sName.isEmpty())
         return;
-
-    // 目录节点不提供“打开”操作（双击即可展开/折叠）
-    if (!isFileLeafItem(item))
-        return;
-
-    FILEINFO info = item->data(FileListModel::InfoRole).value<FILEINFO>();
-
-    QMenu menu(this);
-    QAction *actOpen = menu.addAction("打开");
-    QAction *actOpenNew = menu.addAction("打开新标签页");
-    QAction *chosen = menu.exec(m_tvFilePath->viewport()->mapToGlobal(pos));
-    if (chosen == actOpen)
-        openFileInCurrentTab(info);
-    else if (chosen == actOpenNew)
-        openFileInNewTab(info);
+    DlgFileProperty dlg(data, this);
+    dlg.exec();
 }
 
 // 标签栏“+”按钮：新建空白标签页
@@ -1687,6 +2686,42 @@ void MainWindow::handleFileListDoubleClick(const QModelIndex &index)
 // 在 viewport 层接管双击可同时绕开这两个问题，且对目录与文件一视同仁。
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
+    // 标签栏：中键关闭「+」按钮随标签变化的重新定位
+    if (ui->tabWidget != nullptr
+        && (obj == ui->tabWidget->tabBar() || obj == ui->tabWidget))
+    {
+        if (obj == ui->tabWidget->tabBar()
+            && event->type() == QEvent::MouseButtonRelease
+            && static_cast<QMouseEvent *>(event)->button() == Qt::MiddleButton)
+        {
+            const int nIndex = ui->tabWidget->tabBar()->tabAt(
+                static_cast<QMouseEvent *>(event)->pos());
+            if (nIndex >= 0)
+            {
+                onTabCloseRequested(nIndex);
+                return true;
+            }
+        }
+        else if (event->type() == QEvent::Resize || event->type() == QEvent::LayoutRequest
+                 || event->type() == QEvent::Paint)
+        {
+            // 布局/绘制完成后再定位（直接改几何会被本次布局覆盖）。
+            // Paint 也挂上：标签增删不一定发 LayoutRequest，而绘制一定在布局之后。
+            if (!m_bNewTabBtnPending)
+            {
+                m_bNewTabBtnPending = true;
+                QTimer::singleShot(0, this, [this]() {
+                    m_bNewTabBtnPending = false;
+                    updateNewTabButton();
+                });
+            }
+        }
+        else if (event->type() == QEvent::Show)
+        {
+            QTimer::singleShot(0, this, [this]() { updateNewTabButton(); });
+        }
+    }
+
     // 树形模式下点列头排序会 takeRow/appendRow 重建行，导致已展开目录被折叠：
     // 按下时记住展开状态，松开后（排序已执行）恢复。
     // 注意：表头鼠标事件落在 header 的 viewport 上，过滤器装在那里才收得到。
@@ -1797,6 +2832,15 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
             stopCurrentPlaybackAndInvalidate();
             releaseAllMappedInputs();
         }
+        // P0-3：仍有停播未确认的实例时，映射不能释放，归档也无法安全替换
+        if (!m_setStopUnsafe.isEmpty())
+        {
+            QMessageBox::warning(this, tr("保存失败"),
+                tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
+                   "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
+                   "请稍后重试，或关闭正在播放的标签页。"));
+            return false;
+        }
         QApplication::setOverrideCursor(Qt::WaitCursor);
         bool bOk = m_fileManager->save();
         QApplication::restoreOverrideCursor();
@@ -1825,7 +2869,7 @@ void MainWindow::on_actionLoadFile_triggered()
     if (!confirmDiscardOrSaveIfDirty())
         return;
 
-    QString sFileName = QFileDialog::getOpenFileName(this, tr("加载文件"), "", tr("Class Files (*.dat);;All Files (*.*)"));
+    QString sFileName = QFileDialog::getOpenFileName(this, tr("加载文件"), "", FwArc::fileDialogFilter());
     if(sFileName.isEmpty())
         return;
 
@@ -1845,15 +2889,17 @@ void MainWindow::on_actionLoadFile_triggered()
 
 void MainWindow::loadArchiveFile(const QString &sFileName)
 {
+    // P1-9：校验与加载共用同一次解析结果（旧实现各 parse 一次头部+条目区）
+    FwArc::Meta preParsed;
     QString sErr;
-    if (!m_fileManager->validateMergedFile(sFileName, &sErr))
+    if (!m_fileManager->validateMergedFile(sFileName, &preParsed, &sErr))
     {
         QMessageBox::critical(this, QStringLiteral("加载失败"),
             QStringLiteral("不是有效的归档文件或文件已损坏。\n%1\n\n原有归档与未保存的改动保持不变。").arg(sErr));
         return;
     }
 
-    if (!m_fileManager->QLoadMergedFile(sFileName))
+    if (!m_fileManager->QLoadMergedFile(sFileName, &preParsed))
     {
         QMessageBox::critical(this, QStringLiteral("加载失败"),
             QStringLiteral("归档解析失败，原有归档保持不变。\n%1")
@@ -1873,7 +2919,7 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
     Q_UNUSED(vtFileInfos);
 
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
-    setWindowTitle(tr("文件查看器 - %1").arg(QFileInfo(sFileName).fileName()));
+    updateWindowTitle();
     m_tvFilePath->header()->setVisible(true);
 
     // 换归档时清掉上一份的筛选词，避免新归档"看起来是空的"
@@ -2204,6 +3250,30 @@ void MainWindow::populateFilePathView(bool bShowPath)
     }
 
     updateViewActionState();
+
+    // 模型重建后「大小/类型」两列的内容宽度会变，路径列宽度跟着重算
+    QTimer::singleShot(0, this, [this]() { adjustPathColumnWidth(); });
+}
+
+// 「文件路径」列宽度 = 视口宽 - 大小/类型两列，且不低于 kMinPathColumnWidth。
+// 面板拖窄到放不下时保留最小宽度，由横向滚动条兜底，而不是把文件名压成一条缝。
+void MainWindow::adjustPathColumnWidth()
+{
+    if (m_tvFilePath == nullptr)
+        return;
+    QHeaderView *pHeader = m_tvFilePath->header();
+    if (pHeader == nullptr)
+        return;
+
+    const int nOther = pHeader->sectionSize(1) + pHeader->sectionSize(2);
+    const int nAvail = m_tvFilePath->viewport()->width();
+    const int nWant = qMax(kMinPathColumnWidth, nAvail - nOther);
+    if (nWant <= 0 || pHeader->sectionSize(0) == nWant)
+        return;
+
+    m_bAdjustingPathColumn = true;
+    pHeader->resizeSection(0, nWant);
+    m_bAdjustingPathColumn = false;
 }
 
 // 按表头当前的排序列/方向排序（树形模式下为同级排序、目录优先）
@@ -2447,9 +3517,12 @@ void MainWindow::syncActionStates()
     const bool bHasLeaf = isFileLeafItem(pCur);
 
     updateViewActionState();
+    // P1-10：只剩一个条目时不允许删除（空归档无法保存），按钮状态与实际行为一致
+    const bool bCanDelete = bLoaded && !bBusy && bHasLeaf
+                            && m_fileManager->getFileInfos().size() > 1;
     m_acSaveFile->setEnabled(bLoaded && m_fileManager->needsSave() && !bBusy);
     m_acAddFile->setEnabled(bLoaded && !bBusy);
-    m_acDelFile->setEnabled(bLoaded && !bBusy && bHasLeaf);
+    m_acDelFile->setEnabled(bCanDelete);
     m_acOutputFile->setEnabled(bLoaded && !bBusy && bHasLeaf);
 
     ui->actionLoadFile->setEnabled(!bBusy);
@@ -2458,6 +3531,9 @@ void MainWindow::syncActionStates()
     ui->actionSplitFile->setEnabled(!bBusy);
     ui->actionPluginMap->setEnabled(!bBusy);
     if (m_acVerify != nullptr) m_acVerify->setEnabled(bLoaded && !bBusy);
+
+    // 标题里的“*”跟随未保存状态（所有状态刷新都会走到这里）
+    updateWindowTitle();
 }
 
 // 长操作期间禁用可重入动作（P3-2）
@@ -2518,6 +3594,12 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
     // 固定尺寸：状态文本随文件名/路径变化时弹窗不再忽大忽小（长文本由下方 elidedText 处理）
     dlg->setFixedSize(560, 150);
 
+    // 主题把进度条压成 8px 细条（resources/theme/light.qss），而 Fusion 样式会在
+    // 条内居中绘制「8%」——8px 高装不下 10pt 文字，数字被上下裁掉只剩半截。
+    // 百分比改由状态文字承载（见下方 progressChanged 中拼接的 " · %1%"），条内不再画字。
+    if (QProgressBar *pBar = dlg->findChild<QProgressBar *>())
+        pBar->setTextVisible(false);
+
     m_connProgress = connect(m_fileManager, &FileManager::progressChanged, this,
         [this](qint64 cur, qint64 total, const QString &status) {
             if (m_pActiveProgress == nullptr) return;
@@ -2526,6 +3608,8 @@ void MainWindow::beginProgressOperation(QProgressDialog *dlg, bool *pbOk, QStrin
             {
                 const int nPct = int(100 * cur / total);
                 m_pActiveProgress->setValue(nPct);
+                // 百分比写进状态文字：细条里画不下（见 beginProgressOperation 里的 setTextVisible）
+                sText += tr(" · %1%").arg(nPct);
                 // 进度 ETA：进度稳定后按"已用时间 / 完成比例"估算剩余时间
                 if (nPct >= 3 && nPct < 100)
                 {
@@ -2790,6 +3874,34 @@ void MainWindow::onActionDelFileTriggered()
     }
     FILEINFO fileInfo = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
 
+    // P1-10：空归档语义必须前后一致。删除最后一个条目会让归档无法保存，
+    // 所以这里直接拒绝，并指向真正的“清空”入口（卸载文件）。
+    if (m_fileManager->getFileInfos().size() <= 1)
+    {
+        QMessageBox::information(this, tr("删除文件"),
+            tr("归档至少需要保留一个条目（空归档无法保存）。\n"
+               "如需清空归档，请使用「卸载文件」。"));
+        return;
+    }
+
+    // P1-10：删除前处理已打开该条目的标签页，避免旧标签继续显示已不存在的快照。
+    int nClosedTabs = 0;
+    for (int i = ui->tabWidget->count() - 1; i >= 0; --i)
+    {
+        const int nDoc = docIndexForTab(i);
+        if (nDoc < 0 || nDoc >= m_vTabDocs.size())
+            continue;
+        if (!m_vTabDocs.at(nDoc).hasFile
+            || m_vTabDocs.at(nDoc).info.sFilePath != fileInfo.sFilePath)
+            continue;
+        // 先安全停止（停不下来会转入延期清理，不会 delete/悬空）
+        ensureInstanceStopped(m_vTabDocs.at(nDoc).interface);
+        destroyTabAt(i);
+        ++nClosedTabs;
+    }
+    if (ui->tabWidget->count() == 0)
+        newEmptyTab();
+
     QApplication::setOverrideCursor(Qt::WaitCursor);
     bool bOk = m_fileManager->deleteFile(fileInfo.sFilePath);
     QApplication::restoreOverrideCursor();
@@ -2799,6 +3911,11 @@ void MainWindow::onActionDelFileTriggered()
         QMessageBox::critical(this, tr("删除文件"),
                               tr("删除失败，归档文件可能已损坏。"));
         return;
+    }
+    if (nClosedTabs > 0)
+    {
+        statusBar()->showMessage(
+            tr("已删除条目，并关闭 %1 个正在显示它的标签页").arg(nClosedTabs), 6000);
     }
 
     refreshFilePathView();
@@ -2886,6 +4003,16 @@ void MainWindow::onActionSaveFileTriggered()
             return;
         stopCurrentPlaybackAndInvalidate();
         releaseAllMappedInputs();
+    }
+
+    // P0-3：停播未被确认时，映射仍可能被后台线程访问，不能替换归档
+    if (!m_setStopUnsafe.isEmpty())
+    {
+        QMessageBox::warning(this, tr("保存文件"),
+            tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
+               "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
+               "请稍后重试，或关闭正在播放的标签页。"));
+        return;
     }
 
     // —— 进度条：保存（重写归档）可能耗时，显示进度并支持取消 ——
@@ -3026,7 +4153,7 @@ void MainWindow::on_actionUnloadFile_triggered()
     m_setExpandedTree.clear();
     m_bResetTreeExpansion = true;
     m_tvFilePath->header()->setVisible(false);
-    setWindowTitle(tr("文件查看器"));
+    updateWindowTitle();
     if (m_leFilter && !m_leFilter->text().isEmpty())
     {
         QSignalBlocker blocker(m_leFilter);

@@ -2,6 +2,9 @@
 #include "ui_mainwindow.h"
 
 // Qt6 已移除 QTextCodec；本地编码回退改用 QString::fromLocal8Bit
+// P2-2：UTF-8 校验/解码统一交给 QStringDecoder（严格：拒绝过长编码、代理区、>U+10FFFF）
+#include <QStringDecoder>
+#include <QByteArrayView>
 #include <QFileInfo>
 #include <QLineEdit>
 #include <QShortcut>
@@ -9,6 +12,7 @@
 #include <QToolBar>
 #include <QStatusBar>
 #include <QAction>
+#include <QDebug>
 #include <cstring>
 #include <algorithm>
 #include <limits>
@@ -93,67 +97,125 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-// 严格 UTF-8 合法性校验：遇到任何非法字节序列返回 false。
-// 用于在“无 BOM”时区分 UTF-8 文件与 GBK/ANSI 等本地编码文件，
-// 避免把 GBK 字节当成 UTF-8 解码成乱码。
-static bool isStrictUtf8(const QByteArray &data)
+// P2-2：严格 UTF-8 解码结果。
+// bValid：整段都是合法 UTF-8；bTruncatedTail：末尾是"前缀合法但没写完"的多字节序列
+// （可能是 1 MiB 读窗口的边界，也可能是文件被截断），此时 text 只含有效前缀，
+// 调用方应提示续接/截断，而不是整篇回退本地编码变成乱码。
+struct Utf8DecodeResult
 {
-    const char *p = data.constData();
-    // QByteArray::size() 在 Qt6 返回 qsizetype（64 位）；用 int 保存会在
-    // >2 GiB 时变负，循环体一次都不执行，把 GBK 大文件误判成合法 UTF-8。
+    QString text;
+    bool    bValid = false;
+    bool    bTruncatedTail = false;
+};
+
+// P2-2：判断 data 末尾是否是"尚未写完但前缀合法"的 UTF-8 多字节序列，
+// 返回该序列已出现的字节数（0 表示不是截断，而是确实存在非法字节）。
+// 已经出现的续字节也按 UTF-8 的区间规则校验，避免把过长编码/代理区/
+// > U+10FFFF 的非法序列误判成"只是没写完"。
+static qsizetype incompleteUtf8Tail(QByteArrayView data)
+{
     const qsizetype n = data.size();
-    qsizetype i = 0;
-    while (i < n)
+    if (n == 0)
+        return 0;
+    // 一个多字节序列最多 4 字节，需要回看的残序列最多 3 字节（+首字节）
+    for (qsizetype back = 1; back <= 4 && back <= n; ++back)
     {
-        const unsigned char c = (unsigned char)p[i];
-        int extra; // 后续续字节个数
-        if (c < 0x80)                 // ASCII
+        const qsizetype start = n - back;
+        const unsigned char lead = static_cast<unsigned char>(data[start]);
+        if ((lead & 0xC0) == 0x80)
+            continue;                               // 续字节，继续往前找首字节
+        int need = 0;
+        if (lead >= 0xC2 && lead <= 0xDF)      need = 2;   // 0xC0/0xC1 为过长短编码
+        else if (lead >= 0xE0 && lead <= 0xEF) need = 3;
+        else if (lead >= 0xF0 && lead <= 0xF4) need = 4;   // 0xF5+ 超过 U+10FFFF
+        else return 0;                              // 孤立续字节或非法首字节
+        if (back >= need) return 0;                 // 序列已完整，说明不是截断
+        // 已出现的续字节必须落在合法区间
+        for (qsizetype i = start + 1; i < n; ++i)
         {
-            ++i;
-            continue;
+            const unsigned char c = static_cast<unsigned char>(data[i]);
+            const qsizetype pos = i - start;        // 第几个续字节（1 起）
+            unsigned char lo = 0x80, hi = 0xBF;
+            if (pos == 1)
+            {
+                if (lead == 0xE0)      lo = 0xA0;   // 拒绝 3 字节过长编码
+                else if (lead == 0xED) hi = 0x9F;   // 拒绝 UTF-16 代理区
+                else if (lead == 0xF0) lo = 0x90;   // 拒绝 4 字节过长编码
+                else if (lead == 0xF4) hi = 0x8F;   // 拒绝 > U+10FFFF
+            }
+            if (c < lo || c > hi)
+                return 0;
         }
-        else if ((c & 0xE0) == 0xC0)  // 110xxxxx -> 2 字节
-        {
-            extra = 1;
-            if (c < 0xC2) return false;        // 0xC0/0xC1 为过长短编码，非法
-        }
-        else if ((c & 0xF0) == 0xE0)  // 1110xxxx -> 3 字节
-        {
-            extra = 2;
-        }
-        else if ((c & 0xF8) == 0xF0)  // 11110xxx -> 4 字节
-        {
-            extra = 3;
-            if (c > 0xF4) return false;        // > U+10FFFF，非法
-        }
-        else                          // 0x80-0xBF（续字节当首字节）或 0xF5-0xFF，均非法
-        {
-            return false;
-        }
-        if (i + extra >= n) return false;      // 字节数不足
-        for (int k = 1; k <= extra; ++k)
-        {
-            if (((unsigned char)p[i + k] & 0xC0) != 0x80)
-                return false;                  // 续字节必须是 10xxxxxx
-        }
-        i += extra + 1;
+        return back;                                // 需要再补 back 个字节才完整
     }
-    return true;
+    return 0;
+}
+
+// P2-2：严格 UTF-8 解码。
+// 注意 Flag::Stateless：默认（有状态）模式下 Qt 会把末尾不完整序列静默挂起，
+// 既不报错也不输出；Stateless 模式才会把"本段末尾的残序列"标记为错误，
+// 从而能区分"中间非法字节"（必须回退本地编码）和"末尾截断"（只需解码有效前缀）。
+static Utf8DecodeResult decodeUtf8Strict(QByteArrayView data)
+{
+    Utf8DecodeResult res;
+    if (data.isEmpty())
+    {
+        res.bValid = true;
+        return res;
+    }
+
+    QStringDecoder dec(QStringDecoder::Utf8, QStringDecoder::Flag::Stateless);
+    QString text = dec.decode(data);
+    if (!dec.hasError())
+    {
+        res.text   = text;
+        res.bValid = true;
+        return res;
+    }
+
+    // 整段解码报错：只有末尾是"合法但没写完"的多字节序列时才按截断处理，
+    // 只解码有效前缀；中间有非法字节则返回失败，由调用方回退本地编码。
+    const qsizetype tail = incompleteUtf8Tail(data);
+    if (tail > 0)
+    {
+        QStringDecoder prefixDec(QStringDecoder::Utf8, QStringDecoder::Flag::Stateless);
+        QString prefix = prefixDec.decode(QByteArrayView(data.constData(), data.size() - tail));
+        if (!prefixDec.hasError())
+        {
+            res.text           = prefix;
+            res.bTruncatedTail = true;
+            return res;
+        }
+    }
+    res.text.clear();
+    return res;
 }
 
 // 按编码解码文件内容为 QString：
 //   1) 优先识别 BOM（UTF-8 / UTF-16LE / UTF-16BE）
 //   2) 无 BOM 时，严格 UTF-8 校验通过则按 UTF-8 解析（覆盖绝大多数现代 .sql）
-//   3) 否则按系统本地编码解析（中文 Windows 上为 GBK），避免 ANSI/GBK 文件乱码
-QString MainWindow::decodeText(const QByteArray &data)
+//   3) 末尾是截断的 UTF-8 多字节序列时，只解码有效前缀并置 pbTruncatedTail（P2-2）
+//   4) 否则按系统本地编码解析（中文 Windows 上为 GBK），避免 ANSI/GBK 文件乱码
+QString MainWindow::decodeText(const QByteArray &data, bool *pbTruncatedTail)
 {
-    // 1) BOM 检测
+    if (pbTruncatedTail) *pbTruncatedTail = false;
+
+    // 1) BOM 检测：BOM 已声明编码，直接按该编码解码。
     if (data.size() >= 3
         && (unsigned char)data[0] == 0xEF
         && (unsigned char)data[1] == 0xBB
         && (unsigned char)data[2] == 0xBF)
     {
-        return QString::fromUtf8(data.constData() + 3, data.size() - 3);
+        // P2-2：BOM 已声明是 UTF-8，即使中间有非法字节也按 UTF-8 替换字符输出，
+        // 不再整篇回退本地编码（否则原本正确的中文会全部变成乱码）。
+        const Utf8DecodeResult utf8 = decodeUtf8Strict(
+            QByteArrayView(data.constData() + 3, data.size() - 3));
+        if (pbTruncatedTail && utf8.bTruncatedTail) *pbTruncatedTail = true;
+        if (utf8.bValid || utf8.bTruncatedTail)
+            return utf8.text;
+        qWarning() << "[PluginText] UTF-8 BOM 文件内含非法字节，已用替换字符解码";
+        QStringDecoder dec(QStringDecoder::Utf8);
+        return dec.decode(QByteArrayView(data.constData() + 3, data.size() - 3));
     }
     if (data.size() >= 2)
     {
@@ -174,8 +236,21 @@ QString MainWindow::decodeText(const QByteArray &data)
     }
 
     // 2) 无 BOM：严格 UTF-8 校验通过 -> UTF-8
-    if (isStrictUtf8(data))
-        return QString::fromUtf8(data);
+    {
+        // 放在局部作用域里：UTF-8 解码失败时它的 QString 先释放，
+        // 再回退本地编码，避免 GBK 大文件同时占两份解码结果。
+        const Utf8DecodeResult utf8 = decodeUtf8Strict(QByteArrayView(data));
+        if (utf8.bValid)
+            return utf8.text;
+        if (utf8.bTruncatedTail)
+        {
+            // P2-2：末尾的残序列可能只是 1 MiB 读窗口的边界（由下一窗口续接），
+            // 也可能文件真被截断；两种情况都只解码有效前缀，不在整篇里塞替换字符。
+            if (pbTruncatedTail) *pbTruncatedTail = true;
+            qWarning() << "[PluginText] 末尾 UTF-8 多字节序列不完整，已解码有效前缀";
+            return utf8.text;
+        }
+    }
 
     // 3) 回退到系统本地编码（中文 Windows 上为 GBK）
     // Qt6 中 codecForLocale()->toUnicode() 等价于 QString::fromLocal8Bit()
@@ -203,7 +278,23 @@ void MainWindow::showText(char *szBuf, qint64 nFileLen)
         return;
     }
     QByteArray array(szBuf, static_cast<qsizetype>(nFileLen));
-    const QString text = decodeText(array);
+
+    // P2-2：文本可能按 1 MiB 读窗口分块送入。长度正好是窗口整数倍时，末尾的
+    // 残序列更可能是"窗口边界"（需与下一个窗口续接）而不是文件损坏；
+    // 两种情况都只解码有效前缀，这里只区分提示文案。
+    constexpr qint64 kReadWindowBytes = 1024 * 1024;   // 1 MiB
+    const bool bWindowBoundary = (nFileLen >= kReadWindowBytes)
+                                 && (nFileLen % kReadWindowBytes == 0);
+    bool bTruncatedTail = false;
+    const QString text = decodeText(array, &bTruncatedTail);
+    if (bTruncatedTail)
+    {
+        statusBar()->showMessage(
+            bWindowBoundary
+                ? tr("文本在 1 MiB 读窗口末尾被截断，已解码有效前缀；不完整的尾序列需与后续数据续接。")
+                : tr("文件末尾的 UTF-8 多字节序列不完整，已解码有效前缀（末尾可能有字符被截断）。"),
+            8000);
+    }
 
     // .html/.htm 交给 QTextEdit 的富文本渲染器（QTextBrowser 的子集）；
     // 其它文本（源码/日志/JSON…）仍用 setPlainText —— setText 会把标签吃掉。

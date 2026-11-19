@@ -1,9 +1,12 @@
 #include "worddocument.h"
 #include "xmlguard.h"
 
+#include <QBuffer>
 #include <QDomElement>
+#include <QImageReader>
 #include <QRegularExpression>
 #include <QSet>
+#include <QSize>
 #include <QStringList>
 #include <QtGlobal>
 #include "percentdecode.h"
@@ -28,13 +31,24 @@ namespace {
 
 // ---- 限制（防御畸形 / 恶意文件）----
 constexpr int    kMaxBlockCount   = 100000;          // 段落 + 表格总量上限
-constexpr int    kMaxDepth        = 6;               // 表格 / AlternateContent 递归深度上限
+constexpr int    kMaxLookupDepth  = 6;               // 定点查找（findDescendant）深度上限
+// P1-13：递归遍历的结构深度上限。畸形文档可以用几万层 <w:sdt> 把调用栈打爆，
+// 这里统一在遍历函数入口拦截（比原来的 6 层宽松，真正兜住工作量的是下面的元素总数）。
+constexpr int    kMaxXmlDepth     = 200;
+constexpr int    kMaxVisitedNodes = 500000;          // 单次 render 访问的 XML 元素总量上限
 constexpr qint64 kMaxImageBytes   = 32 * 1024 * 1024; // 单张内嵌图片上限
+// P1-14：解码前的像素/内存预检（QImage 按 4 字节/像素估算解码后占用）。
+// 只挡压缩字节远远不够：几 KB 的 PNG 可以声明成 5 万×5 万像素。
+constexpr qint64 kMaxImagePixels        = 40000000LL;            // 40 MP
+constexpr qint64 kMaxImageDecodeBytes   = 160LL * 1024 * 1024;   // 单图解码后约 160 MiB
+constexpr qint64 kMaxImageDecodeNoSize  = 32LL * 1024 * 1024;    // 读不到尺寸时只允许小文件解码
 constexpr double kMaxImageDisplayW = 1400.0;          // 图片显示宽度上限（px）
 constexpr double kMaxImageDisplayH = 10000.0;         // 图片显示高度上限（px，防止超长图撑爆布局）
 // 整个文档累计的图片解码预算（按 width*height*4 估算常驻内存）：
 // 单图上限只挡压缩字节，多张接近上限的图仍会累计占用数 GB（P-14）
 constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;
+// P1-16：HTML 输出硬上限（约 200 万字符）。超过就不再追加，避免 join 出几 GB 的 QString。
+constexpr qint64 kMaxHtmlChars    = 2000000LL;
 constexpr double kListIndentPt    = 18.0;             // 列表每级缩进（pt）
 constexpr double kTwipsPerPt      = 20.0;
 constexpr double kEmuPerPx        = 9525.0;
@@ -163,10 +177,10 @@ QString childVal(const QDomElement &el, const QString &tag)
     return c.isNull() ? QString() : c.attribute(QStringLiteral("w:val"));
 }
 
-// 深度优先查找后代元素
+// 深度优先查找后代元素（只用于取属性，深度上限保持原值；见 kMaxLookupDepth）
 QDomElement findDescendant(const QDomElement &el, const QString &tag, int depth = 0)
 {
-    if (el.isNull() || depth > kMaxDepth) return QDomElement();
+    if (el.isNull() || depth > kMaxLookupDepth) return QDomElement();
     for (QDomElement c = el.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
     {
         if (c.tagName() == tag) return c;
@@ -240,6 +254,34 @@ qint64 decodedImageBytes(const QImage &img)
 {
     if (img.isNull()) return 0;
     return qint64(img.width()) * qint64(img.height()) * 4;
+}
+
+// ---- P1-14：解码前的图片尺寸/内存预检 ----
+// 只限制压缩字节挡不住「解压炸弹」：几 KB 的 PNG 头可以声明 5 万×5 万像素，
+// QImage::fromData 会直接分配 10 GB 像素。这里先用 QImageReader 只读元数据，
+// 尺寸/估算内存超限就在解码前拒掉；读不到尺寸时才退回解码，并对字节数另设硬上限。
+enum class ImageGate { Ok, NoSize, TooLarge };
+
+ImageGate precheckImage(const QByteArray &bytes, QSize *size)
+{
+    if (size) *size = QSize();
+    if (bytes.isEmpty()) return ImageGate::NoSize;
+
+    QByteArray data = bytes;          // QByteArray 隐式共享：这里只读，不会复制内容
+    QBuffer device(&data);
+    if (!device.open(QIODevice::ReadOnly)) return ImageGate::NoSize;
+    QImageReader reader(&device);
+    reader.setDecideFormatFromContent(true);   // 扩展名不可信（zip 条目名可能与内容不符）
+    if (!reader.canRead()) return ImageGate::NoSize;
+
+    const QSize sz = reader.size();
+    if (size) *size = sz;
+    if (!sz.isValid() || sz.width() <= 0 || sz.height() <= 0) return ImageGate::NoSize;
+
+    const qint64 pixels = qint64(sz.width()) * qint64(sz.height());
+    if (pixels > kMaxImagePixels) return ImageGate::TooLarge;
+    if (pixels * 4 > kMaxImageDecodeBytes) return ImageGate::TooLarge;
+    return ImageGate::Ok;
 }
 
 // 本次 render() 已经解码进 m_imageCache 的字节合计（每次 render 开头清零）。
@@ -618,6 +660,10 @@ void WordDocument::reset()
     m_failedImages.clear();
     m_imageCache.clear();
     m_nDecodedImageBytes = 0;    // P-14：图片缓存清空，累计解码预算同步归零
+    // P1-13 / P1-16：换文档时截断原因与遍历/输出计数一并归零
+    m_truncatedReason.clear();
+    m_nVisitedNodes = 0;
+    m_nHtmlChars = 0;
     m_rtf.reset();
     m_isRtf = false;
     m_isOdt = false;
@@ -1053,7 +1099,52 @@ QString WordDocument::nextListPrefix(int numId, int ilvl)
 
 // ============================================================================
 // HTML 生成
+// ----------------------------------------------------------------------------
+// 资源 / 健壮性预算（P1-13 / P1-14 / P1-16）：结构深度与元素总量、图片解码前
+// 预检、HTML 输出体量，三项共用下面这组入口。
 // ============================================================================
+
+// 统一截断记账：只保留第一次触发的原因，避免被后续更细碎的原因覆盖
+void WordDocument::markTruncated(const QString &reason)
+{
+    m_truncated = true;
+    if (m_truncatedReason.isEmpty() && !reason.isEmpty()) m_truncatedReason = reason;
+}
+
+// P1-13：递归遍历的深度 + 访问元素总量闸门。返回 false 表示必须停止当前遍历。
+bool WordDocument::visitGuard(int nDepth)
+{
+    if (nDepth > kMaxXmlDepth)
+    {
+        markTruncated(QStringLiteral("文档结构过深"));
+        return false;
+    }
+    if (++m_nVisitedNodes > kMaxVisitedNodes)
+    {
+        markTruncated(QStringLiteral("文档结构过大"));
+        return false;
+    }
+    return true;
+}
+
+// P1-16：输出体量的累计记账。只累加已知片段长度（不 join），避免 O(n^2)。
+void WordDocument::accountHtml(qint64 chars)
+{
+    if (chars <= 0) return;
+    m_nHtmlChars += chars;
+    if (m_nHtmlChars > kMaxHtmlChars)
+        markTruncated(QStringLiteral("输出内容超过上限"));
+}
+
+// P1-14：被预算拒掉的图片只是「不显示」，不能因此中断整篇渲染。
+// 这里单独记账，render() 末尾用一句话提示，既不静默丢弃也不谎报文档被截断。
+void WordDocument::noteSkippedImage(const QString &reason)
+{
+    ++m_nSkippedImages;
+    if (m_skippedImageReason.isEmpty() && !reason.isEmpty())
+        m_skippedImageReason = reason;
+}
+
 WordDocument::RenderResult WordDocument::render(double fontScale)
 {
     RenderResult res;
@@ -1064,6 +1155,12 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     m_numCounters.clear();
     m_truncated = false;
     m_blockBudget = 0;
+    // P1-13 / P1-16：每次渲染重置结构访问计数与输出体量计数（缓存与图片预算跨 render 保留）
+    m_truncatedReason.clear();
+    m_nVisitedNodes = 0;
+    m_nHtmlChars = 0;
+    m_nSkippedImages = 0;
+    m_skippedImageReason.clear();
     // 缓存跨 render 保留，预算也必须累计；只有 reset() 清空缓存时才归零。
 
     // RTF 走自己的轻量解析器：直接产出 HTML，不需要 ZipReader / 样式表
@@ -1085,7 +1182,20 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
         emitBlocks(m_body, out, fontScale, 0);
 
     if (m_truncated)
-        out << QStringLiteral("<p><i>（文档过大，仅显示前一部分内容）</i></p>");
+    {
+        // P1-16：把触发的具体原因（结构过深/过大、输出超限……）一起显示出来
+        const QString why = m_truncatedReason.isEmpty()
+                ? QStringLiteral("文档过大") : m_truncatedReason;
+        out << QStringLiteral("<p><i>（%1，仅显示前一部分内容）</i></p>").arg(esc(why));
+    }
+    if (m_nSkippedImages > 0)
+    {
+        // P1-14：图片超预算只是不显示，正文继续，末尾给出可核查的说明
+        const QString why = m_skippedImageReason.isEmpty()
+                ? QStringLiteral("超出图片预算") : m_skippedImageReason;
+        out << QStringLiteral("<p><i>（%1 张图片未显示：%2）</i></p>")
+                   .arg(m_nSkippedImages).arg(esc(why));
+    }
 
     res.html = out.join(QString());
     res.images = m_imageCache;
@@ -1094,47 +1204,50 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
     return res;
 }
 
-void WordDocument::emitBlocks(const QDomElement &parent, QStringList &out, double scale, int depth)
+void WordDocument::emitBlocks(const QDomElement &parent, QStringList &out, double scale, int nDepth)
 {
-    if (parent.isNull() || depth > kMaxDepth) return;
+    if (parent.isNull()) return;
+    // P1-13：结构过深直接停止，并留下截断原因
+    if (!visitGuard(nDepth)) return;
 
     for (QDomElement e = parent.firstChildElement(); !e.isNull(); e = e.nextSiblingElement())
     {
         if (m_truncated) return;
+        if (!visitGuard(nDepth + 1)) return;
         const QString tag = e.tagName();
 
         if (tag == QLatin1String("w:p"))
         {
-            emitParagraph(e, out, scale);
+            emitParagraph(e, out, scale, nDepth + 1);
         }
         else if (tag == QLatin1String("w:tbl"))
         {
-            emitTable(e, out, scale, depth);
+            emitTable(e, out, scale, nDepth + 1);
         }
         else if (tag == QLatin1String("w:sdt"))
         {
             const QDomElement content = e.firstChildElement(QStringLiteral("w:sdtContent"));
-            if (!content.isNull()) emitBlocks(content, out, scale, depth + 1);
+            if (!content.isNull()) emitBlocks(content, out, scale, nDepth + 1);
         }
         else if (tag == QLatin1String("w:ins") || tag == QLatin1String("w:moveTo")
                  || tag == QLatin1String("w:customXml") || tag == QLatin1String("w:smartTag"))
         {
-            emitBlocks(e, out, scale, depth + 1);
+            emitBlocks(e, out, scale, nDepth + 1);
         }
         else if (tag == QLatin1String("mc:AlternateContent"))
         {
             // Word 2010+ 的兼容性包装：优先取 mc:Choice，否则取 mc:Fallback
             QDomElement chosen = e.firstChildElement(QStringLiteral("mc:Choice"));
             if (chosen.isNull()) chosen = e.firstChildElement(QStringLiteral("mc:Fallback"));
-            if (!chosen.isNull()) emitBlocks(chosen, out, scale, depth + 1);
+            if (!chosen.isNull()) emitBlocks(chosen, out, scale, nDepth + 1);
         }
         // 其余（w:sectPr / w:bookmarkStart / w:del ...）对页面显示无意义，跳过
     }
 }
 
-void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double scale)
+void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double scale, int nDepth)
 {
-    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+    if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("段落数量超过上限")); return; }
 
     const QDomElement pPr = p.firstChildElement(QStringLiteral("w:pPr"));
     const QString parStyleId = childVal(pPr, QStringLiteral("w:pStyle"));
@@ -1168,7 +1281,7 @@ void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double 
     }
 
     QStringList runs;
-    emitRuns(p, runs, base, scale, QString());
+    emitRuns(p, runs, base, scale, QString(), nDepth + 1);
 
     ++m_stats.paragraphs;
     if (heading > 0) ++m_stats.headings;
@@ -1205,6 +1318,13 @@ void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double 
     const double baseSize = (base.sizePt > 0.0 ? base.sizePt : m_defaultSizePt) * scale;
     css << QStringLiteral("font-size:%1pt").arg(fmtNum(baseSize));
 
+    // P1-16：追加前先记账，超过输出上限就停止（本节内容不再输出）
+    qint64 nOut = 128;                       // 标签/CSS 的近似开销
+    for (const QString &s : runs) nOut += s.size();
+    nOut += prefix.size();
+    accountHtml(nOut);
+    if (m_truncated) return;
+
     out << QStringLiteral("<p style=\"") << css.join(QLatin1Char(';')) << QStringLiteral("\">");
 
     if (!prefix.isEmpty())
@@ -1227,13 +1347,16 @@ void WordDocument::emitParagraph(const QDomElement &p, QStringList &out, double 
 }
 
 void WordDocument::emitRuns(const QDomElement &parent, QStringList &out, const RunProps &base,
-                            double scale, const QString &linkTarget)
+                            double scale, const QString &linkTarget, int nDepth)
 {
     struct DepthGuard { int &d; explicit DepthGuard(int &x) : d(x) { ++d; } ~DepthGuard() { --d; } };
     DepthGuard guard(m_nInlineDepth);
-    if (m_nInlineDepth > 64) { m_truncated = true; return; }
+    if (!visitGuard(nDepth)) return;                 // P1-13：结构深度 / 元素总量闸门
+    if (m_nInlineDepth > 64) { markTruncated(QStringLiteral("行内嵌套过深")); return; }
     for (QDomElement e = parent.firstChildElement(); !e.isNull(); e = e.nextSiblingElement())
     {
+        if (m_truncated) return;
+        if (!visitGuard(nDepth + 1)) return;
         const QString tag = e.tagName();
 
         if (tag == QLatin1String("w:r"))
@@ -1248,7 +1371,7 @@ void WordDocument::emitRuns(const QDomElement &parent, QStringList &out, const R
             target = safeHref(target);
 
             QStringList sub;
-            emitRuns(e, sub, base, scale, target);
+            emitRuns(e, sub, base, scale, target, nDepth + 1);
             if (!sub.isEmpty() && !target.isEmpty())
                 out << QStringLiteral("<a href=\"") << escAttr(target) << QStringLiteral("\">")
                     << sub.join(QString()) << QStringLiteral("</a>");
@@ -1259,16 +1382,16 @@ void WordDocument::emitRuns(const QDomElement &parent, QStringList &out, const R
                  || tag == QLatin1String("w:smartTag") || tag == QLatin1String("w:fldSimple")
                  || tag == QLatin1String("w:customXml"))
         {
-            emitRuns(e, out, base, scale, linkTarget);
+            emitRuns(e, out, base, scale, linkTarget, nDepth + 1);
         }
         else if (tag == QLatin1String("w:sdt"))
         {
             const QDomElement content = e.firstChildElement(QStringLiteral("w:sdtContent"));
-            if (!content.isNull()) emitRuns(content, out, base, scale, linkTarget);
+            if (!content.isNull()) emitRuns(content, out, base, scale, linkTarget, nDepth + 1);
         }
         else if (tag == QLatin1String("mc:AlternateContent"))
         {
-            emitAlternateContent(e, out, base, scale, linkTarget);
+            emitAlternateContent(e, out, base, scale, linkTarget, nDepth + 1);
         }
         // w:pPr / w:rPr / w:bookmarkStart / w:del / w:proofErr ... 跳过
     }
@@ -1276,11 +1399,11 @@ void WordDocument::emitRuns(const QDomElement &parent, QStringList &out, const R
 
 void WordDocument::emitAlternateContent(const QDomElement &ac, QStringList &out,
                                         const RunProps &base, double scale,
-                                        const QString &linkTarget)
+                                        const QString &linkTarget, int nDepth)
 {
     QDomElement chosen = ac.firstChildElement(QStringLiteral("mc:Choice"));
     if (chosen.isNull()) chosen = ac.firstChildElement(QStringLiteral("mc:Fallback"));
-    if (!chosen.isNull()) emitRuns(chosen, out, base, scale, linkTarget);
+    if (!chosen.isNull()) emitRuns(chosen, out, base, scale, linkTarget, nDepth + 1);
 }
 
 void WordDocument::emitRun(const QDomElement &r, QStringList &out, const RunProps &base,
@@ -1362,6 +1485,10 @@ void WordDocument::emitRun(const QDomElement &r, QStringList &out, const RunProp
     if (!rp.highlight.isEmpty()) css << QStringLiteral("background-color:") + rp.highlight;
     if (!rp.family.isEmpty())    css << QStringLiteral("font-family:") + rp.family;
 
+    // P1-16：单个 run 的输出也要记账，否则全篇都是短 run 时永远触发不到上限
+    accountHtml(qint64(html.size()) + 64);
+    if (m_truncated) return;
+
     out << QStringLiteral("<span style=\"") << css.join(QLatin1Char(';'))
         << QStringLiteral("\">") << html << QStringLiteral("</span>");
 }
@@ -1431,6 +1558,36 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
     {
         const QByteArray bytes = m_zip.entry(part);
         if (bytes.isEmpty() || bytes.size() > kMaxImageBytes) { m_failedImages.insert(part); return QString(); }
+
+        // ---- P1-14：解码前先做尺寸/内存预检 ----
+        QSize size;
+        const ImageGate gate = precheckImage(bytes, &size);
+        if (gate == ImageGate::TooLarge)
+        {
+            m_failedImages.insert(part);           // 负缓存：不再重复解压/预检
+            noteSkippedImage(QStringLiteral("图片像素超过上限"));
+            return QString();
+        }
+        if (gate == ImageGate::NoSize && bytes.size() > kMaxImageDecodeNoSize)
+        {
+            // 格式没有报出尺寸：只放行小文件解码，其余按超预算处理
+            m_failedImages.insert(part);
+            noteSkippedImage(QStringLiteral("图片无法预检尺寸且体积过大"));
+            return QString();
+        }
+        // 已知尺寸时先用估算值挡掉，避免解码后才发现超预算
+        if (gate == ImageGate::Ok)
+        {
+            const qint64 estimate = qint64(size.width()) * qint64(size.height()) * 4;
+            if (estimate > kMaxImageDecodeBytes
+                || m_nDecodedImageBytes + estimate > kMaxDecodedImageBytes)
+            {
+                m_failedImages.insert(part);
+                noteSkippedImage(QStringLiteral("图片解码内存超过预算"));
+                return QString();
+            }
+        }
+
         const QImage img = QImage::fromData(bytes);
         if (img.isNull()) { m_failedImages.insert(part); return QString(); }      // WMF/EMF 等 Qt 不支持的格式
 
@@ -1440,6 +1597,7 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
         if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
         {
             m_failedImages.insert(part);   // 负缓存：后续引用不再重复解压/解码
+            noteSkippedImage(QStringLiteral("图片解码内存超过预算"));
             return QString();
         }
 
@@ -1459,9 +1617,10 @@ QString WordDocument::imageTag(const QDomElement &container, double scale)
     return tag;
 }
 
-void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double scale, int depth)
+void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double scale, int nDepth)
 {
-    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+    if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("表格数量超过上限")); return; }
+    if (!visitGuard(nDepth)) return;               // P1-13：表格嵌套深度 / 元素总量
 
     struct CellInfo {
         QDomElement el;
@@ -1477,12 +1636,14 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
     for (QDomElement tr = tbl.firstChildElement(QStringLiteral("w:tr"));
          !tr.isNull(); tr = tr.nextSiblingElement(QStringLiteral("w:tr")))
     {
+        if (!visitGuard(nDepth + 1)) return;
         QVector<CellInfo> row;
         int col = 0;
         for (QDomElement tc = tr.firstChildElement(QStringLiteral("w:tc"));
              !tc.isNull(); tc = tc.nextSiblingElement(QStringLiteral("w:tc")))
         {
-            if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+            if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("表格数量超过上限")); return; }
+            if (!visitGuard(nDepth + 1)) return;
             CellInfo c;
             c.el = tc;
             c.colStart = col;
@@ -1499,7 +1660,7 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
             }
 
             col += c.colSpan;
-            if (col > 1000000) { m_truncated = true; break; }
+            if (col > 1000000) { markTruncated(QStringLiteral("表格列数异常")); break; }
             row.append(c);
         }
         if (!row.isEmpty()) rows.append(row);
@@ -1539,6 +1700,7 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
 
     for (const QVector<CellInfo> &row : rows)
     {
+        if (m_truncated) break;          // 超预算：跳出循环但补上 </table>，别留半截标签
         out << QStringLiteral("<tr>");
         for (const CellInfo &c : row)
         {
@@ -1561,11 +1723,16 @@ void WordDocument::emitTable(const QDomElement &tbl, QStringList &out, double sc
             out << QStringLiteral(">");
 
             QStringList cell;
-            emitBlocks(c.el, cell, scale, depth + 1);
+            emitBlocks(c.el, cell, scale, nDepth + 1);
             if (cell.isEmpty()) out << QStringLiteral("&#160;");
             else                out << cell.join(QString());
 
             out << QStringLiteral("</td>");
+            // P1-16：逐格记账，表格特别多/特别大时也能在输出上限处停下
+            qint64 nOut = 32;
+            for (const QString &s : cell) nOut += s.size();
+            accountHtml(nOut);
+            if (m_truncated) break;
         }
         out << QStringLiteral("</tr>");
     }
@@ -1824,33 +1991,36 @@ bool WordDocument::loadOdt(const QByteArray &data, QString *error)
     return true;
 }
 
-void WordDocument::emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int depth)
+void WordDocument::emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int nDepth)
 {
-    if (parent.isNull() || depth > kMaxDepth) return;
+    if (parent.isNull()) return;
+    if (!visitGuard(nDepth)) return;               // P1-13：结构深度 / 元素总量
 
     for (QDomElement e = parent.firstChildElement(); !e.isNull(); e = e.nextSiblingElement())
     {
         if (m_truncated) return;
+        if (!visitGuard(nDepth + 1)) return;
         const QString tag = e.tagName();
 
         if (tag == QLatin1String("text:p") || tag == QLatin1String("text:h"))
         {
             const bool heading = (tag == QLatin1String("text:h"));
             const int lvl = e.attribute(QStringLiteral("text:outline-level")).toInt();
-            emitOdtParagraph(e, out, scale, heading, lvl > 0 ? lvl : 1, 0, QString());
+            emitOdtParagraph(e, out, scale, heading, lvl > 0 ? lvl : 1, 0, QString(),
+                             nDepth + 1);
         }
         else if (tag == QLatin1String("text:list"))
         {
-            emitOdtList(e, out, scale, 0);
+            emitOdtList(e, out, scale, nDepth + 1, 0);   // 正文里的列表从 0 级缩进开始
         }
         else if (tag == QLatin1String("table:table"))
         {
-            emitOdtTable(e, out, scale, depth);
+            emitOdtTable(e, out, scale, nDepth + 1);
         }
         else if (tag == QLatin1String("text:section")
                  || tag == QLatin1String("text:index-body"))
         {
-            emitOdtBody(e, out, scale, depth + 1);
+            emitOdtBody(e, out, scale, nDepth + 1);
         }
         // 其它（目录、脚注/尾注集合、文本框、表单）忽略
     }
@@ -1858,9 +2028,9 @@ void WordDocument::emitOdtBody(const QDomElement &parent, QStringList &out, doub
 
 void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, double scale,
                                     bool heading, int headingLevel, int listDepth,
-                                    const QString &bulletPrefix)
+                                    const QString &bulletPrefix, int nDepth)
 {
-    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+    if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("段落数量超过上限")); return; }
 
     const QString styleName = e.attribute(QStringLiteral("text:style-name"));
     OdtRun base = odtRunProps(styleName);
@@ -1874,7 +2044,7 @@ void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, doub
     }
 
     QStringList runs;
-    emitOdtInline(e, runs, base, scale, QString());
+    emitOdtInline(e, runs, base, scale, QString(), nDepth + 1);
 
     ++m_stats.paragraphs;
     if (heading) ++m_stats.headings;
@@ -1911,6 +2081,12 @@ void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, doub
     css << QStringLiteral("font-size:%1pt").arg(fmtNum(baseSize));
     if (heading) css << QStringLiteral("font-weight:bold");
 
+    // P1-16：输出预算记账（与 docx 段落同口径）
+    qint64 nOut = 128 + bulletPrefix.size();
+    for (const QString &s : runs) nOut += s.size();
+    accountHtml(nOut);
+    if (m_truncated) return;
+
     out << QStringLiteral("<p style=\"") + css.join(QLatin1Char(';')) + QStringLiteral("\">");
     if (!bulletPrefix.isEmpty())
         out << QStringLiteral("<span>") + esc(bulletPrefix) + QStringLiteral("</span>");
@@ -1919,13 +2095,17 @@ void WordDocument::emitOdtParagraph(const QDomElement &e, QStringList &out, doub
 }
 
 void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
-                                 const OdtRun &base, double scale, const QString &link)
+                                 const OdtRun &base, double scale, const QString &link,
+                                 int nDepth)
 {
     struct DepthGuard { int &d; explicit DepthGuard(int &x) : d(x) { ++d; } ~DepthGuard() { --d; } };
     DepthGuard guard(m_nInlineDepth);
-    if (m_nInlineDepth > 64) { m_truncated = true; return; }
+    if (!visitGuard(nDepth)) return;               // P1-13：结构深度 / 元素总量
+    if (m_nInlineDepth > 64) { markTruncated(QStringLiteral("行内嵌套过深")); return; }
     for (QDomNode n = parent.firstChild(); !n.isNull(); n = n.nextSibling())
     {
+        if (m_truncated) return;
+        if (!visitGuard(nDepth + 1)) return;
         if (n.isText())
         {
             const QString text = n.toText().data();
@@ -1937,6 +2117,7 @@ void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
                                      || !base.color.isEmpty() || !base.fill.isEmpty()
                                      || !base.family.isEmpty();
                 out << (baseFmt ? odtWrapRun(base, scale, html) : html);
+                accountHtml(qint64(html.size()) + 32);
             }
             continue;
         }
@@ -1971,7 +2152,7 @@ void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
             const OdtRun merged = odtMergeRun(base, own);
 
             QStringList inner;
-            emitOdtInline(e, inner, merged, scale, link);
+            emitOdtInline(e, inner, merged, scale, link, nDepth + 1);
             const QString html = inner.join(QString());
 
             const bool hasFormat = own.b || own.i || own.u || own.sizePt > 0.0
@@ -1983,7 +2164,7 @@ void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
         {
             const QString href = e.attribute(QStringLiteral("xlink:href"));
             QStringList inner;
-            emitOdtInline(e, inner, base, scale, href);
+            emitOdtInline(e, inner, base, scale, href, nDepth + 1);
             const QString html = inner.join(QString());
             const QString low = href.toLower();
             if (low.startsWith(QLatin1String("http")) || low.startsWith(QLatin1String("mailto"))
@@ -2007,14 +2188,18 @@ void WordDocument::emitOdtInline(const QDomElement &parent, QStringList &out,
         else
         {
             // text:ruby / text:ruby-base / text:meta 等：透传子节点
-            emitOdtInline(e, out, base, scale, link);
+            emitOdtInline(e, out, base, scale, link, nDepth + 1);
         }
     }
 }
 
-void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double scale, int depth)
+// nDepth 是结构递归深度（P1-13 的上限用它）；
+// nListDepth 是列表嵌套层级，只影响缩进——两者必须分开，否则列表缩进会随
+// 外层 section/表格的嵌套深度一起漂移。
+void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double scale,
+                               int nDepth, int nListDepth)
 {
-    if (depth > kMaxDepth) return;
+    if (!visitGuard(nDepth)) return;               // P1-13：结构深度 / 元素总量
 
     const QString styleName = list.attribute(QStringLiteral("text:style-name"));
     const bool ordered = m_odtListOrdered.value(styleName, false);
@@ -2024,7 +2209,8 @@ void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double
          !item.isNull(); item = item.nextSiblingElement(QStringLiteral("text:list-item")))
     {
         if (m_truncated) return;
-        if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
+        if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("列表项数量超过上限")); return; }
+        if (!visitGuard(nDepth + 1)) return;
 
         ++index;
         const QString prefix = ordered ? QStringLiteral("%1. ").arg(index)
@@ -2039,20 +2225,22 @@ void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double
             {
                 const bool heading = (t == QLatin1String("text:h"));
                 const int lvl = child.attribute(QStringLiteral("text:outline-level")).toInt();
-                emitOdtParagraph(child, out, scale, heading, lvl > 0 ? lvl : 1, depth + 1,
-                                 emitted ? QString() : prefix);
+                emitOdtParagraph(child, out, scale, heading, lvl > 0 ? lvl : 1, nListDepth + 1,
+                                 emitted ? QString() : prefix, nDepth + 1);
                 emitted = true;
             }
             else if (t == QLatin1String("text:list"))
             {
-                emitOdtList(child, out, scale, depth + 1);
+                emitOdtList(child, out, scale, nDepth + 1, nListDepth + 1);
             }
         }
 
         if (!emitted)
         {
+            accountHtml(96 + prefix.size());
+            if (m_truncated) return;
             out << QStringLiteral("<p style=\"margin-left:%1px;text-indent:%2px\">")
-                       .arg(fmtNum((depth + 2) * kListIndentPt * kPtToPx))
+                       .arg(fmtNum((nListDepth + 2) * kListIndentPt * kPtToPx))
                        .arg(fmtNum(-kListIndentPt * kPtToPx))
                 << QStringLiteral("<span>") + esc(prefix) + QStringLiteral("</span>")
                 << QStringLiteral("</p>");
@@ -2060,10 +2248,10 @@ void WordDocument::emitOdtList(const QDomElement &list, QStringList &out, double
     }
 }
 
-void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, double scale, int depth)
+void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, double scale, int nDepth)
 {
-    if (++m_blockBudget > kMaxBlockCount) { m_truncated = true; return; }
-    if (depth > kMaxDepth) return;
+    if (++m_blockBudget > kMaxBlockCount) { markTruncated(QStringLiteral("表格数量超过上限")); return; }
+    if (!visitGuard(nDepth)) return;               // P1-13：表格嵌套深度 / 元素总量
 
     ++m_stats.tables;
     out << QStringLiteral("<table border=\"1\" cellspacing=\"0\" cellpadding=\"4\" "
@@ -2073,7 +2261,10 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
     // ODF 允许行被 table:table-header-rows / table-rows / table-row-group 包裹；
     // 只取直接子 table:table-row 会让整行（如重复标题行）消失。
     QVector<QDomElement> rows;
-    std::function<void(const QDomElement &)> collectRows = [&](const QDomElement &parent) {
+    std::function<void(const QDomElement &, int)> collectRows = [&](const QDomElement &parent,
+                                                                    int nRowDepth) {
+        // P1-13：行分组包装可以层层嵌套，递归深度按 kMaxXmlDepth 兜住
+        if (nRowDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("表格行分组过深")); return; }
         for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
         {
             const QString tag = c.tagName();
@@ -2082,10 +2273,10 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
             else if (tag == QLatin1String("table:table-header-rows")
                      || tag == QLatin1String("table:table-rows")
                      || tag == QLatin1String("table:table-row-group"))
-                collectRows(c);
+                collectRows(c, nRowDepth + 1);
         }
     };
-    collectRows(table);
+    collectRows(table, nDepth);
     for (const QDomElement &row : rows)
     {
         if (m_truncated) break;
@@ -2113,15 +2304,16 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
                 {
                     const bool heading = (t == QLatin1String("text:h"));
                     const int lvl = child.attribute(QStringLiteral("text:outline-level")).toInt();
-                    emitOdtParagraph(child, inner, scale, heading, lvl > 0 ? lvl : 1, 0, QString());
+                    emitOdtParagraph(child, inner, scale, heading, lvl > 0 ? lvl : 1, 0, QString(),
+                                     nDepth + 1);
                 }
                 else if (t == QLatin1String("text:list"))
                 {
-                    emitOdtList(child, inner, scale, depth + 1);
+                    emitOdtList(child, inner, scale, nDepth + 1, 1);   // 表格内列表保持比正文多一级
                 }
                 else if (t == QLatin1String("table:table"))
                 {
-                    emitOdtTable(child, inner, scale, depth + 1);
+                    emitOdtTable(child, inner, scale, nDepth + 1);
                 }
             }
 
@@ -2132,6 +2324,12 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
             if (inner.isEmpty()) out << QStringLiteral("&#160;");
             else                 out << inner.join(QString());
             out << QStringLiteral("</td>");
+
+            // P1-16：逐格记账（与 docx 表格同口径）
+            qint64 nOut = 32;
+            for (const QString &s : inner) nOut += s.size();
+            accountHtml(nOut);
+            if (m_truncated) break;
         }
         out << QStringLiteral("</tr>");
     }
@@ -2180,6 +2378,33 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     }
     if (url.isEmpty())
     {
+        // ---- P1-14：解码前的尺寸/内存预检（与 docx 图片同一套阈值）----
+        QSize size;
+        const ImageGate gate = precheckImage(bytes, &size);
+        if (gate == ImageGate::TooLarge)
+        {
+            m_failedImages.insert(key);
+            noteSkippedImage(QStringLiteral("图片像素超过上限"));
+            return QString();
+        }
+        if (gate == ImageGate::NoSize && bytes.size() > kMaxImageDecodeNoSize)
+        {
+            m_failedImages.insert(key);
+            noteSkippedImage(QStringLiteral("图片无法预检尺寸且体积过大"));
+            return QString();
+        }
+        if (gate == ImageGate::Ok)
+        {
+            const qint64 estimate = qint64(size.width()) * qint64(size.height()) * 4;
+            if (estimate > kMaxImageDecodeBytes
+                || m_nDecodedImageBytes + estimate > kMaxDecodedImageBytes)
+            {
+                m_failedImages.insert(key);
+                noteSkippedImage(QStringLiteral("图片解码内存超过预算"));
+                return QString();
+            }
+        }
+
         const QImage im = QImage::fromData(bytes);
         if (im.isNull()) { m_failedImages.insert(key); return QString(); }      // SVG/WMF 等 Qt 不能直接解码的格式
 
@@ -2188,6 +2413,7 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
         if (m_nDecodedImageBytes + decoded > kMaxDecodedImageBytes)
         {
             m_failedImages.insert(key);
+            noteSkippedImage(QStringLiteral("图片解码内存超过预算"));
             return QString();
         }
 

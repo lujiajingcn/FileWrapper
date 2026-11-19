@@ -40,11 +40,26 @@ PluginManager::PluginManager(QObject *parent) : QObject (parent)
 
 PluginManager::~PluginManager()
 {
+    // P0-3：宿主还有「停播未确认」的插件实例时，卸载 DLL 会让后台线程
+    // 执行已卸载代码。进程退出阶段宁可泄漏 loader（OS 会回收），也不 unload。
+    if (!m_bUnloadEnabled)
+    {
+        qWarning() << "[PluginManager] 存在未确认停止的插件实例，退出时跳过 DLL 卸载";
+        m_mapPluginLoaders.clear();
+        m_mapPluginInterface.clear();
+        m_listRejectedLoaders.clear();
+        return;
+    }
     qDeleteAll(m_mapPluginLoaders);
     m_mapPluginLoaders.clear();
     m_mapPluginInterface.clear();
     qDeleteAll(m_listRejectedLoaders);
     m_listRejectedLoaders.clear();
+}
+
+void PluginManager::setUnloadEnabled(bool bEnabled)
+{
+    m_bUnloadEnabled = bEnabled;
 }
 
 PluginManager *PluginManager::getInstance()
@@ -304,6 +319,12 @@ void PluginManager::setPluginEnabled(const QString &sPluginId, bool bEnabled)
 
 void PluginManager::reloadPlugins()
 {
+    if (!m_bUnloadEnabled)
+    {
+        qWarning() << "[PluginManager] 拒绝重新加载：存在未确认停止的插件实例";
+        recordFailure(QString(), QStringLiteral("仍有插件实例停播未完成，必须保持 DLL 加载状态"));
+        return;
+    }
     // 先释放所有 loader（= 卸载 DLL）。调用方必须保证没有标签页仍持有插件实例，
     // 否则那些对象的虚表会指向已卸载的模块。
     qDeleteAll(m_mapPluginLoaders);

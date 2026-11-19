@@ -6,6 +6,75 @@
 #include <QVBoxLayout>
 #include <QFont>
 #include <QByteArray>
+#include <QStringDecoder>
+
+namespace {
+
+// P2-1/P2-2：严格解码文本。
+// 旧实现用 QString::fromUtf8() 后检查 U+FFFD：既会把「合法包含 U+FFFD 的文本」
+// 误判成坏编码，也会把 1 MiB 截断处的半个多字节序列当成整个文件非法而回退本地编码。
+// 这里用可报告错误的 QStringDecoder：
+//   * 先按 UTF-8 严格解码；成功即用（U+FFFD 只在它真的以 UTF-8 合法编码出现时才保留）；
+//   * 失败且是「读取窗口末尾截断」时，去掉末尾最多 3 个未完成字节再试；
+//   * 仍失败才回退本地编码（GBK 等）。
+QString decodeTextStrict(const char *p, qint64 n, bool bWindowTruncated,
+                         bool *pbFellBack, bool *pbTailTruncated)
+{
+    if (pbFellBack) *pbFellBack = false;
+    if (pbTailTruncated) *pbTailTruncated = false;
+    QByteArray bytes(p, qsizetype(n));
+
+    // BOM：UTF-8 / UTF-16LE / UTF-16BE
+    if (bytes.startsWith("\xEF\xBB\xBF"))
+    {
+        QStringDecoder dec(QStringDecoder::Utf8);
+        const QString s = dec.decode(bytes.mid(3));
+        if (!dec.hasError()) return s;
+    }
+    else if (bytes.startsWith("\xFF\xFE"))
+    {
+        QStringDecoder dec(QStringDecoder::Utf16LE);
+        const QString s = dec.decode(bytes.mid(2));
+        if (!dec.hasError()) return s;
+    }
+    else if (bytes.startsWith("\xFE\xFF"))
+    {
+        QStringDecoder dec(QStringDecoder::Utf16BE);
+        const QString s = dec.decode(bytes.mid(2));
+        if (!dec.hasError()) return s;
+    }
+
+    {
+        QStringDecoder dec(QStringDecoder::Utf8);
+        const QString s = dec.decode(bytes);
+        if (!dec.hasError()) return s;
+    }
+
+    // 读取窗口在 1 MiB 边界截断：末尾可能是某个多字节字符的前半段。
+    // 去掉最多 3 个尾字节后重新严格解码，成功就只丢弃这个不完整字符。
+    if (bWindowTruncated)
+    {
+        for (int trim = 1; trim <= 3 && trim < bytes.size(); ++trim)
+        {
+            QStringDecoder dec(QStringDecoder::Utf8);
+            const QString s = dec.decode(bytes.left(bytes.size() - trim));
+            if (!dec.hasError())
+            {
+                if (pbTailTruncated) *pbTailTruncated = true;
+                return s;
+            }
+        }
+    }
+
+    // 最后的兜底：本地编码（中文 Windows 为 GBK）。仍然可报告错误，
+    // 避免把明显非文本的二进制内容当成合法文本显示。
+    QStringDecoder local(QStringDecoder::System);
+    const QString s = local.decode(bytes);
+    if (pbFellBack) *pbFellBack = true;
+    return s;
+}
+
+} // namespace
 
 BuiltinViewer::BuiltinViewer(Mode mode)
     : m_mode(mode), m_widget(nullptr), m_title(nullptr), m_edit(nullptr)
@@ -52,11 +121,15 @@ void BuiltinViewer::sendFileData(char *szFileData, qint64 nFileLen)
 
     if (m_mode == TextMode)
     {
-        QString s = QString::fromUtf8(szFileData, qsizetype(n));
-        // UTF-8 解码出现替换字符时回退到本地编码（中文 Windows 为 GBK）
-        if (s.contains(QChar(0xFFFD)))
-            s = QString::fromLocal8Bit(szFileData, qsizetype(n));
+        bool bFellBack = false;
+        bool bTailTruncated = false;
+        QString s = decodeTextStrict(szFileData, n, nFileLen > n,
+                                     &bFellBack, &bTailTruncated);
         text = s;
+        if (bTailTruncated)
+            text += QStringLiteral("\n[读取窗口在字符中间截断，已丢弃末尾不完整字符]");
+        else if (bFellBack)
+            text += QStringLiteral("\n[内容不是合法 UTF-8，已按本地编码显示]");
     }
     else
     {

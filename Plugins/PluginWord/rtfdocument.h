@@ -88,7 +88,9 @@ private:
     double         m_paraIndentPt = 0.0;
     QHash<int, QString> m_fonts;    // \fN -> 字体名
     QHash<int, QString> m_colors;   // \cfN -> #RRGGBB
-    double         m_defaultSizePt = 10.5;
+    // P2-8：文档没写 \fs 时按 12pt 显示。RTF 阅读器的缺省字号是 12pt（10.5 是
+    // docx 中文「五号」的习惯值，套到 RTF 上会整体偏小一号）。
+    double         m_defaultSizePt = 12.0;
     bool           m_ok = false;
     bool           m_skipUnicodeFallback = false;
     int            m_ucCount = 1;          // \ucN 的 N（默认为 1）

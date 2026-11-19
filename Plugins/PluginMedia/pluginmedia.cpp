@@ -14,8 +14,17 @@ bool PluginMedia::showFile(const PluginFile &file)
     const char *pData = nullptr;
     qint64 nLen = 0;
 
+    // 每次尝试开始先清掉上一次的失败原因（接口 v6 约定）：宿主只在返回 false 后
+    // 读 lastError()，陈旧原因会把这次的失败解释错。
+    m_wMainWindow->clearLastError();
+
     if (file.isPath())
     {
+        // P1-23：路径分支不要无上限 readAll。正常宿主会走 sendFileByPath 流式打开，
+        // 这里只服务直接 API 调用；超过阈值直接拒绝，避免一次性读入数 GB。
+        constexpr qint64 kMaxDirectPathBytes = 256LL * 1024 * 1024;
+        if (file.size() > kMaxDirectPathBytes)
+            return false;
         owned = file.readAll();
         pData = owned.constData();
         nLen  = owned.size();
@@ -32,11 +41,26 @@ bool PluginMedia::showFile(const PluginFile &file)
     // 失败时统一复位进度条/时间标签/播放图标，避免残留上一个文件的状态。
     const int nRet = m_wMainWindow->showVideo(const_cast<char *>(pData), nLen);
     if (nRet < 0)
-    {
-        m_wMainWindow->clearContent();
-        return false;
-    }
+        return reportOpenFailure();
     return true;
+}
+
+QString PluginMedia::lastError() const
+{
+    // 空串 = 本次没失败（或旧窗口没有原因）：宿主据此决定显示通用提示。
+    return m_wMainWindow ? m_wMainWindow->lastError() : QString();
+}
+
+bool PluginMedia::reportOpenFailure()
+{
+    if (m_wMainWindow == nullptr)
+        return false;
+    // 顺序不能反：clearContent() 会清空画面区，真实原因必须在它之后写进去。
+    // 画面区是本插件唯一的"持久"位置 —— 宿主的提示只停 10 秒，
+    // 用户回头看标签页时不能只剩一块黑屏。
+    m_wMainWindow->clearContent();
+    m_wMainWindow->showFailurePage();
+    return false;
 }
 
 bool PluginMedia::stopPlaybackAndWait()
@@ -67,6 +91,7 @@ bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName
     Q_UNUSED(displayName);
     if (m_wMainWindow == nullptr)
         return false;
+    m_wMainWindow->clearLastError();
     // 非法输入与 showFile/sendFileMapped 的空数据分支保持一致：只返回 false，
     // 由宿主决定是否复位（不在这里产生"停掉正在播放文件"的副作用）。
     if (path.isEmpty() || !QFileInfo::exists(path))
@@ -75,8 +100,7 @@ bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName
     if (m_wMainWindow->showVideoFile(path) < 0)
     {
         // 打开失败（showVideo 已停掉旧播放并清画面，但进度条/时间/图标仍是旧状态）
-        m_wMainWindow->clearContent();
-        return false;
+        return reportOpenFailure();
     }
     return true;
 }
@@ -84,12 +108,12 @@ bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName
 bool PluginMedia::sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName)
 {
     Q_UNUSED(displayName);
-    if (m_wMainWindow == nullptr || pData == nullptr || nFileLen <= 0)
+    if (m_wMainWindow == nullptr)
+        return false;
+    m_wMainWindow->clearLastError();
+    if (pData == nullptr || nFileLen <= 0)
         return false;
     if (m_wMainWindow->showVideoMapped(pData, nFileLen) < 0)
-    {
-        m_wMainWindow->clearContent();
-        return false;
-    }
+        return reportOpenFailure();
     return true;
 }

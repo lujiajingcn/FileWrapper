@@ -6,6 +6,7 @@
 #include <QDebug>
 #include <QStringList>
 #include <QRegularExpression>
+#include <limits>
 #include "xmlguard.h"
 #include "percentdecode.h"
 
@@ -20,13 +21,40 @@ constexpr int kMaxCellLen = 400;
 constexpr int kMaxXlsxCols = 16384;   // xlsx 列号上限（XFD，1 基），超过视为畸形引用
 constexpr int kMaxRelationships = 10000;   // 单个 .rels 条目上限（防 QDom 节点放大）
 
+// P1-13：递归遍历的结构深度上限与单文档访问元素总量上限（与 xmlguard 的 50 万标签同量级）
+constexpr int kMaxXmlDepth     = 200;
+constexpr int kMaxVisitedNodes = 500000;
+
+// P1-12/16：共享字符串表的硬上限。超出后不再追加，并记录截断原因，
+// 而不是让调用方把「只解出一半」当成成功数据继续用（单元格会显示成空）。
+constexpr int    kMaxSharedStrings     = 500000;
+constexpr qint64 kMaxSharedStringChars = 64LL * 1024 * 1024;
+
+// P2-6：ODS 重复行列的「物化」上限。逻辑坐标必须按原始 repeat 前进，
+// 这里只是限制真正写进单元格表/HTML 的行列数。
+constexpr int kMaxRepeatPreview = 40;
+
+// P2-6：repeat 计数饱和推进。原始 repeat 可能是 2^31 级别的值，
+// 直接相加会让 int 溢出（UB）；饱和到 int 上限并置溢出标记。
+int saturatingAdvance(int base, qint64 repeat, bool *pbOverflow)
+{
+    const qint64 next = qint64(base) + (repeat > 0 ? repeat : 0);
+    if (next > std::numeric_limits<int>::max())
+    {
+        if (pbOverflow) *pbOverflow = true;
+        return std::numeric_limits<int>::max();
+    }
+    return int(next);
+}
+
 
 QString odsCellText(const QDomElement &cell)
 {
     QString out;
     const int nLimit = kMaxCellLen + 2;   // 给 setCell 的省略号留余量
     std::function<void(const QDomNode &, int)> appendNode = [&](const QDomNode &n, int depth) {
-        if (out.size() >= nLimit || depth > 64) return;
+        // P1-13：结构深度按 kMaxXmlDepth 兜住（输出长度另有 nLimit 上限）
+        if (out.size() >= nLimit || depth > kMaxXmlDepth) return;
         if (n.isText()) {
             out += n.toText().data().left(nLimit - out.size());
             return;
@@ -52,6 +80,17 @@ QString odsCellText(const QDomElement &cell)
         for (QDomNode c = p.firstChild(); !c.isNull(); c = c.nextSibling()) appendNode(c, 0);
     }
     return out;
+}
+
+// P2-6：读取 ODS 的 number-rows-repeated / number-columns-repeated。
+// 用 toLongLong 而不是 toInt：畸形值可能超出 int 范围（toInt 会失败并返回 0，
+// 于是「重复 10 亿次」被悄悄当成 1 次）。
+qint64 readRepeat(const QString &value)
+{
+    bool ok = false;
+    const qint64 n = value.trimmed().toLongLong(&ok);
+    if (!ok || n < 1) return 1;
+    return n;
 }
 
 QString esc(const QString &s)
@@ -151,23 +190,48 @@ void SheetDocument::reset()
     m_totalRows = 0;
     m_maxCols = 0;
     m_truncated = false;
+    m_parseProblem = false;
+    m_truncatedReason.clear();
     m_ok = false;
+}
+
+// 截断记账（保留第一次的原因）
+void SheetDocument::markTruncated(const QString &reason)
+{
+    m_truncated = true;
+    if (m_truncatedReason.isEmpty() && !reason.isEmpty()) m_truncatedReason = reason;
+}
+
+// P2-5：解析异常记账。与「表格过大被截断」分开，避免把损坏文件当成正常截断。
+void SheetDocument::markParseProblem(const QString &reason)
+{
+    m_parseProblem = true;
+    if (m_truncatedReason.isEmpty() && !reason.isEmpty()) m_truncatedReason = reason;
 }
 
 void SheetDocument::setCell(int sheetIndex, int row, int col, const QString &text)
 {
     if (sheetIndex < 0 || sheetIndex >= m_sheets.size()) return;
-    if (row < 0 || row >= kMaxRows || col < 0 || col >= kMaxCols) { m_truncated = true; return; }
+    if (row < 0 || row >= kMaxRows || col < 0 || col >= kMaxCols)
+    {
+        markTruncated(QStringLiteral("表格行列超出预览上限"));
+        return;
+    }
     Sheet &s = m_sheets[sheetIndex];
     auto &rowMap = s.cells[row];
     if (!rowMap.contains(col))
     {
-        if (s.cellCount >= kMaxCells) { m_truncated = true; return; }
+        if (s.cellCount >= kMaxCells) { markTruncated(QStringLiteral("单元格数量超过上限")); return; }
         ++s.cellCount;
     }
 
     QString t = text;
-    if (t.size() > kMaxCellLen) { t.truncate(kMaxCellLen); t += QStringLiteral("…"); m_truncated = true; }
+    if (t.size() > kMaxCellLen)
+    {
+        t.truncate(kMaxCellLen);
+        t += QStringLiteral("…");
+        markTruncated(QStringLiteral("单元格文本过长已截断"));
+    }
 
     Cell c;
     c.text = t;
@@ -196,7 +260,7 @@ void SheetDocument::applyMerge(int sheetIndex, int row, int col, int rowSpan, in
             auto &coveredRow = s.cells[r];
             if (!coveredRow.contains(c))
             {
-                if (s.cellCount >= kMaxCells) { m_truncated = true; return; }
+                if (s.cellCount >= kMaxCells) { markTruncated(QStringLiteral("合并单元格过多")); return; }
                 ++s.cellCount;
             }
             coveredRow[c].covered = true;
@@ -256,9 +320,23 @@ bool SheetDocument::parseXlsx(QString *error)
         const QByteArray ssXml = m_zip.entry(QStringLiteral("xl/sharedStrings.xml"));
         if (xmlWithinTagBudget(ssXml) && ss.setContent(ssXml))
         {
+            // P1-12/16：共享字符串表本身也要有上限。条目数或总字符数超限就停止追加
+            // 并记录截断原因，不能把「只读了一半」当成成功数据。
+            qint64 totalChars = 0;
+            bool ssCapped = false;
             for (QDomElement si = ss.documentElement().firstChildElement(QStringLiteral("si"));
                  !si.isNull(); si = si.nextSiblingElement(QStringLiteral("si")))
             {
+                if (sharedStrings.size() >= kMaxSharedStrings)
+                {
+                    ssCapped = true;
+                    break;
+                }
+                if (totalChars >= kMaxSharedStringChars)
+                {
+                    ssCapped = true;
+                    break;
+                }
                 QString text;
                 // <si><t>..</t></si> 或 <si><r><t>..</t></r>...</si>
                 for (QDomElement t = si.firstChildElement(); !t.isNull(); t = t.nextSiblingElement())
@@ -268,8 +346,11 @@ bool SheetDocument::parseXlsx(QString *error)
                     else if (t.tagName() == QLatin1String("r"))
                         text += firstTextOf(t, QStringLiteral("t"));
                 }
+                totalChars += text.size();
                 sharedStrings.append(text);
             }
+            if (ssCapped)
+                markTruncated(QStringLiteral("共享字符串表超过上限，后续文本未解析"));
         }
     }
 
@@ -309,7 +390,7 @@ bool SheetDocument::parseXlsx(QString *error)
             sheetList.append(qMakePair(name, target));
         }
     }
-    if (sheetListCapped) m_truncated = true;
+    if (sheetListCapped) markTruncated(QStringLiteral("工作表数量超过预览上限"));
     if (sheetList.isEmpty())
         return fail(QStringLiteral("工作簿里没有任何工作表。"));
 
@@ -338,7 +419,7 @@ bool SheetDocument::parseXlsx(QString *error)
                 if (!row.attribute(QStringLiteral("r")).isEmpty())
                     rowIdx = row.attribute(QStringLiteral("r")).toInt() - 1;
                 if (rowIdx < 0) rowIdx = 0;
-                if (rowIdx >= kMaxRows) { m_truncated = true; break; }
+                if (rowIdx >= kMaxRows) { markTruncated(QStringLiteral("行数超过预览上限")); break; }
                 int nextCol = 0;
 
                 for (QDomElement c = row.firstChildElement(QStringLiteral("c")); !c.isNull();
@@ -358,8 +439,19 @@ bool SheetDocument::parseXlsx(QString *error)
                     QString text;
                     if (type == QLatin1String("s"))
                     {
-                        const int n = c.firstChildElement(QStringLiteral("v")).text().toInt();
-                        if (n >= 0 && n < sharedStrings.size()) text = sharedStrings.at(n);
+                        // P2-5：共享字符串索引必须带 ok 校验。原先直接 toInt()，
+                        // 非法值（""/"abc"/"1e9"/负数）都会被当成 0，于是单元格显示
+                        // 共享表的第一条文本——把损坏数据伪装成正常内容。
+                        bool ok = false;
+                        const int n = c.firstChildElement(QStringLiteral("v")).text().trimmed().toInt(&ok);
+                        if (ok && n >= 0 && n < sharedStrings.size())
+                        {
+                            text = sharedStrings.at(n);
+                        }
+                        else
+                        {
+                            markParseProblem(QStringLiteral("共享字符串索引无效"));
+                        }
                     }
                     else if (type == QLatin1String("inlineStr"))
                     {
@@ -384,7 +476,7 @@ bool SheetDocument::parseXlsx(QString *error)
             for (QDomElement m = mc.firstChildElement(QStringLiteral("mergeCell")); !m.isNull();
                  m = m.nextSiblingElement(QStringLiteral("mergeCell")))
             {
-                if (++nMerges > 4096) { m_truncated = true; break; }
+                if (++nMerges > 4096) { markTruncated(QStringLiteral("合并单元格条目过多")); break; }
                 const QString ref = m.attribute(QStringLiteral("ref"));
                 const QStringList parts = ref.split(QLatin1Char(':'));
                 int c1 = 0, r1 = 0, c2 = 0, r2 = 0;
@@ -418,21 +510,26 @@ bool SheetDocument::parseOds(QString *error)
     if (!doc.setContent(odsXml))
         return fail(QStringLiteral("无法解析 ODS 的 content.xml。"));
 
+    // P1-13：递归遍历带深度 + 访问元素总量上限；office:spreadsheet 可能被包很多层。
+    int nVisited = 0;
     QDomElement spreadsheet;
-    std::function<void(const QDomElement &)> findSpreadsheet = [&](const QDomElement &el) {
+    std::function<void(const QDomElement &, int)> findSpreadsheet =
+        [&](const QDomElement &el, int nDepth) {
         if (!spreadsheet.isNull()) return;
+        if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+        if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
         if (el.tagName() == QLatin1String("office:spreadsheet")) { spreadsheet = el; return; }
         for (QDomElement c = el.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-            findSpreadsheet(c);
+            findSpreadsheet(c, nDepth + 1);
     };
-    findSpreadsheet(doc.documentElement());
+    findSpreadsheet(doc.documentElement(), 0);
     if (spreadsheet.isNull())
         return fail(QStringLiteral("ODS 里找不到 office:spreadsheet。"));
 
     for (QDomElement table = spreadsheet.firstChildElement(QStringLiteral("table:table"));
          !table.isNull(); table = table.nextSiblingElement(QStringLiteral("table:table")))
     {
-        if (m_sheets.size() >= kMaxSheets) { m_truncated = true; break; }
+        if (m_sheets.size() >= kMaxSheets) { markTruncated(QStringLiteral("工作表数量超过预览上限")); break; }
 
         Sheet sheet;
         sheet.name = table.attribute(QStringLiteral("table:name"));
@@ -442,7 +539,11 @@ bool SheetDocument::parseOds(QString *error)
 
         int rowIdx = 0;
         QVector<QDomElement> odsRows;
-        std::function<void(const QDomElement &)> collectRows = [&](const QDomElement &parent) {
+        // P1-13：行分组包装可以层层嵌套，分层递归 + 访问总量双上限
+        std::function<void(const QDomElement &, int)> collectRows =
+            [&](const QDomElement &parent, int nDepth) {
+            if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+            if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
             for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
             {
                 const QString tag = c.tagName();
@@ -451,14 +552,21 @@ bool SheetDocument::parseOds(QString *error)
                 else if (tag == QLatin1String("table:table-header-rows")
                          || tag == QLatin1String("table:table-rows")
                          || tag == QLatin1String("table:table-row-group"))
-                    collectRows(c);
+                    collectRows(c, nDepth + 1);
             }
         };
-        collectRows(table);
+        collectRows(table, 0);
         for (const QDomElement &row : odsRows)
         {
             if (rowIdx >= kMaxRows) break;
-            const int rowRepeat = qBound(1, row.attribute(QStringLiteral("table:number-rows-repeated")).toInt(), 40);
+            if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); break; }
+
+            // P2-6：repeat 的**原始值**用来推进逻辑坐标，只有真正写出的行/列才按
+            // kMaxRepeatPreview 截断。原实现把截断后的值同时当坐标用，一旦某行/列
+            // repeat 超过 40，后面所有单元格都会整体错位。
+            bool bRepeatOverflow = false;
+            const qint64 rowRepeat   = readRepeat(row.attribute(QStringLiteral("table:number-rows-repeated")));
+            const int    rowPreview  = int(qMin<qint64>(rowRepeat, kMaxRepeatPreview));
 
             int colIdx = 0;
             for (QDomElement cell = row.firstChildElement(); !cell.isNull();
@@ -469,8 +577,9 @@ bool SheetDocument::parseOds(QString *error)
                     && tag != QLatin1String("table:covered-table-cell"))
                     continue;
 
-                int colRepeat = qBound(1, cell.attribute(
-                    QStringLiteral("table:number-columns-repeated")).toInt(), 40);
+                const qint64 colRepeat =
+                    readRepeat(cell.attribute(QStringLiteral("table:number-columns-repeated")));
+                const int    colPreview = int(qMin<qint64>(colRepeat, kMaxRepeatPreview));
 
                 if (tag == QLatin1String("table:table-cell") && colIdx < kMaxCols)
                 {
@@ -478,15 +587,17 @@ bool SheetDocument::parseOds(QString *error)
                     if (!text.isEmpty())
                     {
                         // 重复列要把同一文本填到每一列，而不是只填首列再跳过索引。
-                        for (int repRow = 0; repRow < rowRepeat && rowIdx + repRow < kMaxRows; ++repRow)
-                            for (int repCol = 0; repCol < colRepeat && colIdx + repCol < kMaxCols; ++repCol)
+                        for (int repRow = 0; repRow < rowPreview && rowIdx + repRow < kMaxRows; ++repRow)
+                            for (int repCol = 0; repCol < colPreview && colIdx + repCol < kMaxCols; ++repCol)
                                 setCell(idx, rowIdx + repRow, colIdx + repCol, text);
                     }
                 }
-                colIdx += colRepeat;
-                if (colIdx >= kMaxCols) { m_truncated = true; break; }
+                colIdx = saturatingAdvance(colIdx, colRepeat, &bRepeatOverflow);
+                if (colIdx >= kMaxCols) { markTruncated(QStringLiteral("列数超过预览上限")); break; }
             }
-            rowIdx += rowRepeat;
+            rowIdx = saturatingAdvance(rowIdx, rowRepeat, &bRepeatOverflow);
+            if (bRepeatOverflow)
+                markTruncated(QStringLiteral("重复行列数溢出，已按预览上限处理"));
         }
     }
 
@@ -538,8 +649,19 @@ QString SheetDocument::render(double fontScale) const
             out << QStringLiteral("</tr>");
         }
         out << QStringLiteral("</table>");
+        // P1-12/13、P2-5/6：把「为什么只显示一部分 / 哪些单元格留空」说清楚，不静默丢弃
         if (m_truncated)
-            out << QStringLiteral("<p><i>（表格过大，仅显示前一部分内容）</i></p>");
+        {
+            const QString why = m_truncatedReason.isEmpty()
+                    ? QStringLiteral("表格过大") : m_truncatedReason;
+            out << QStringLiteral("<p><i>（%1，仅显示前一部分内容）</i></p>").arg(esc(why));
+        }
+        else if (m_parseProblem)
+        {
+            const QString why = m_truncatedReason.isEmpty()
+                    ? QStringLiteral("表格数据有异常") : m_truncatedReason;
+            out << QStringLiteral("<p><i>（%1，相关单元格已留空）</i></p>").arg(esc(why));
+        }
     }
     return out.join(QString());
 }

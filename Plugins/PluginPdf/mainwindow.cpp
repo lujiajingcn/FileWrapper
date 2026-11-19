@@ -3,6 +3,9 @@
 #include <QDebug>
 #include <QImage>
 #include <QPixmap>
+#include <QPainter>
+#include <QColor>
+#include <QFont>
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
@@ -21,6 +24,12 @@ MainWindow::MainWindow(QWidget *parent) :
     m_lePageNum->setMaxLength(11);
     ui->mainToolBar->insertWidget(ui->actionLastPage,(QWidget *)m_lePageNum);
     connect(m_lePageNum, &QLineEdit::returnPressed, this, &MainWindow::gotoPage);
+
+    // P2-10：初始就是"空文档"状态：翻页按钮不可用、页码显示"空文档"而不是 1/0，
+    // 内容区也不再显示 .ui 里的占位文字 "TextLabel"。
+    m_lbContent->setText(tr("空文档"));
+    updatePageActions();
+    setLineEditPageNum();
 }
 
 MainWindow::~MainWindow()
@@ -37,8 +46,11 @@ void MainWindow::clearContent()
     m_pdfBuf.setData(QByteArray());
     m_nPageCount = 0;
     m_nCurPage = 0;
-    if (m_lbContent) m_lbContent->clear();
-    if (m_lePageNum) m_lePageNum->clear();
+    // P2-10：0 页时给出明确的"空文档"文案，并禁用翻页动作；
+    // 页码框同样显示"空文档"，避免出现 "1/0" 这种无意义的页码。
+    if (m_lbContent) m_lbContent->setText(tr("空文档"));
+    updatePageActions();
+    setLineEditPageNum();
 }
 
 void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
@@ -92,24 +104,26 @@ bool MainWindow::showPdfFile(const QString &sPath)
 
 void MainWindow::on_actionFirstPage_triggered()
 {
+    if (m_nPageCount <= 0)
+        return;
+    // P2-10：导航入口一律把页码夹在 [0, pageCount-1]
     m_nCurPage = 0;
     gotoPage();
 }
 
 void MainWindow::on_actionPrePage_triggered()
 {
-    if(m_nCurPage > 0)
-    {
-        m_nCurPage--;
-        gotoPage();
-    }
+    if(m_nPageCount <= 0)
+        return;
+    m_nCurPage = qBound(0, m_nCurPage - 1, m_nPageCount - 1);
+    gotoPage();
 }
 
 void MainWindow::on_actionNextPage_triggered()
 {
-    if(m_nPageCount <= 0 || m_nCurPage >= m_nPageCount - 1)
+    if(m_nPageCount <= 0)
         return;
-    m_nCurPage++;
+    m_nCurPage = qBound(0, m_nCurPage + 1, m_nPageCount - 1);
     gotoPage();
 }
 
@@ -148,34 +162,96 @@ void MainWindow::on_actionZoomOut_triggered()
 void MainWindow::gotoPage()
 {
     getLineEditPageNum();
+    // P2-10：页码在统一出口夹紧，任何导航路径（按钮 / 页码输入框 / 刷新）都不会越界
+    clampPageIndex();
+    updatePageActions();
     setLineEditPageNum();
     updatePage();
 }
 
+void MainWindow::clampPageIndex()
+{
+    if (m_nPageCount > 0)
+        m_nCurPage = qBound(0, m_nCurPage, m_nPageCount - 1);
+    else
+        m_nCurPage = 0;
+}
+
+void MainWindow::updatePageActions()
+{
+    // P2-10：0 页（空文档/加载失败）时四个翻页动作全部禁用
+    const bool bHasDoc = (m_nPageCount > 0);
+    ui->actionFirstPage->setEnabled(bHasDoc);
+    ui->actionPrePage->setEnabled(bHasDoc);
+    ui->actionNextPage->setEnabled(bHasDoc);
+    ui->actionLastPage->setEnabled(bHasDoc);
+    if (m_lePageNum)
+        m_lePageNum->setEnabled(bHasDoc);
+}
+
+QPixmap MainWindow::makeErrorPlaceholder(const QSize &size, const QString &msg) const
+{
+    // 目标尺寸过小/无效时退回 A4@72dpi，保证提示文字可读
+    QSize sz = size;
+    if (sz.width() < 240 || sz.height() < 240)
+        sz = QSize(595, 842);
+    QPixmap pm(sz);
+    pm.fill(QColor(255, 255, 255));
+    QPainter painter(&pm);
+    painter.setPen(QColor(176, 32, 32));
+    QFont font = painter.font();
+    font.setPointSizeF(qMax(10.0, qMin(sz.width(), sz.height()) / 30.0));
+    painter.setFont(font);
+    painter.drawText(pm.rect().adjusted(16, 16, -16, -16),
+                     Qt::AlignCenter | Qt::TextWordWrap, msg);
+    painter.end();
+    return pm;
+}
+
 void MainWindow::updatePage()
 {
-    if (m_nPageCount <= 0 || m_nCurPage < 0 || m_nCurPage >= m_nPageCount)
+    // P2-10：空文档由 clearContent() 显示"空文档"占位，这里不再渲染
+    if (m_nPageCount <= 0)
         return;
+
+    // 页码越界时先夹紧并同步页码框，保证"显示的页码"和"渲染的页"一致
+    if (m_nCurPage < 0 || m_nCurPage >= m_nPageCount)
+    {
+        clampPageIndex();
+        setLineEditPageNum();
+    }
 
     // pagePointSize() 返回页面尺寸（单位 point，1/72 inch）。沿用原 QtPdfium
     // 的 72dpi 基准：100% 缩放时 A4 约为 595x842 像素，保持视觉尺寸不变。
     // 直接按目标分辨率调用 render()，比先渲染再缩放更清晰。
     const QSizeF pt = m_doc.pagePointSize(m_nCurPage);
-    if (pt.isEmpty())
-        return;
+    QSize target;
+    if (!pt.isEmpty())
+    {
+        const qreal factor = qreal(m_nScale) / 100.0;
+        target = QSize(qMax(1, qRound(pt.width()  * factor)),
+                       qMax(1, qRound(pt.height() * factor)));
+        // 433 字节的 PDF 也能声明 12000x12000pt；无上限会一次分配 ~1.1GB。
+        constexpr int kMaxPdfRenderDim = 4096;
+        if (target.width() > kMaxPdfRenderDim || target.height() > kMaxPdfRenderDim)
+            target.scale(kMaxPdfRenderDim, kMaxPdfRenderDim, Qt::KeepAspectRatio);
+        const QImage pdfImage = m_doc.render(m_nCurPage, target);
+        if (!pdfImage.isNull())
+        {
+            m_lbContent->setPixmap(QPixmap::fromImage(pdfImage));
+            return;
+        }
+        qWarning() << "[PluginPdf] 第" << (m_nCurPage + 1) << "页渲染失败（返回空图）";
+    }
+    else
+    {
+        qWarning() << "[PluginPdf] 第" << (m_nCurPage + 1) << "页尺寸无效，无法渲染";
+    }
 
-    const qreal factor = qreal(m_nScale) / 100.0;
-    QSize target(qMax(1, qRound(pt.width()  * factor)),
-                 qMax(1, qRound(pt.height() * factor)));
-    // 433 字节的 PDF 也能声明 12000x12000pt；无上限会一次分配 ~1.1GB。
-    constexpr int kMaxPdfRenderDim = 4096;
-    if (target.width() > kMaxPdfRenderDim || target.height() > kMaxPdfRenderDim)
-        target.scale(kMaxPdfRenderDim, kMaxPdfRenderDim, Qt::KeepAspectRatio);
-    const QImage pdfImage = m_doc.render(m_nCurPage, target);
-    if (pdfImage.isNull())
-        return;
-
-    m_lbContent->setPixmap(QPixmap::fromImage(pdfImage));
+    // P2-10：渲染失败/尺寸无效时，用"当前页"的错误占位图替换画面，
+    // 而不是继续显示上一页的 pixmap（否则页码和画面会对不上）。
+    m_lbContent->setPixmap(makeErrorPlaceholder(
+        target, tr("第 %1 页渲染失败\n\n文档可能已损坏，或该页内容不受支持。").arg(m_nCurPage + 1)));
 }
 
 void MainWindow::getLineEditPageNum()
@@ -203,6 +279,14 @@ void MainWindow::getLineEditPageNum()
 
 void MainWindow::setLineEditPageNum()
 {
+    if (!m_lePageNum)
+        return;
+    // P2-10：0 页时显示"空文档"，不再出现 "1/0"
+    if (m_nPageCount <= 0)
+    {
+        m_lePageNum->setText(tr("空文档"));
+        return;
+    }
     QString sLePageNum = QString("%1/%2").arg(QString::number(m_nCurPage + 1)).arg(QString::number(m_nPageCount));
     m_lePageNum->setText(sLePageNum);
 }

@@ -33,8 +33,10 @@
 //   4  新增 sendFileMapped(char*, qint64, name)：归档内容区只读内存映射，
 //      媒体插件播放期间直接引用、零拷贝（见 PluginInterface::sendFileMapped）
 //   5  新增 stopPlaybackAndWait()：停止后台线程并确认可安全 unmap（M-04）
+//   6  新增 lastError()：打开失败时插件回报**真实原因**（例如"没有可用的音频
+//      输出设备"），取代宿主统一显示的"插件无法显示该文件"（见 lastError）
 // ============================================================================
-#define PLUGIN_API_VERSION 5
+#define PLUGIN_API_VERSION 6
 
 // ==================== 文件数据载体（C2） ====================
 //
@@ -192,6 +194,19 @@ public:
 
     // 主程序在送数据前告知文件名，插件可据此做标题回退（P2-7）
     virtual void setSourceName(const QString &name) { Q_UNUSED(name); }
+
+    // —— v6：失败原因回报 ——
+    // sendFile() / sendFileByPath() / sendFileMapped() 返回 false 之后，宿主用
+    // 它把**真实原因**呈现给用户。以前宿主只能显示「插件无法显示该文件：xxx」，
+    // 于是"没有音频输出设备""解码器不支持该编码"和"文件损坏"在界面上完全一样。
+    //
+    // 约定：
+    //   * 返回空串 = 插件没提供原因，宿主退回通用提示（旧插件行为不变）；
+    //   * 返回非空 = 插件**已经自行复位了自己的界面**并在界面上说明了原因，
+    //     宿主不要再调 sendFileData(nullptr, 0) 清屏（会把说明一起抹掉）；
+    //   * 每次新的打开尝试开始时插件必须清空上一次的失败原因；
+    //   * 一句话、不带换行，供状态栏/对话框直接拼接。
+    virtual QString lastError() const { return QString(); }
 };
 
 #define PluginTemplate_main_iid "FileWrapper.main"

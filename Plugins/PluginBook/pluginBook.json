@@ -3,7 +3,7 @@
     "Version":"0.1.0",
     "Author" : "lujiajing",
     "Date":"2026-08-21",
-    "apiVersion":5,
+    "apiVersion":6,
     "extensions":[
         "epub", "fb2", "mobi", "azw", "azw3", "prc"
     ],

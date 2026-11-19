@@ -58,25 +58,18 @@ DESTDIR = $$PLUGIN_OUT_DIR
     PLUGIN_SIDECAR_DST = $$shell_path($$PLUGIN_OUT_DIR/$${TARGET}.json)
     PLUGIN_SIDECAR_SRC = $$shell_path($$PLUGIN_METADATA_JSON)
     QMAKE_POST_LINK = $$QMAKE_COPY \"$$PLUGIN_SIDECAR_SRC\" \"$$PLUGIN_SIDECAR_DST\"
+}
 
-    # ---- 让元数据 JSON 成为真正的构建输入 ----
-    # Q_PLUGIN_METADATA(IID ... FILE ...) 的内容是 **moc 在生成 moc_xxx.cpp 时读取并内嵌** 的，
-    # 但 qmake 只把 .h 当 moc 的依赖，不会把 JSON 加进去 —— 结果就是「只改 JSON」时
-    # make 认为无事可做，DLL 里仍然是旧元数据（sidecar 也不会刷新），排查起来非常费解。
-    # 这里加一个戳文件：JSON 比戳新时，先把插件类头文件的 mtime 更新（触发 moc 重跑），
-    # 再更新戳文件。PRE_TARGETDEPS 保证它在链接目标之前先执行。
-    !isEmpty(PLUGIN_CLASS_HEADER) {
-        PLUGIN_META_STAMP = $$OUT_PWD/$${TARGET}.meta.stamp
-        PLUGIN_HDR = $$shell_path($$PLUGIN_CLASS_HEADER)
-        PLUGIN_STAMP = $$shell_path($$PLUGIN_META_STAMP)
-
-        # 更新头文件 mtime 用 cmd 的 "copy /b 文件+,, 文件"（就是"触碰"，不改内容），
-        # 再写戳文件。不要在这条 recipe 里用 PowerShell 管道：recipes 走 cmd，
-        # 反引号/`^|` 转义在双引号参数里会被原样传给 PowerShell 而报错。
-        meta_stamp.target   = $$PLUGIN_META_STAMP
-        meta_stamp.depends  = $$PLUGIN_METADATA_JSON
-        meta_stamp.commands = $$QMAKE_COPY /b \"$$PLUGIN_HDR\"+,, \"$$PLUGIN_HDR\" >nul 2>&1$$escape_expand(\\n\\t) echo.> \"$$PLUGIN_STAMP\"
-        QMAKE_EXTRA_TARGETS += meta_stamp
-        PRE_TARGETDEPS      += $$PLUGIN_META_STAMP
-    }
+# ---- 内嵌元数据的构建约定（P2-17：只写构建目录，不修改源码树）----
+#
+# 以前为了「只改 JSON 也触发重编」会去 touch 源码头文件（copy /b hdr+,, hdr）：
+#   * 源码树必须可写 —— 只读源码构建、受限权限环境直接构建失败；
+#   * 依赖 Windows cmd 的小技巧，跨平台无意义；
+#   * 构建过程改源码时间戳，干扰增量构建与版本管理。
+#
+# 现在构建过程完全不碰源码树：JSON 只作为构建输入登记（DISTFILES），
+# 修改插件 JSON 后重新运行一次 qmake 即可让 moc 重新内嵌元数据
+# （QtCreator 里「执行 qmake / 重新构建」等价）。内嵌元数据的权威性不变。
+!isEmpty(PLUGIN_METADATA_JSON) {
+    DISTFILES += $$PLUGIN_METADATA_JSON
 }

@@ -33,6 +33,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Qt translations live next to bin (<qt>/mingw_64/bin -> <qt>/mingw_64/translations).
+# NOTE: keep this file pure ASCII. Windows PowerShell 5.1 reads a BOM-less script
+# using the ANSI code page; a multi-byte UTF-8 sequence can then swallow the
+# following newline and turn the next statement into a comment (this exact bug
+# made $QtTranslations undefined and the deploy step fail with "Path is null").
+$QtTranslations = Join-Path (Split-Path -Parent $QtBin) 'translations'
+
 function Fail([string]$msg) {
     Write-Host "[deploy][ERROR] $msg"
     exit 1
@@ -69,10 +76,11 @@ foreach ($raw in (Get-Content -LiteralPath $Manifest -Encoding UTF8)) {
 
     $srcPath = $null
     switch ($kind) {
-        'qt-bin'  { $srcPath = Join-Path $QtBin     $src }
-        'qt-plug' { $srcPath = Join-Path $QtPlugins $src }
-        'ffmpeg'  { $srcPath = Join-Path $FfmpegBin $src }
-        'repo'    { $srcPath = Join-Path $RepoRoot  $src }
+        'qt-bin'   { $srcPath = Join-Path $QtBin          $src }
+        'qt-plug'  { $srcPath = Join-Path $QtPlugins      $src }
+        'qt-trans' { $srcPath = Join-Path $QtTranslations $src }
+        'ffmpeg'   { $srcPath = Join-Path $FfmpegBin      $src }
+        'repo'     { $srcPath = Join-Path $RepoRoot       $src }
         default   {
             Fail "unknown source kind '$kind': $line"
         }

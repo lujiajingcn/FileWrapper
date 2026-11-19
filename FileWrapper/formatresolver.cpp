@@ -28,10 +28,13 @@ bool hasPrefix(const QByteArray &d, const char *bytes, int n)
     return d.size() >= n && std::memcmp(d.constData(), bytes, size_t(n)) == 0;
 }
 
-// 在文件头里找 ASCII 标志（忽略大小写）
+// 在文件头里找 ASCII 标志（忽略大小写）。
+// 旧实现的注释写着「忽略大小写」，实际是区分大小写的 indexOf：ZIP 中央目录里
+// 部件名的大小写并不总与规范一致（尤其第三方生成的 docx），会误判成未知 ZIP。
 bool containsAscii(const QByteArray &d, const char *needle)
 {
-    return d.indexOf(QByteArray(needle)) >= 0;
+    const QByteArray hay = d.toLower();
+    return hay.indexOf(QByteArray(needle).toLower()) >= 0;
 }
 
 QString extOf(const QString &fileName)
@@ -285,8 +288,34 @@ Detection byContent(const QByteArray &head)
         return make(QStringLiteral("mkv"), QStringLiteral("Matroska/WebM 视频"), QStringLiteral("mkv"),
                     QString(), QStringLiteral("文件头 EBML"), true);
     if (head.size() >= 12 && head.mid(4, 4) == "ftyp")
+    {
+        // P2-1：ftyp 不是「MP4 专用」。先看 major brand，再看兼容 brand 列表，
+        // 避免把 HEIC/AVIF 照片误判成 MP4 视频（交给错误的插件打开）。
+        const QByteArray major = head.mid(8, 4).toLower();
+        QByteArray brands = major;
+        for (int off = 16; off + 4 <= head.size() && off < 16 + 4 * 16; off += 4)
+            brands += ' ' + head.mid(off, 4).toLower();
+
+        if (brands.contains("heic") || brands.contains("heix") || brands.contains("heim")
+            || brands.contains("heis") || brands.contains("hevc") || brands.contains("hevx"))
+            return make(QStringLiteral("heic"), QStringLiteral("HEIF/HEIC 照片"), QString(),
+                        QStringLiteral("可用系统「照片」应用打开并另存为 JPEG。"),
+                        QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
+        if (brands.contains("avif") || brands.contains("avis"))
+            return make(QStringLiteral("avif"), QStringLiteral("AVIF 图像"), QString(),
+                        QStringLiteral("请转换为 PNG/JPEG 后查看。"),
+                        QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
+        if (brands.contains("qt  "))
+            return make(QStringLiteral("mov"), QStringLiteral("QuickTime 视频"), QStringLiteral("mov"),
+                        QString(), QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
+        if (brands.contains("3gp") || brands.contains("3g2"))
+            return make(QStringLiteral("mp4"), QStringLiteral("3GP 视频"), QStringLiteral("mp4"),
+                        QString(), QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
+
+        // 其余常见 ISO BMFF 视频品牌（isom/mp41/mp42/avc1/M4V/…）按 MP4 处理
         return make(QStringLiteral("mp4"), QStringLiteral("MP4/MOV 视频"), QStringLiteral("mp4"),
-                    QString(), QStringLiteral("文件头 ftyp"), true);
+                    QString(), QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
+    }
 
     // 压缩包
     if (hasPrefix(head, "7z\xBC\xAF\x27\x1C", 6))

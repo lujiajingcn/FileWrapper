@@ -154,30 +154,41 @@ private:
     QString nextListPrefix(int numId, int ilvl);
 
     // ---- HTML 生成 ----
-    void emitBlocks(const QDomElement &parent, QStringList &out, double scale, int depth);
-    void emitParagraph(const QDomElement &p, QStringList &out, double scale);
+    // P1-13：递归遍历统一带 nDepth（默认 0），超过 kMaxXmlDepth 或访问元素总量超预算
+    // 就停止并记录 truncatedReason，避免畸形文档用超深/超大的结构打爆调用栈与 CPU。
+    void emitBlocks(const QDomElement &parent, QStringList &out, double scale, int nDepth = 0);
+    void emitParagraph(const QDomElement &p, QStringList &out, double scale, int nDepth = 0);
     void emitRuns(const QDomElement &parent, QStringList &out, const RunProps &base,
-                  double scale, const QString &linkTarget);
+                  double scale, const QString &linkTarget, int nDepth = 0);
     void emitRun(const QDomElement &r, QStringList &out, const RunProps &base,
                  double scale, const QString &linkTarget);
-    void emitTable(const QDomElement &tbl, QStringList &out, double scale, int depth);
+    void emitTable(const QDomElement &tbl, QStringList &out, double scale, int nDepth = 0);
     void emitAlternateContent(const QDomElement &ac, QStringList &out, const RunProps &base,
-                              double scale, const QString &linkTarget);
+                              double scale, const QString &linkTarget, int nDepth = 0);
     QString imageTag(const QDomElement &container, double scale);
+
+    // ---- 资源 / 健壮性预算 ----
+    // P1-13 结构深度、P1-14 图片解码前预检、P1-16 HTML 输出体量：三个统一入口
+    void markTruncated(const QString &reason);
+    bool visitGuard(int nDepth);
+    void accountHtml(qint64 chars);
+    // P1-14：被预算拒掉的图片只是不显示，不影响后续正文；单独记账并在末尾提示
+    void noteSkippedImage(const QString &reason);
 
     // ---- ODT（OpenDocument Text）：与 docx 共用 ZipReader 与图片资源机制 ----
     // ODT 与 docx 都是 ZIP+XML，但元素/属性命名完全不同（text:p / style:text-properties…
     // / fo:font-size），这里用独立的轻量 emitter 映射到同一套 HTML 子集：
     // 段落/标题/字符格式/列表/表格/内嵌图片/超链接。缩放仍走 render(fontScale)。
     bool loadOdt(const QByteArray &data, QString *error);
-    void emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int depth);
+    void emitOdtBody(const QDomElement &parent, QStringList &out, double scale, int nDepth = 0);
     void emitOdtParagraph(const QDomElement &e, QStringList &out, double scale,
                           bool heading, int headingLevel, int listDepth,
-                          const QString &bulletPrefix);
+                          const QString &bulletPrefix, int nDepth = 0);
     void emitOdtInline(const QDomElement &parent, QStringList &out, const OdtRun &base,
-                       double scale, const QString &link);
-    void emitOdtList(const QDomElement &list, QStringList &out, double scale, int depth);
-    void emitOdtTable(const QDomElement &table, QStringList &out, double scale, int depth);
+                       double scale, const QString &link, int nDepth = 0);
+    void emitOdtList(const QDomElement &list, QStringList &out, double scale,
+                     int nDepth = 0, int nListDepth = 0);
+    void emitOdtTable(const QDomElement &table, QStringList &out, double scale, int nDepth = 0);
     QString odtImageTag(const QDomElement &frame, double scale);
     OdtRun  odtRunProps(const QString &styleName) const;
     OdtPar  odtParProps(const QString &styleName) const;
@@ -225,6 +236,13 @@ private:
     QSet<QString>          m_failedImages;   // 已拒绝/解码失败的 zip 路径，避免重复解码
     int                    m_nInlineDepth = 0;
     qint64                 m_nDecodedImageBytes = 0;   // P-14：本文档累计解码图片字节预算
+    // P1-13 / P1-14 / P1-16：首次触发截断的中文原因、已访问元素数、已生成 HTML 字符数
+    QString m_truncatedReason;
+    int     m_nVisitedNodes = 0;
+    qint64  m_nHtmlChars    = 0;
+    // P1-14：被预算拒掉（未显示）的图片张数与首个原因（不中断正文渲染）
+    int     m_nSkippedImages = 0;
+    QString m_skippedImageReason;
     bool   m_ok = false;
 };
 

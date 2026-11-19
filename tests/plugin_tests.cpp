@@ -76,6 +76,7 @@
 #include <functional>
 
 #include "dlgpluginmap.h"
+#include "dlgfileproperty.h"
 #include "filemanager.h"
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
@@ -85,6 +86,7 @@
 #include "plugininterface.h"
 #include "pluginmanager.h"
 #include "plugindiag.h"
+#include "zipreader.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -105,6 +107,22 @@ static void report(bool ok, const QString &msg)
 }
 
 static void note(const QString &msg) { out(QStringLiteral("[INFO] ") + msg); }
+
+// 受限环境（任务沙箱/AppContainer）下 QTemporaryDir 会把新目录的 ACL 收成
+// owner-only，宿主进程本身反而写不进去。优先使用运行器预创建、可写的
+// FW_TEST_SCRATCH_DIR；没有该环境变量时退回系统临时目录。
+static QString makeWritableTestDir(const QString &prefix)
+{
+    QString base = qEnvironmentVariable("FW_TEST_SCRATCH_DIR");
+    if (base.isEmpty())
+        base = QDir::tempPath();
+    const QString dir = base + QLatin1Char('/') + prefix + QLatin1Char('-')
+                        + QString::number(QCoreApplication::applicationPid())
+                        + QLatin1Char('-')
+                        + QString::number(QDateTime::currentMSecsSinceEpoch());
+    QDir().mkpath(dir);
+    return dir;
+}
 
 static QByteArray readFile(const QString &path)
 {
@@ -242,6 +260,9 @@ class ProbeTreeWindow : public MainWindow
 public:
     ProbeTreeWindow() : MainWindow(nullptr) {}
     using MainWindow::loadArchiveFile;
+    using MainWindow::buildFileListContextMenu;
+    using MainWindow::filePropertyData;
+    using MainWindow::folderPropertyData;
 };
 
 static void checkExtensionMapping()
@@ -550,11 +571,9 @@ static QString brokenProbePluginPath()
 static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
 {
     // ---- D1/D2: 清单解析、缺失项、无清单时的降级 ----
-    QTemporaryDir tmp;
-    report(tmp.isValid(), QStringLiteral("D1: temp app dir"));
-    if (!tmp.isValid()) return;
-
-    const QString appDir = tmp.path();
+    const QString appDir = makeWritableTestDir(QStringLiteral("diag_app"));
+    report(QDir(appDir).exists(), QStringLiteral("D1: temp app dir"));
+    if (!QDir(appDir).exists()) return;
     {
         QFile existing(appDir + QStringLiteral("/PresentDep.dll"));
         existing.open(QIODevice::WriteOnly);
@@ -577,9 +596,9 @@ static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
                .arg(missing.isEmpty() ? QStringLiteral("-") : missing[0].path));
 
     // 没有清单时要能明确报错，而不是静默当成"没问题"
-    QTemporaryDir tmpNoManifest;
+    const QString noManifestDir = makeWritableTestDir(QStringLiteral("diag_nomanifest"));
     QString sNoManifestErr;
-    PluginDiagnostics::missingFiles(tmpNoManifest.path(), &sNoManifestErr);
+    PluginDiagnostics::missingFiles(noManifestDir, &sNoManifestErr);
     report(!sNoManifestErr.isEmpty(), QStringLiteral("D3: no manifest -> explicit error"));
 
     // ---- D4: 失败报告文本（插件名 + 原始错误 + 缺失项 + 用途）----
@@ -629,6 +648,17 @@ static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
     QProcess d6Child;
     d6Child.start(QCoreApplication::applicationFilePath(),
                   QStringList{QStringLiteral("--d6-child")});
+    const bool bChildStarted = d6Child.waitForStarted(10000);
+    if (!bChildStarted)
+    {
+        // 受限沙箱不允许子进程通过管道启动：这不是产品缺陷，按环境跳过。
+        ++g_skipped;
+        note(QStringLiteral("[SKIP] D6: cannot start child process in this environment (")
+             + d6Child.errorString() + QLatin1Char(')'));
+        QFile::remove(sPath.left(sPath.size() - 4) + QStringLiteral(".json"));
+    }
+    else
+    {
     bool bChildFinished = d6Child.waitForFinished(60000);
     if (!bChildFinished)
     {
@@ -647,6 +677,7 @@ static void verifyDeploymentDiagnostics(const QString &appPluginsDir)
     if (!bD6)
         note(QStringLiteral("D6 child stderr: ")
              + QString::fromLocal8Bit(d6Child.readAllStandardError()).left(400));
+    }
 
     // ---- D7: 文件损坏时重试不会假装成功 ----
     // 注意必须换一个"本进程从未加载过"的文件名：同一个路径在 D6 已被成功加载，
@@ -873,9 +904,9 @@ static void verifyFileChannel(PluginInterface *wordTemplate, const QString &work
            QStringLiteral("Y1: PluginFile memory source"));
 
     // Y2: PluginFile 路径形态
-    QTemporaryDir tmp;
-    report(tmp.isValid(), QStringLiteral("Y2a: temp dir for path source"));
-    const QString sPayloadFile = tmp.path() + QStringLiteral("/payload.bin");
+    const QString yDir = makeWritableTestDir(QStringLiteral("filechannel"));
+    report(QDir(yDir).exists(), QStringLiteral("Y2a: temp dir for path source"));
+    const QString sPayloadFile = yDir + QStringLiteral("/payload.bin");
     {
         QFile f(sPayloadFile);
         f.open(QIODevice::WriteOnly);
@@ -1260,18 +1291,51 @@ static void verifyOtherViewers(const QString &work)
             auto *pStop = pWin ? pWin->findChild<QPushButton *>(QStringLiteral("stopBtn")) : nullptr;
             auto *pTime = pWin ? pWin->findChild<QLabel *>(QStringLiteral("timeLabel")) : nullptr;
             auto *pSlider = pWin ? pWin->findChild<QSlider *>(QStringLiteral("progressSlider")) : nullptr;
-            for (int i = 0; i < 5; ++i) QApplication::processEvents();
-            bPlayingIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
+            auto *pVideo = pWin ? pWin->findChild<QLabel *>(QStringLiteral("videoLabel")) : nullptr;
 
-            if (pStop) pStop->click();
-            QApplication::processEvents();
-            bStopIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+            // P1-20：纯音频在音频设备不可用时必须“明确失败 + 复位界面”，
+            // 而不是显示成正在播放。无声卡的 CI/远程环境走这条分支。
+            if (!bOpen)
+            {
+                QApplication::processEvents();
+                const bool bRejectedCleanly = pTime != nullptr
+                        && pTime->text() == QStringLiteral("0:00 / 0:00")
+                        && pSlider != nullptr && !pSlider->isEnabled()
+                        && pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+                note(QStringLiteral("[INFO] V13: no audio device; audio-only open correctly rejected"));
+                report(bRejectedCleanly,
+                       QStringLiteral("V13: audio-only open without device fails cleanly"));
 
-            if (pPlay) pPlay->click();   // 从起点重播
-            for (int i = 0; i < 5; ++i) QApplication::processEvents();
-            bReplayIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
+                // v6：失败必须带上**真实原因**，并且原因要留在画面区。
+                // 以前界面一律显示「插件无法显示该文件」——把"这台机器没声卡"
+                // 说成"文件打不开"，用户照着这个提示永远修不好。
+                const QString sWhy = p->lastError();
+                const QString sVideoText = pVideo ? pVideo->text() : QString();
+                report(!sWhy.isEmpty(),
+                       QStringLiteral("V13b: failure reports the real reason ('%1')")
+                           .arg(sWhy.left(40)));
+                report(sVideoText.contains(QStringLiteral("音频")),
+                       QStringLiteral("V13c: reason stays visible in the video area (not just the status bar)"));
+            }
+            else
+            {
+                for (int i = 0; i < 5; ++i) QApplication::processEvents();
+                bPlayingIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
 
-            // 坏数据：showFile 应返回 false 并把进度/时间/按钮复位
+                if (pStop) pStop->click();
+                QApplication::processEvents();
+                bStopIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+
+                if (pPlay) pPlay->click();   // 从起点重播
+                for (int i = 0; i < 5; ++i) QApplication::processEvents();
+                bReplayIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
+
+                report(bPlayingIcon && bStopIcon && bReplayIcon,
+                       QStringLiteral("V13: media stop/replay button"));
+            }
+
+            // 坏数据：showFile 应返回 false、把进度/时间/按钮复位，并回报真实原因。
+            // 这条与机器上有没有声卡无关，任何环境都必须成立。
             const QByteArray junk("this is not a media file", 24);
             const bool bRejected = !p->sendFile(PluginFile::fromMemory(junk, QStringLiteral("bad.mp4")));
             QApplication::processEvents();
@@ -1279,10 +1343,16 @@ static void verifyOtherViewers(const QString &work)
                         && pTime->text() == QStringLiteral("0:00 / 0:00")
                         && pSlider != nullptr && !pSlider->isEnabled()
                         && pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+            report(bBadReset, QStringLiteral("V13d: bad media file resets the player UI"));
+
+            const QString sBadWhy = p->lastError();
+            const QString sBadPage = pVideo ? pVideo->text() : QString();
+            report(!sBadWhy.isEmpty(),
+                   QStringLiteral("V13e: bad media file reports why ('%1')").arg(sBadWhy.left(40)));
+            report(sBadPage.contains(QStringLiteral("无法")),
+                   QStringLiteral("V13f: bad media file shows the reason in the video area"));
         }
         delete p;
-        report(bOpen && bPlayingIcon && bStopIcon && bReplayIcon && bBadReset,
-               QStringLiteral("V13: media stop/replay button and failure reset"));
     }
 
     // V14: RTF \uN 后紧跟 \'hh 回退时不得把回退字节写进正文（P-07 回归）
@@ -1981,6 +2051,232 @@ static void verifyMergeDialog()
     report(bOutputDialog,
            QStringLiteral("H15: output dialog clears stale dir on old-path and returns selected dir"));
 
+    // H16: 输出路径实时解析——填相对路径 "a" 后，提示条必须给出真正会写到的绝对路径
+    {
+        auto *pEdit = dlg.findChild<QLineEdit *>(QStringLiteral("leMergedFilePath"));
+        auto *pHint = dlg.findChild<QLabel *>(QStringLiteral("labelResolvedPath"));
+        const QString sExpect = QDir::cleanPath(QFileInfo(QStringLiteral("a")).absoluteFilePath());
+        if (pEdit) pEdit->setText(QStringLiteral("a"));
+        const QString sHint = pHint ? pHint->text() : QString();
+        report(pEdit != nullptr && pHint != nullptr && sHint.contains(sExpect),
+               QStringLiteral("H16: relative output path resolved before merging (%1)")
+                   .arg(QString(sHint).replace(QLatin1Char('\n'), QStringLiteral(" | "))));
+    }
+
+    // H17: 没写扩展名的输出补 .fwda；已有扩展名（.fwda / 老的 .dat / "v1.2" 版本号）原样保留
+    {
+        const QString sNoExt  = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged"));
+        const QString sDotEnd = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged."));
+        const QString sFwda   = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged.fwda"));
+        const QString sDat    = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged.dat"));
+        const QString sVer    = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/v1.2"));
+        report(sNoExt == QStringLiteral("E:/tmp/merged.fwda")
+                   && sDotEnd == QStringLiteral("E:/tmp/merged.fwda")
+                   && sFwda == QStringLiteral("E:/tmp/merged.fwda")
+                   && sDat == QStringLiteral("E:/tmp/merged.dat")
+                   && sVer == QStringLiteral("E:/tmp/v1.2")
+                   && FwArc::hasArchiveSuffix(QStringLiteral("x.fwda"))
+                   && FwArc::hasArchiveSuffix(QStringLiteral("x.DAT"))
+                   && !FwArc::hasArchiveSuffix(QStringLiteral("x.png")),
+               QStringLiteral("H17: missing output extension becomes .fwda (%1)").arg(sNoExt));
+    }
+
+    // H18: 加载/另存为/拆分共用的过滤器必须同时列出 *.fwda 与老的 *.dat，
+    //      否则「另存成 .fwda」之后老归档在对话框里就看不见了
+    {
+        const QString sFilter = FwArc::fileDialogFilter();
+        report(sFilter.contains(QStringLiteral("*.fwda"))
+                   && sFilter.contains(QStringLiteral("*.dat")),
+               QStringLiteral("H18: archive filter lists both *.fwda and *.dat (%1)").arg(sFilter));
+    }
+
+    // H19: 文件列表右键菜单——文件行 = 打开 / 打开新标签页 / 属性；目录行 = 属性；
+    //      同时校验「属性」数据源（名称/类型/位置/大小/CRC/归档格式）
+    bool bContextMenuOk = false;
+    bool bFileDataOk = false;
+    bool bFolderDataOk = false;
+    if (bMerged)
+    {
+        ProbeTreeWindow mwProp;
+        QMetaObject::invokeMethod(&mwProp, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mwProp.loadArchiveFile(sTreeArc);
+        auto *pPropView = mwProp.findChild<QTreeView *>();
+        auto *pPropModel = pPropView
+                               ? qobject_cast<QStandardItemModel *>(pPropView->model())
+                               : nullptr;
+        QStandardItem *pPropRoot = pPropModel ? pPropModel->item(0, 0) : nullptr;
+        QStandardItem *pPropFile = nullptr;
+        QStandardItem *pPropDir = nullptr;
+        if (pPropRoot)
+        {
+            for (int r = 0; r < pPropRoot->rowCount(); ++r)
+            {
+                QStandardItem *pChild = pPropRoot->child(r, 0);
+                if (pChild == nullptr) continue;
+                if (pChild->text().endsWith(QStringLiteral("top.txt"))) pPropFile = pChild;
+                if (pChild->text().endsWith(QStringLiteral("sub")))     pPropDir = pChild;
+            }
+        }
+
+        auto actionTexts = [](QMenu *pMenu) {
+            QStringList texts;
+            if (pMenu != nullptr)
+            {
+                for (QAction *pAction : pMenu->actions())
+                    if (!pAction->isSeparator())
+                        texts << pAction->text();
+            }
+            return texts;
+        };
+
+        QStringList fileActs;
+        QStringList dirActs;
+        if (pPropFile)
+        {
+            QMenu *pMenu = mwProp.buildFileListContextMenu(
+                pPropModel->indexFromItem(pPropFile));
+            fileActs = actionTexts(pMenu);
+            delete pMenu;
+        }
+        if (pPropDir)
+        {
+            QMenu *pMenu = mwProp.buildFileListContextMenu(
+                pPropModel->indexFromItem(pPropDir));
+            dirActs = actionTexts(pMenu);
+            delete pMenu;
+        }
+        bContextMenuOk = (fileActs == QStringList{ QStringLiteral("打开"),
+                                                   QStringLiteral("打开新标签页"),
+                                                   QStringLiteral("属性") })
+                         && (dirActs == QStringList{ QStringLiteral("属性") });
+
+        if (pPropFile)
+        {
+            const FILEINFO fi = pPropFile->data(FileListModel::InfoRole).value<FILEINFO>();
+            const DlgFileProperty::Data fd = mwProp.filePropertyData(fi);
+            bFileDataOk = fd.sName == QStringLiteral("top.txt")
+                          && fd.sType == QStringLiteral("TXT 文件")
+                          && fd.nSize == 1234
+                          && fd.sLocation == FwArc::normalizePath(sTreeDir)
+                          && fd.sEntryPath == FwArc::normalizePath(sTreeDir + QStringLiteral("/top.txt"))
+                          && fd.sArchivePath == FwArc::normalizePath(sTreeArc)
+                          && fd.nArchiveVersion == FwArc::VERSION_V2
+                          && fd.bHasCrc
+                          && !fd.bPending
+                          && !fd.bDir;
+        }
+        if (pPropDir && pPropRoot)
+        {
+            const DlgFileProperty::Data subData = mwProp.folderPropertyData(
+                pPropModel->indexFromItem(pPropDir));
+            const DlgFileProperty::Data rootData = mwProp.folderPropertyData(
+                pPropModel->indexFromItem(pPropRoot));
+            // writeBytes: sub/a.bin=50, sub/b.bin=999, top.txt=1234
+            bFolderDataOk = subData.bDir
+                            && subData.sName == QStringLiteral("sub")
+                            && subData.nSize == 1049
+                            && subData.nFileCount == 2
+                            && subData.nDirCount == 0
+                            && subData.sLocation == FwArc::normalizePath(sTreeDir)
+                            && subData.sEntryPath == FwArc::normalizePath(sTreeDir + QStringLiteral("/sub"))
+                            && !subData.bFiltered
+                            && rootData.bDir
+                            && rootData.nSize == 2283
+                            && rootData.nFileCount == 3
+                            && rootData.nDirCount == 1
+                            && rootData.sLocation.isEmpty();
+        }
+    }
+    report(bContextMenuOk,
+           QStringLiteral("H19a: file-list context menu offers 属性 for files and dirs"));
+    report(bFileDataOk,
+           QStringLiteral("H19b: file property data carries name/type/size/location/CRC"));
+    report(bFolderDataOk,
+           QStringLiteral("H19c: dir property data aggregates visible subtree size/counts"));
+
+    // H20: 属性文本——大小格式、CRC、待保存条目、v1 旧归档、文件夹汇总与筛选说明
+    bool bPropTextOk = false;
+    bool bPropStateOk = false;
+    bool bPropFolderOk = false;
+    {
+        DlgFileProperty::Data d;
+        d.sName = QStringLiteral("report.docx");
+        d.sType = DlgFileProperty::typeTextForFile(d.sName);
+        d.sLocation = QStringLiteral("E:/testfiles_copy");
+        d.nSize = 22907;
+        d.sArchivePath = QStringLiteral("E:/testfiles_copy/1.dat");
+        d.nArchiveVersion = FwArc::VERSION_V2;
+        d.sEntryPath = QStringLiteral("E:/testfiles_copy/report.docx");
+        d.bHasCrc = true;
+        d.nCrc = 0xDEADBEEFu;
+
+        const QString sText = DlgFileProperty::formatInfoText(d);
+        bPropTextOk = sText.contains(QStringLiteral("名称：report.docx"))
+                      && sText.contains(QStringLiteral("类型：DOCX 文件"))
+                      && sText.contains(QStringLiteral("位置：E:/testfiles_copy"))
+                      && sText.contains(QStringLiteral("大小：22.37 KB（22,907 字节）"))
+                      && sText.contains(QStringLiteral("压缩方式：不压缩（原样存储）"))
+                      && sText.contains(QStringLiteral("所属归档：E:/testfiles_copy/1.dat"))
+                      && sText.contains(QStringLiteral("归档格式：FWDA v2"))
+                      && sText.contains(QStringLiteral("归档内路径：E:/testfiles_copy/report.docx"))
+                      && sText.contains(QStringLiteral("内容校验：CRC32 0xDEADBEEF"))
+                      && sText.contains(QStringLiteral("状态：已保存在归档中"))
+                      && DlgFileProperty::formatSize(0) == QStringLiteral("0 字节")
+                      && DlgFileProperty::formatSize(1024 * 1024)
+                             == QStringLiteral("1.00 MB（1,048,576 字节）")
+                      && DlgFileProperty::typeTextForFile(QStringLiteral("README"))
+                             == QStringLiteral("文件");
+
+        DlgFileProperty::Data pending = d;
+        pending.bHasCrc = false;
+        pending.nCrc = 0;
+        pending.bPending = true;
+        const QString sPending = DlgFileProperty::formatInfoText(pending);
+
+        DlgFileProperty::Data v1 = d;
+        v1.bHasCrc = false;
+        v1.nCrc = 0;
+        v1.nArchiveVersion = FwArc::VERSION_V1;
+        const QString sV1 = DlgFileProperty::formatInfoText(v1);
+        bPropStateOk = sPending.contains(QStringLiteral("内容校验：不可用（新增条目尚未保存）"))
+                       && sPending.contains(QStringLiteral("状态：新增条目，尚未保存"))
+                       && sV1.contains(QStringLiteral("归档格式：FWDA v1（旧格式）"))
+                       && sV1.contains(QStringLiteral("内容校验：不可用（v1 归档未记录内容校验）"))
+                       && sV1.contains(QStringLiteral("状态：已保存在归档中"));
+
+        DlgFileProperty::Data folderData;
+        folderData.bDir = true;
+        folderData.sName = QStringLiteral("代码");
+        folderData.sType = QStringLiteral("文件夹");
+        folderData.sLocation = QStringLiteral("E:/study");
+        folderData.nSize = 1060000;
+        folderData.nFileCount = 20;
+        folderData.nDirCount = 4;
+        folderData.bFiltered = true;
+        folderData.sArchivePath = QStringLiteral("E:/study/1.dat");
+        folderData.nArchiveVersion = FwArc::VERSION_V2;
+        folderData.sEntryPath = QStringLiteral("E:/study/代码");
+        const QString sFolder = DlgFileProperty::formatInfoText(folderData);
+        DlgFileProperty::Data unfiltered;
+        unfiltered.bDir = true;
+        unfiltered.nFileCount = 1;
+        bPropFolderOk = sFolder.contains(QStringLiteral("类型：文件夹"))
+                        && sFolder.contains(QStringLiteral("大小（合计）：1.01 MB（1,060,000 字节）"))
+                        && sFolder.contains(QStringLiteral("包含：20 个文件、4 个子文件夹"))
+                        && sFolder.contains(QStringLiteral("统计范围：当前搜索筛选结果"))
+                        && sFolder.contains(QStringLiteral("归档内路径：E:/study/代码"))
+                        && !sFolder.contains(QStringLiteral("内容校验"))
+                        && !sFolder.contains(QStringLiteral("状态："))
+                        && DlgFileProperty::formatInfoText(unfiltered)
+                               .contains(QStringLiteral("统计范围：当前列表中的归档条目"));
+    }
+    report(bPropTextOk,
+           QStringLiteral("H20a: property text formats size/CRC/archive fields"));
+    report(bPropStateOk,
+           QStringLiteral("H20b: pending entry and v1 archive show explicit CRC/state text"));
+    report(bPropFolderOk,
+           QStringLiteral("H20c: folder property text shows aggregate and filter scope"));
+
     QDir(sChainDir).removeRecursively();
 }
 
@@ -2047,9 +2343,9 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     // K2: 同一盘内添加"归档公共根之外"的文件后保存：
     //     公共根应上移且各条目保留子目录层级（fixtures/...），不能拍平成文件名。
     const QString sSame = scratchDir + QStringLiteral("/save_same.dat");
-    // 用 fixtures 的上一级目录里自建文件作为“公共根之外”的来源，
-    // 不再依赖 work/../run-plugin-tests.ps1 的存在（-FixturesDir 可指向任意目录）。
-    const QString sUp = QFileInfo(work + QStringLiteral("/../k2_sibling.txt"))
+    // 用 scratch 的上一级目录里自建文件作为“公共根之外”的来源：该目录由运行器
+    // 创建，在受限沙箱里也可写（fixtures 的上级目录是源码树，不应依赖可写）。
+    const QString sUp = QFileInfo(scratchDir + QStringLiteral("/../k2_sibling.txt"))
                             .absoluteFilePath();
     {
         QFile fUp(sUp);
@@ -2075,9 +2371,13 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
             if (p == QStringLiteral("basic.docx") || p == QStringLiteral("pic.png"))
                 bKeptDirs = false;   // 出现了裸文件名 -> 被拍平
         }
-        report(bSaved2 && bMeta2 && !sameMeta.root.isEmpty() && bKeptDirs
-                   && !hasDup(samePaths),
-               QStringLiteral("K2: same-drive save keeps subdirectories (%1)")
+        // 跨盘（scratch 与 fixtures 不同卷）时 root 为空、盘符当首段也是合法形态，
+        // 这里只断言「不拍平成裸文件名」；root 非空只在同卷时要求。
+        const bool bRootShapeOk = !samePaths.isEmpty()
+                                  && (!sameMeta.root.isEmpty()
+                                      || samePaths.first().contains(QLatin1Char('/')));
+        report(bSaved2 && bMeta2 && bRootShapeOk && bKeptDirs && !hasDup(samePaths),
+               QStringLiteral("K2: save keeps subdirectories (%1)")
                    .arg(samePaths.join(QStringLiteral(", "))));
         QFile::remove(sUp);   // 不把临时来源文件留进 fixtures 上级目录
     }
@@ -2109,10 +2409,16 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         const bool bCancelled = fm6.isCancelRequested();
         fm6.resetCancel();
         const bool bReset = !fm6.isCancelRequested();
-        fm6.outputFile(crossPaths.isEmpty() ? QString() : crossPaths.first(), scratchDir);
+        // 导出用加载后的 FILEINFO 路径（与 UI 双击导出完全同一条链路），
+        // 不能用 Meta.relPath：同盘合并时 root 非空，relPath 是「相对 root」的
+        // 形式，和 outputFile() 的查找键 sFilePath 不是一回事（跨盘时才恰好相等）。
+        const QVector<FILEINFO> infos6 = fm6.getFileInfos();
+        const QString sExportPath = infos6.isEmpty() ? QString() : infos6.first().sFilePath;
+        fm6.outputFile(sExportPath, scratchDir);
         report(bCancelled && bReset && fm6.lastError().isEmpty(),
                QStringLiteral("K5: cancel flag reset lets next export succeed (%1)")
-                   .arg(fm6.lastError()));
+                   .arg(fm6.lastError().isEmpty()
+                            ? sExportPath : fm6.lastError()));
     }
 
     // K6: 删除后重加同路径文件不得复用旧 CRC（A-02）
@@ -2179,6 +2485,54 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         fm.QMergeFiles(QVector<QString>{sSrc}, sOut);
         report(bDone && !bOk && sMsg.contains(QStringLiteral("目录")),
                QStringLiteral("K8: merge refuses directory as output"));
+    }
+
+    // K9: 合并成功的提示必须带输出的绝对路径——相对路径按当前目录解析，
+    // 提示里不写这一行，用户只能靠猜才知道合并结果落在哪（2026-11-19 真实踩过）。
+    {
+        const QString sSrc = scratchDir + QStringLiteral("/merge_msg_src.bin");
+        const QString sOut = scratchDir + QStringLiteral("/merge_msg_out");
+        {
+            QFile f(sSrc);
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QByteArray(16, 'm'));
+        }
+        FileManager fm;
+        bool bDone = false, bOk = false;
+        QString sMsg;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&](bool ok, const QString &m) { bDone = true; bOk = ok; sMsg = m; });
+        fm.QMergeFiles(QVector<QString>{sSrc}, sOut);
+        const QString sExpect = QFileInfo(sOut).absoluteFilePath();
+        report(bDone && bOk && sMsg.contains(QStringLiteral("输出文件：")) && sMsg.contains(sExpect),
+               QStringLiteral("K9: success message shows absolute output path (%1)")
+                   .arg(QString(sMsg).replace(QLatin1Char('\n'), QStringLiteral(" | "))));
+        QFile::remove(sOut);
+        QFile::remove(sSrc);
+    }
+
+    // K10: 后缀只是命名约定——.fwda 归档必须能原样加载回来（识别一律看文件头魔数 FWDA，
+    //      不依赖后缀；老的 .dat 同理，所以换后缀不需要迁移任何旧文件）
+    {
+        const QString sSrc = scratchDir + QStringLiteral("/fwda_suffix_src.bin");
+        const QString sArc = scratchDir + QStringLiteral("/fwda_suffix.fwda");
+        {
+            QFile f(sSrc);
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QByteArray(64, 's'));
+        }
+        FileManager fm;
+        bool bMergeOk = false;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&bMergeOk](bool ok, const QString &) { bMergeOk = ok; });
+        fm.QMergeFiles(QVector<QString>{sSrc}, sArc);
+        const bool bLoaded = fm.QLoadMergedFile(sArc);
+        const int nEntries = fm.getFileInfos().size();
+        report(bMergeOk && bLoaded && nEntries == 1,
+               QStringLiteral("K10: .fwda archive loads by magic bytes (%1 entries, merge=%2, load=%3)")
+                   .arg(nEntries).arg(bMergeOk).arg(bLoaded));
+        QFile::remove(sArc);
+        QFile::remove(sSrc);
     }
 }
 
@@ -2358,17 +2712,345 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
     // A10: 「支持的格式」入口（用户遇到不支持的格式时最直接的求助入口）
     report(sActions.contains(QStringLiteral("支持的格式…")),
            QStringLiteral("A10: menu action 支持的格式 exists"));
+
+    // A11: 插件拒绝打开时的说明文案（接口 v6）。
+    // 用户报过的问题：WAV 打不开时界面只说「插件无法显示该文件」，而日志里其实是
+    // "没有可用的音频输出设备"——界面显示的信息是错的，照它永远修不好。
+    {
+        const QString sWithReason = MainWindow::pluginFailureText(
+            QStringLiteral("audio.wav"), QStringLiteral("系统中没有可用的音频输出设备"));
+        const QString sNoReason = MainWindow::pluginFailureText(
+            QStringLiteral("audio.wav"), QStringLiteral("   "));
+        report(sWithReason.contains(QStringLiteral("audio.wav"))
+                   && sWithReason.contains(QStringLiteral("系统中没有可用的音频输出设备"))
+                   && !sWithReason.contains(QStringLiteral("插件无法显示该文件")),
+               QStringLiteral("A11a: plugin failure text carries the real reason ('%1')").arg(sWithReason));
+        report(sNoReason == QStringLiteral("插件无法显示该文件：audio.wav"),
+               QStringLiteral("A11b: plugins without a reason keep the generic text"));
+    }
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// AUDIT-2026-11：本轮审查修复的回归测试
+//   P0-1 固定 tmp/bak 名 / 跨进程锁；P1-2 二次合并来源 CRC；P1-3 删除事务；
+//   P1-4 分割成功语义；P1-5 导出不覆盖；P1-6 来源变化；P1-9 一次解析复用；
+//   P1-11 路径段；P1-12/P2-3 ZIP 预算与 CRC；P2-2 严格 UTF-8。
+// ---------------------------------------------------------------------------
+namespace {
+
+void put16(QByteArray &a, quint16 v)
+{
+    a.append(char(v & 0xFF));
+    a.append(char((v >> 8) & 0xFF));
+}
+
+void put32(QByteArray &a, quint32 v)
+{
+    for (int i = 0; i < 4; ++i)
+        a.append(char((v >> (8 * i)) & 0xFF));
+}
+
+void writeBytes(const QString &path, const QByteArray &data)
+{
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(data);
+}
+
+// 构造只有一个 stored 条目的最小 ZIP。declaredUncomp 可故意写错，
+// 用于验证 ZipReader 的预算与 CRC 校验（不依赖任何外部 ZIP 工具）。
+QByteArray buildStoredZip(const QByteArray &name, const QByteArray &payload,
+                          quint32 declaredUncomp = 0xFFFFFFFEu,
+                          bool corruptCentralCrc = false)
+{
+    const quint32 crc = FwArc::Crc32::of(payload);
+    const quint32 uncomp = (declaredUncomp == 0xFFFFFFFEu)
+                               ? quint32(payload.size()) : declaredUncomp;
+
+    QByteArray zip;
+    // local file header
+    put32(zip, 0x04034b50u); put16(zip, 20); put16(zip, 0); put16(zip, 0);
+    put16(zip, 0); put16(zip, 0);
+    put32(zip, crc); put32(zip, quint32(payload.size())); put32(zip, uncomp);
+    put16(zip, quint16(name.size())); put16(zip, 0);
+    zip.append(name);
+    zip.append(payload);
+    const quint32 cdOff = quint32(zip.size());
+    // central directory
+    put32(zip, 0x02014b50u); put16(zip, 20); put16(zip, 20); put16(zip, 0); put16(zip, 0);
+    put16(zip, 0); put16(zip, 0);
+    put32(zip, corruptCentralCrc ? (crc ^ 0xFFFFFFFFu) : crc);
+    put32(zip, quint32(payload.size())); put32(zip, uncomp);
+    put16(zip, quint16(name.size())); put16(zip, 0); put16(zip, 0);
+    put16(zip, 0); put16(zip, 0); put32(zip, 0); put32(zip, 0);
+    zip.append(name);
+    const quint32 cdSize = quint32(zip.size()) - cdOff;
+    // EOCD（单磁盘）
+    put32(zip, 0x06054b50u); put16(zip, 0); put16(zip, 0); put16(zip, 1); put16(zip, 1);
+    put32(zip, cdSize); put32(zip, cdOff); put16(zip, 0);
+    return zip;
+}
+
+} // namespace
+
+static void verifyAudit2026Fixes(const QString &work, const QString &scratchDir)
+{
+    Q_UNUSED(work);
+
+    // ---- A1: 严格 UTF-8（P2-2）----
+    {
+        auto okBytes = [](std::initializer_list<int> bytes) {
+            QByteArray b;
+            for (int v : bytes) b.append(char(v));
+            return FwArc::isValidUtf8(b);
+        };
+        const bool bValidBasic = FwArc::isValidUtf8(QByteArray("hello, \xE4\xB8\xAD\xE6\x96\x87"));
+        const bool bValidReplacement = FwArc::isValidUtf8(QByteArray("\xEF\xBF\xBD"));
+        const bool bValidMax = okBytes({0xF4, 0x8F, 0xBF, 0xBF});
+        const bool bOverlong2 = okBytes({0xC0, 0xAF});
+        const bool bOverlong3 = okBytes({0xE0, 0x80, 0xAF});
+        const bool bOverlong4 = okBytes({0xF0, 0x80, 0x80, 0xAF});
+        const bool bSurrogate = okBytes({0xED, 0xA0, 0x80});
+        const bool bTooBig = okBytes({0xF4, 0x90, 0x80, 0x80});
+        const bool bTruncated = okBytes({0xE2, 0x82});
+        report(bValidBasic && bValidReplacement && bValidMax
+               && !bOverlong2 && !bOverlong3 && !bOverlong4
+               && !bSurrogate && !bTooBig && !bTruncated,
+               QStringLiteral("AUDIT-P2-2: strict UTF-8 rejects overlong/surrogate/>U+10FFFF"));
+    }
+
+    // ---- A2: 路径段安全（P1-11）----
+    {
+        const bool bTrailingDot = !FwArc::isSafeRelativePath(QStringLiteral("a/b."));
+        const bool bTrailingSpace = !FwArc::isSafeRelativePath(QStringLiteral("a/b "));
+        const bool bMidDevice = !FwArc::isSafeRelativePath(QStringLiteral("CON/x.txt"));
+        const bool bDevWithExt = !FwArc::isSafeRelativePath(QStringLiteral("a/COM1.txt"));
+        const bool bLongSeg = !FwArc::isSafeRelativePath(QString(260, QLatin1Char('a')));
+        const bool bGood = FwArc::isSafeRelativePath(QStringLiteral("dir/sub/file.txt"));
+        report(bTrailingDot && bTrailingSpace && bMidDevice && bDevWithExt && bLongSeg && bGood,
+               QStringLiteral("AUDIT-P1-11: path segments reject dots/spaces/device/long names"));
+    }
+
+    // ---- A3: 合并不得删除输入/无关的固定辅助名文件（P0-1）----
+    {
+        const QString out = scratchDir + QStringLiteral("/audit_fixed_aux.dat");
+        const QString in  = out + QStringLiteral(".tmp.fwda");   // 旧实现会误删它
+        writeBytes(in, "keep-me");
+        bool bDone = false, bOk = false;
+        QString sMsg;
+        FileManager fm;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
+        fm.QMergeFiles(QVector<QString>{in}, out);
+        const bool bInputKept = QFileInfo::exists(in) && readFile(in) == QByteArray("keep-me");
+        FwArc::Meta m;
+        QString e;
+        const bool bOutOk = FileManager::inspectArchive(out, m, e) && m.entries.size() == 1;
+        report(bDone && bOk && bInputKept && bOutOk,
+               QStringLiteral("AUDIT-P0-1: merge keeps input named like old fixed tmp (%1)").arg(sMsg));
+    }
+
+    // ---- A4: 同一输出的写锁（P0-1）----
+    {
+        const QString out = scratchDir + QStringLiteral("/audit_lock.dat");
+        const QString in  = scratchDir + QStringLiteral("/audit_lock.in");
+        writeBytes(in, "lock");
+        // 与 FileManager 的锁格式一致：<输出>.fwdalock，NewOnly 创建后写 PID
+        const QString lockPath = out + QStringLiteral(".fwdalock");
+        QFile held(lockPath);
+        const bool bHeld = held.open(QIODevice::WriteOnly | QIODevice::NewOnly);
+        held.write(QByteArray::number(qint64(QCoreApplication::applicationPid())));
+        held.close();
+        bool bDone = false, bOk = true;
+        QString sMsg;
+        FileManager fm;
+        QObject::connect(&fm, &FileManager::operationFinished,
+                         [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
+        fm.QMergeFiles(QVector<QString>{in}, out);
+        QFile::remove(lockPath);
+        report(bHeld && bDone && !bOk && sMsg.contains(QStringLiteral("实例")),
+               QStringLiteral("AUDIT-P0-1: output write lock rejects a concurrent writer"));
+    }
+
+    // ---- A5: 二次合并必须校验来源内容 CRC（P1-2）----
+    {
+        const QString src = scratchDir + QStringLiteral("/audit_crc_src.bin");
+        const QString arc = scratchDir + QStringLiteral("/audit_crc.dat");
+        const QString out = scratchDir + QStringLiteral("/audit_crc_out.dat");
+        QFile::remove(out);
+        writeBytes(src, QByteArray(4096, 'A'));
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{src}, arc);
+        FwArc::Meta meta;
+        QString err;
+        const bool bMeta = FileManager::inspectArchive(arc, meta, err) && meta.entries.size() == 1;
+        if (bMeta)
+        {
+            QFile f(arc);
+            if (f.open(QIODevice::ReadWrite))
+            {
+                f.seek(qint64(meta.entries.first().contentPos));
+                const char c = 'B';
+                f.write(&c, 1);
+            }
+        }
+        bool bDone = false, bOk = true;
+        QString sMsg;
+        FileManager fm2;
+        QObject::connect(&fm2, &FileManager::operationFinished,
+                         [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
+        fm2.QMergeFiles(QVector<QString>{arc}, out);
+        report(bMeta && bDone && !bOk && !QFileInfo::exists(out)
+               && sMsg.contains(QStringLiteral("CRC")),
+               QStringLiteral("AUDIT-P1-2: merge rejects corrupted source content (%1)").arg(sMsg));
+    }
+
+    // ---- A6: 删除后保存走完整事务重写（P1-3）----
+    {
+        const QString a = scratchDir + QStringLiteral("/audit_del_a.txt");
+        const QString b = scratchDir + QStringLiteral("/audit_del_b.txt");
+        const QString arc = scratchDir + QStringLiteral("/audit_del.dat");
+        writeBytes(a, "aaa");
+        writeBytes(b, "bbb");
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{a, b}, arc);
+        FileManager fm2;
+        const bool bLoaded = fm2.QLoadMergedFile(arc);
+        const QString keep = fm2.getFileInfos().first().sFilePath;
+        const bool bDel = fm2.deleteFile(keep);
+        const bool bSaved = fm2.save();
+        FwArc::Meta m;
+        QString e;
+        const bool bMetaOk = FileManager::inspectArchive(arc, m, e)
+                             && m.entries.size() == 1 && m.fileCount == 1;
+        report(bLoaded && bDel && bSaved && bMetaOk,
+               QStringLiteral("AUDIT-P1-3: delete+save rewrites with %1 slots").arg(m.fileCount));
+    }
+
+    // ---- A7: 新增文件在保存前被修改必须失败（P1-6）----
+    {
+        const QString base = scratchDir + QStringLiteral("/audit_pending_base.txt");
+        const QString add  = scratchDir + QStringLiteral("/audit_pending_add.txt");
+        const QString arc  = scratchDir + QStringLiteral("/audit_pending.dat");
+        writeBytes(base, "base");
+        writeBytes(add, "first");
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{base}, arc);
+        FileManager fm2;
+        const bool bLoaded = fm2.QLoadMergedFile(arc);
+        fm2.addFiles(QVector<QString>{add});
+        {
+            QFile f(add);
+            if (f.open(QIODevice::Append))
+                f.write("MORE");
+        }
+        const bool bSaved = fm2.save();
+        const QString sErr = fm2.lastError();
+        FwArc::Meta m;
+        QString e;
+        const bool bStillOld = FileManager::inspectArchive(arc, m, e) && m.entries.size() == 1;
+        report(bLoaded && !bSaved && sErr.contains(QStringLiteral("变化")) && bStillOld,
+               QStringLiteral("AUDIT-P1-6: changed pending file aborts save (%1)").arg(sErr));
+    }
+
+    // ---- A8: 导出绝不覆盖/截断已有文件（P1-5）----
+    {
+        const QString src = scratchDir + QStringLiteral("/dup.txt");
+        const QString arc = scratchDir + QStringLiteral("/audit_export.dat");
+        writeBytes(src, "export-once");
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{src}, arc);
+        FileManager fm2;
+        fm2.QLoadMergedFile(arc);
+        const QString name = fm2.getFileInfos().first().sFilePath;
+        fm2.outputFile(name, scratchDir);
+        const QString first = fm2.lastOutputPath();
+        fm2.outputFile(name, scratchDir);
+        const QString second = fm2.lastOutputPath();
+        const bool bOk = !second.isEmpty() && second != first
+                         && QFileInfo::exists(first)
+                         && readFile(first) == QByteArray("export-once")
+                         && readFile(second) == QByteArray("export-once");
+        report(bOk, QStringLiteral("AUDIT-P1-5: export renames instead of truncating (%1 | %2)")
+                        .arg(first, second));
+    }
+
+    // ---- A9: 校验结果可直接复用于加载（P1-9）----
+    {
+        const QString arc = scratchDir + QStringLiteral("/audit_preparse.dat");
+        const QString src = scratchDir + QStringLiteral("/audit_preparse.txt");
+        writeBytes(src, "preparse");
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{src}, arc);
+        FileManager fm2;
+        FwArc::Meta meta;
+        QString err;
+        const bool bValid = fm2.validateMergedFile(arc, &meta, &err);
+        const bool bLoaded = fm2.QLoadMergedFile(arc, &meta);
+        report(bValid && bLoaded && fm2.isArchiveLoaded(),
+               QStringLiteral("AUDIT-P1-9: validated meta reused by load"));
+    }
+
+    // ---- A10: 分割完全成功 = 全部条目都输出（P1-4）----
+    {
+        const QString a = scratchDir + QStringLiteral("/audit_split_a.txt");
+        const QString b = scratchDir + QStringLiteral("/audit_split_b.txt");
+        const QString arc = scratchDir + QStringLiteral("/audit_split.dat");
+        const QString outDir = scratchDir + QStringLiteral("/audit_split_out");
+        QDir(outDir).removeRecursively();
+        writeBytes(a, "split-a");
+        writeBytes(b, "split-b");
+        FileManager fm;
+        fm.QMergeFiles(QVector<QString>{a, b}, arc);
+        bool bDone = false, bOk = false;
+        QString sMsg;
+        FileManager fm2;
+        QObject::connect(&fm2, &FileManager::operationFinished,
+                         [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
+        fm2.QSplitFiles(arc, false, outDir);
+        const bool bFiles = QFileInfo::exists(outDir + QStringLiteral("/audit_split_a.txt"))
+                            && QFileInfo::exists(outDir + QStringLiteral("/audit_split_b.txt"));
+        report(bDone && bOk && bFiles,
+               QStringLiteral("AUDIT-P1-4: split reports success only when all entries output (%1)")
+                   .arg(sMsg));
+    }
+
+    // ---- A11: ZipReader 预算与 CRC（P1-12 / P2-3）----
+    {
+        const QByteArray name("a.txt");
+        const QByteArray payload("hello zip");
+        ZipReader good;
+        const bool bOpen = good.open(buildStoredZip(name, payload));
+        const bool bGood = bOpen
+                           && good.entry(QString::fromLatin1(name)) == payload;
+
+        ZipReader badCrc;
+        const bool bOpenBad = badCrc.open(buildStoredZip(name, payload, 0xFFFFFFFEu, true));
+        const QByteArray badData = badCrc.entry(QString::fromLatin1(name));
+        const bool bRejectedCrc = bOpenBad && badData.isEmpty()
+                                  && badCrc.lastError().contains(QStringLiteral("CRC"));
+
+        ZipReader overBudget;
+        const bool bOpenBig = overBudget.open(
+            buildStoredZip(name, payload, 100u * 1024u * 1024u));   // 声明 100 MiB（>64 MiB）
+        const QByteArray bigData = overBudget.entry(QString::fromLatin1(name));
+        const bool bRejectedBudget = bOpenBig && bigData.isEmpty()
+                                     && overBudget.budget().exhausted;
+
+        report(bGood && bRejectedCrc && bRejectedBudget,
+               QStringLiteral("AUDIT-P1-12/P2-3: ZipReader verifies CRC and enforces budget"));
+    }
+}
 
 // D6 的独立子进程：加载坏插件→换成真插件→重试→进程退出后模块自然卸载，
 // 父进程才能删除 ZZBroken.dll，避免同一进程留下第 9 个重复模块。
 static int runBrokenRetryChild()
 {
-    QTemporaryDir childSettings;
-    if (!childSettings.isValid()) return 2;
-    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, childSettings.path());
+    const QString childSettings = makeWritableTestDir(QStringLiteral("d6_settings"));
+    if (!QDir(childSettings).exists()) return 2;
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, childSettings);
     const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
     const QString dll = dir + QStringLiteral("/ZZBroken.dll");
     const QString json = dir + QStringLiteral("/ZZBroken.json");
@@ -2409,11 +3091,19 @@ int main(int argc, char **argv)
     // 测试必须与用户真实配置隔离：插件映射（QSettings PluginMap）与插件启停
     // （PluginEnabled）都会读写 ini，若用默认路径，一次测试就会改动用户设置。
     // 这里把 UserScope 的 ini 目录指到临时目录（必须在任何 QSettings 构造之前调用）。
+    //
+    // 受限环境下 QTemporaryDir 的子目录可能不可写（任务沙箱/只读配置），
+    // 允许用 FW_TEST_SETTINGS_DIR / FW_TEST_SCRATCH_DIR 显式指定可写目录。
+    const QString sSettingsOverride = qEnvironmentVariable("FW_TEST_SETTINGS_DIR");
     QTemporaryDir settingsDir;
-    if (settingsDir.isValid())
+    QString settingsPath = sSettingsOverride;
+    if (settingsPath.isEmpty() && settingsDir.isValid())
+        settingsPath = settingsDir.path();
+    if (!settingsPath.isEmpty())
     {
-        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDir.path());
-        note(QStringLiteral("settings isolated to: ") + settingsDir.path());
+        QDir().mkpath(settingsPath);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsPath);
+        note(QStringLiteral("settings isolated to: ") + settingsPath);
     }
     else
     {
@@ -2459,10 +3149,13 @@ int main(int argc, char **argv)
 
     // 派生文件（合并出的 .dat 等）放临时目录，避免污染入库的 fixtures/
     QTemporaryDir scratch;
-    const QString scratchDir = scratch.isValid() ? scratch.path()
-                                                 : QDir::tempPath() + QStringLiteral("/plugin_tests");
-    if (!scratch.isValid())
+    QString scratchDir = qEnvironmentVariable("FW_TEST_SCRATCH_DIR");
+    if (scratchDir.isEmpty())
+        scratchDir = scratch.isValid() ? scratch.path()
+                                       : QDir::tempPath() + QStringLiteral("/plugin_tests");
+    if (!QDir().exists(scratchDir))
         QDir().mkpath(scratchDir);
+    note(QStringLiteral("scratch: ") + scratchDir);
 
     // ---------- W1 ----------
     // 先放一个坏插件：MainWindow 构造时（checkExtensionMapping 里）会扫描 plugins/，
@@ -2611,6 +3304,9 @@ int main(int argc, char **argv)
 
     // ---------- K: 保存路径规划（P0：添加文件后不得拍平目录） ----------
     verifySavePathPreservation(work, scratchDir);
+
+    // ---------- AUDIT-2026-11: 本轮审查修复的回归 ----------
+    verifyAudit2026Fixes(work, scratchDir);
 
     // ---------- D: 部署自检 + 插件失败可见性 ----------
     // 放在 A 之后：D6「补文件后重试恢复」会额外加载一份插件副本，从而在

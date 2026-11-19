@@ -59,11 +59,18 @@ private:
         return textOfRow(row, 0);
     }
 
-    static void sortLevel(QStandardItem *pParent, int nCols, int column, Qt::SortOrder order)
+    static void sortLevel(QStandardItem *pParent, int nCols, int column, Qt::SortOrder order,
+                          int nDepth = 0)
     {
         if (pParent == nullptr)
             return;
-
+        // P2-16：极深目录会耗尽 native 栈。归档内的路径段数本就有上限
+        // （FwArc::MAX_PATH_LEN / 每段 255），512 层足够覆盖合法输入；
+        // 超过后停止继续下钻，而不是把进程留在递归里。
+        static const int kMaxDepth = 512;
+        if (nDepth > kMaxDepth)
+            return;
+        Q_UNUSED(nCols);
         const int nRows = pParent->rowCount();
         if (nRows > 1)
         {
@@ -111,7 +118,7 @@ private:
         for (int r = 0; r < pParent->rowCount(); ++r)
         {
             if (QStandardItem *pChild = pParent->child(r, 0))
-                sortLevel(pChild, nCols, column, order);
+                sortLevel(pChild, nCols, column, order, nDepth + 1);
         }
     }
 };

@@ -60,13 +60,28 @@ QList<PluginDiagnostics::MissingFile> PluginDiagnostics::missingFiles(const QStr
         if (item.path.isEmpty())
             continue;
 
-        // 清单里的路径统一用 '/' 分隔，QDir::filePath 在 Windows 上也能正确拼接
+        // 清单里的路径统一用 '/' 分隔，QDir::filePath 在 Windows 上也能正确拼接。
+        // P2-16：必须用 isFile()：同名目录以前也会被当成「依赖存在」，
+        // 从而在真正缺 DLL 时给出「依赖齐全」的错误结论。
         const QString sAbs = QDir(appDir).filePath(item.path);
-        if (!QFileInfo::exists(sAbs))
+        const QFileInfo fi(sAbs);
+        if (!fi.isFile())
         {
             item.path.replace(QLatin1Char('/'), QDir::separator());
+            if (fi.exists() && fi.isDir())
+                item.hint = item.hint.isEmpty()
+                                ? QStringLiteral("该路径是一个目录，不是文件")
+                                : item.hint + QStringLiteral("（该路径是一个目录）");
             missing.append(item);
         }
+    }
+
+    // P2-16：读取过程出错时，缺失列表可能不完整。必须让调用方知道
+    // 「诊断不完整」，否则会把半份清单当成完整结论展示给用户。
+    if (in.status() != QTextStream::Ok && error)
+    {
+        *error = QStringLiteral("部署清单读取不完整（%1）：%2")
+                     .arg(sPath, f.errorString());
     }
     return missing;
 }

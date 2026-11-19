@@ -91,7 +91,8 @@ public:
                      SwrContext *swr, uint8_t *aOutBuf,
                      QMutex *aMutex, QByteArray *aByteBuf,
                      int outSampleRate, int genId,
-                     int audioOutBufCapacity);
+                     int audioOutBufCapacity,
+                     quint64 runId);
 
     // 请求改变视频输出尺寸（主线程调用，窗口缩放时）。
     // 解码线程会在下一帧前在自己的线程内重建 sws 上下文与输出缓冲：
@@ -107,9 +108,13 @@ signals:
     void decodingFinished(int genId);
 
 public slots:
-    void doDecode();
+    // P0-4：每个解码任务绑定创建时的 runId。旧 runId 的任务在入口直接退出，
+    // 绝不读取/清理当前上下文（排队任务也不再能越过 stop 检查）。
+    void doDecodeRun(quint64 runId);
     void requestStop();
     void clearStopRequest();
+    // 上下文世代：主线程换上下文/停止时推进，使排队中的旧任务立即失效
+    void setContextRunId(quint64 runId);
     // 暂停/恢复解码线程的 PTS 帧调度（不退出循环，仅阻塞在条件变量上）
     void setPaused(bool paused);
     // 更新当前播放世代（用于 seek 时过滤排队的旧帧信号）
@@ -171,6 +176,9 @@ private:
     int m_audioOutBufCapacity = 0;  // 音频输出缓冲区实际容量（样本数），用作 swr_convert 的 out_count
 
     int m_genId = -1;
+    // P0-4：当前上下文对应的播放世代。doDecodeRun 的任务世代与它不一致时直接退出，
+    // 用于隔离「已排队但尚未执行」的旧任务。
+    std::atomic<quint64> m_contextRunId{0};
 
     // seek 后的快进目标（绝对 PTS 毫秒）；解码循环按它丢弃目标前的包
     std::atomic<qint64> m_seekTargetAbsMs{0};
@@ -206,6 +214,18 @@ public:
     // 打开失败 / 0 字节时停止后台播放并清空画面，避免残留上一个文件
     void clearContent();
 
+    // v6：打开失败的**真实原因**（空串 = 本次没失败 / 未提供）。
+    // 主程序用它替代「插件无法显示该文件」这种笼统提示：没有音频输出设备、
+    // 解码器不支持该编码、文件损坏在界面上必须能区分开。
+    QString lastError() const { return m_sLastError; }
+
+    // 把失败原因（含文件信息与建议）留在画面区。打开失败时画面区本来是黑的，
+    // 只靠状态栏 10 秒的消息，用户回头看标签页就只剩一块黑屏。
+    void showFailurePage();
+    // 每次新的打开尝试开始时调用：宿主只会在 sendFile* 返回 false 后读 lastError()，
+    // 陈旧的失败原因会让它把「这次」的失败解释成上一次的原因。
+    void clearLastError();
+
 public slots:
    void timeCallback(void);
 
@@ -235,6 +255,20 @@ private slots:
 private:
     // force=true 时即使解码线程未确认退出也释放（仅析构使用）
     void clearFFmpegResources(bool force = false);
+    // 统一的打开失败出口：记录真实原因 -> 释放 FFmpeg 资源 -> 返回 -1。
+    // 所有 return -1 都必须走这里，否则宿主又只能显示笼统提示。
+    int failOpen(const QString &sShortReason, const QString &sDetail = QString());
+    // 启动音频输出。失败时通过 psShort/psDetail 给出可照做的真实原因
+    // （没有输出设备 / 设备不支持该采样格式 / 设备打开失败是三种不同的问题）。
+    bool startAudioOutput(const QAudioFormat &fmt, AVStream *astream,
+                          QString *psShort, QString *psDetail);
+    // Qt6 专用：QAudioSink 启动失败只给一个 OpenError，靠多媒体设备信息把原因说清楚
+    void diagnoseAudioFailure(const QAudioFormat &fmt, int nErr, AVStream *astream,
+                              QString *psShort, QString *psDetail) const;
+    // 容器/流/码率三种口径估算时长（进度条与失败页共用，避免两处算法漂移）
+    qint64 probeDurationMs(AVFormatContext *pCtx, AVStream *vstream, AVStream *astream) const;
+    // 失败页用的文件信息：封装 + 音频编码 + 采样率/声道
+    QString sourceSummary(AVFormatContext *pCtx, AVStream *astream) const;
     void doSeek(qint64 ms);
     void updateProgressDisplay();
     void updatePlayPauseIcon();
@@ -243,6 +277,10 @@ private:
     bool ensureAudioStarted();
     // 停止 worker 并阻塞等待其退出 doDecode；返回 false 表示超时、worker 仍在运行
     bool stopWorkerAndWait(unsigned long timeoutMs = 2000);
+    // P0-4：推进播放世代并让 worker 立刻作废旧任务（排队任务在入口即退出）
+    void invalidateDecodeRun();
+    // 按指定世代排队一次解码任务
+    void queueDecode(quint64 runId);
     // 根据源宽高与目标区域计算保持宽高比的目标输出尺寸
     QSize computeAspectRatioSize(int srcW, int srcH, int dstW, int dstH) const;
     // 清空画面区（清除残留 pixmap 与文字）：切换文件时必须调用，
@@ -307,13 +345,21 @@ private:
     // 避免 AVSEEK_FLAG_BACKWARD 把刚拖到的位置又拉回开头。
     qint64 m_nSeekTargetMs = 0;
     int    m_nVolume = 80;
-    int    m_genCounter = 0;  // 用于过滤过期 decodingFinished 信号
+    int    m_genCounter = 0;  // 用于过滤过期 decodingFinished / frameDecoded 信号
+    // P0-4：宿主侧播放世代（与 worker 的 m_contextRunId 对应）
+    quint64 m_runId = 0;
+    // P1-18：FFmpeg 中断回调共享标志（停止/换文件时置 1，让阻塞 I/O 尽快返回）
+    std::atomic<int> m_ioInterrupt{0};
 
     // ===== 视频解码线程 =====
     QThread     *m_videoThread = nullptr;
     VideoWorker *m_videoWorker = nullptr;
     // 解码线程超时未退出时挂起资源释放，等 decodingFinished 后再清理，避免 UAF
     bool         m_bCleanupPending = false;
+
+    // 最近一次打开失败的说明（v6：交给宿主显示，取代「插件无法显示该文件」）
+    QString      m_sLastError;       // 一句话，供状态栏/对话框拼接
+    QString      m_sFailureDetail;   // 多行：原因 + 文件信息 + 建议（画面区失败页）
 };
 
 #endif // MAINWINDOW_H

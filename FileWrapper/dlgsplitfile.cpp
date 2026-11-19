@@ -4,6 +4,7 @@
 #include <QMessageBox>
 #include <QScreen>
 #include "icons.h"
+#include "archiveformat.h"
 
 DlgSplitFile::DlgSplitFile(QWidget *parent) :
     QDialog(parent),
@@ -76,7 +77,7 @@ void DlgSplitFile::setMergedFilePath(const QString &sPath)
 
 void DlgSplitFile::on_btnMergedFilePath_clicked()
 {
-    QString sFilePath = QFileDialog::getOpenFileName(this, tr("待分割的文件"), "", tr("Class Files (*.dat);;All Files (*.*)"));
+    QString sFilePath = QFileDialog::getOpenFileName(this, tr("待分割的文件"), "", FwArc::fileDialogFilter());
     if(sFilePath.isEmpty())
         return;
 

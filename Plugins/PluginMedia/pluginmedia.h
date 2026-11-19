@@ -28,11 +28,20 @@ public:
     // v4：主程序把归档内容区 mmap 后交进来，插件直接引用（播放期间宿主保持映射）
     bool sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName) override;
 
+    // v6：打开失败的真实原因（例如"系统中没有可用的音频输出设备"）。
+    // 主程序用它替代「插件无法显示该文件」——把"环境缺设备"和"文件坏了"区分开。
+    QString lastError() const override;
+
 signals:
     void showVideo(char *szFileData, qint64 nFileLen);
 
 protected:
     bool showFile(const PluginFile &file) override;
+
+private:
+    // 打开失败后的统一收尾：复位播放控件 + 把真实原因留在画面区。
+    // 返回 false（= 未处理），供 showFile/sendFileByPath/sendFileMapped 直接 return。
+    bool reportOpenFailure();
 };
 
 #endif // PLUGINMEDIA_H

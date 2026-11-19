@@ -1,9 +1,12 @@
 #include "slidesdocument.h"
 
+#include <QBuffer>
 #include <QDomDocument>
 #include <QDomElement>
 #include <QHash>
 #include <QDebug>
+#include <QImageReader>
+#include <QSize>
 #include <QStringList>
 #include <algorithm>
 #include <functional>
@@ -19,6 +22,13 @@ constexpr double kEmuPerPt    = 12700.0;      // 1pt = 12700 EMU
 constexpr qint64 kMaxImageBytes = 32LL * 1024 * 1024;
 constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;   // 整份文档累计解码预算
 constexpr qint64 kMaxSlidesTextChars = 20LL * 1000 * 1000;      // 整份文档累计正文字符
+// P1-13：递归遍历的结构深度与单文档访问元素总量上限（与 xmlguard 的 50 万标签同量级）
+constexpr int    kMaxXmlDepth     = 200;
+constexpr int    kMaxVisitedNodes = 500000;
+// P1-14：解码前的图片尺寸/内存预检（QImage 按 4 字节/像素估算解码后占用）
+constexpr qint64 kMaxImagePixels       = 40000000LL;            // 40 MP
+constexpr qint64 kMaxImageDecodeBytes  = 160LL * 1024 * 1024;   // 单图解码后约 160 MiB
+constexpr qint64 kMaxImageDecodeNoSize = 32LL * 1024 * 1024;    // 读不到尺寸时只允许小文件解码
 
 QString esc(const QString &s)
 {
@@ -105,6 +115,39 @@ bool chargeDecodeBudget(qint64 *used, const QImage &img)
     return true;
 }
 
+// ---- P1-14：解码前的图片尺寸/内存预检 ----
+// 只限制压缩字节挡不住「解压炸弹」：几 KB 的 PNG 头可以声明几万×几万像素，
+// QImage::fromData 会直接分配数 GB 像素。这里先用 QImageReader 只读元数据。
+enum class ImageGate { Ok, NoSize, TooLarge };
+
+ImageGate precheckImage(const QByteArray &bytes, QSize *size)
+{
+    if (size) *size = QSize();
+    if (bytes.isEmpty()) return ImageGate::NoSize;
+
+    QByteArray data = bytes;          // QByteArray 隐式共享：这里只读，不会复制内容
+    QBuffer device(&data);
+    if (!device.open(QIODevice::ReadOnly)) return ImageGate::NoSize;
+    QImageReader reader(&device);
+    reader.setDecideFormatFromContent(true);   // zip 条目名不可信，按内容判断格式
+    if (!reader.canRead()) return ImageGate::NoSize;
+
+    const QSize sz = reader.size();
+    if (size) *size = sz;
+    if (!sz.isValid() || sz.width() <= 0 || sz.height() <= 0) return ImageGate::NoSize;
+
+    const qint64 pixels = qint64(sz.width()) * qint64(sz.height());
+    if (pixels > kMaxImagePixels) return ImageGate::TooLarge;
+    if (pixels * 4 > kMaxImageDecodeBytes) return ImageGate::TooLarge;
+    return ImageGate::Ok;
+}
+
+// P1-15：媒体路径归一化成负缓存/正缓存用的键（统一小写，避免大小写差异绕过缓存）
+QString mediaKeyOf(const QString &mediaPath)
+{
+    return mediaPath.trimmed().toLower();
+}
+
 QString attrOf(const QDomElement &el, const QString &name)
 {
     return el.isNull() ? QString() : el.attribute(name);
@@ -118,10 +161,19 @@ void SlidesDocument::reset()
     m_slides.clear();
     m_images.clear();
     m_imageByKey.clear();
+    m_failedImages.clear();
     m_kind.clear();
     m_imageSeq = 0;
     m_truncated = false;
+    m_truncatedReason.clear();
     m_ok = false;
+}
+
+// 截断记账（保留第一次的原因，P1-9/P2-9：不再静默丢内容）
+void SlidesDocument::markTruncated(const QString &reason)
+{
+    m_truncated = true;
+    if (m_truncatedReason.isEmpty() && !reason.isEmpty()) m_truncatedReason = reason;
 }
 
 QString SlidesDocument::normalizePath(const QString &baseDir, const QString &rel) const
@@ -129,13 +181,59 @@ QString SlidesDocument::normalizePath(const QString &baseDir, const QString &rel
     return joinPath(baseDir, rel);
 }
 
+// P1-15：按 zip 内路径取图。命中缓存就直接复用（不再解压）；
+// 命中负缓存直接放弃（不再解压/解码）；都没有才解压。重复引用的图片因此只付一次成本。
+void SlidesDocument::addImageFromZip(const QString &mediaPath, double wPt, double hPt,
+                                     Block *block, bool *pbNewDecoded)
+{
+    if (pbNewDecoded) *pbNewDecoded = false;
+    if (block == nullptr || mediaPath.isEmpty()) return;
+
+    const QString key = mediaKeyOf(mediaPath);
+    if (key.isEmpty()) return;
+
+    // 1) 已判定不可用：直接跳过（无效格式/超大/超预算/解压失败都记在这里）
+    if (m_failedImages.contains(key)) return;
+
+    // 2) 已解码过：复用 URL，不再 m_zip.entry()
+    const auto hit = m_imageByKey.constFind(key);
+    if (hit != m_imageByKey.constEnd())
+    {
+        const QString sExisting = hit.value();
+        const QImage &img = m_images[sExisting];
+        block->imageUrl = sExisting;
+        const double w = qBound(1.0, wPt > 0.0 ? wPt : 240.0, 10000.0);
+        const double h = qBound(1.0, hPt > 0.0 ? hPt
+                                               : (w * img.height() / qMax(1, img.width())),
+                                10000.0);
+        block->imgW = w;
+        block->imgH = h;
+        return;
+    }
+
+    // 3) 缓存未命中：这时才解压（原实现在调用 addImage 之前就 m_zip.entry() 了）
+    if (!m_zip.contains(mediaPath))
+    {
+        m_failedImages.insert(key);
+        return;
+    }
+    const QByteArray bytes = m_zip.entry(mediaPath);
+    if (bytes.isEmpty() || bytes.size() > kMaxImageBytes)
+    {
+        m_failedImages.insert(key);       // 解压失败或压缩字节超限
+        markTruncated(QStringLiteral("内嵌图片体积过大或无法解压"));
+        return;
+    }
+    addImage(bytes, wPt, hPt, block, key, pbNewDecoded);
+}
+
 void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, Block *block,
                               const QString &sKey, bool *pbNewDecoded)
 {
     if (pbNewDecoded) *pbNewDecoded = false;
-    if (bytes.isEmpty() || bytes.size() > kMaxImageBytes || block == nullptr) return;
+    if (block == nullptr) return;
 
-    const QString sCacheKey = sKey.toLower();
+    const QString sCacheKey = mediaKeyOf(sKey);
     // 同一 zip 图片被多页/多次 a:blip 引用时复用已有 URL，不重复解码。
     if (!sCacheKey.isEmpty() && m_imageByKey.contains(sCacheKey))
     {
@@ -151,8 +249,45 @@ void SlidesDocument::addImage(const QByteArray &bytes, double wPt, double hPt, B
         return;
     }
 
+    if (bytes.isEmpty() || bytes.size() > kMaxImageBytes)
+    {
+        if (!sCacheKey.isEmpty()) m_failedImages.insert(sCacheKey);
+        return;
+    }
+
+    // ---- P1-14：解码前的尺寸/内存预检 ----
+    QSize size;
+    const ImageGate gate = precheckImage(bytes, &size);
+    if (gate == ImageGate::TooLarge)
+    {
+        if (!sCacheKey.isEmpty()) m_failedImages.insert(sCacheKey);   // 负缓存
+        markTruncated(QStringLiteral("图片像素超过上限"));
+        return;
+    }
+    if (gate == ImageGate::NoSize && bytes.size() > kMaxImageDecodeNoSize)
+    {
+        if (!sCacheKey.isEmpty()) m_failedImages.insert(sCacheKey);
+        markTruncated(QStringLiteral("图片无法预检尺寸且体积过大"));
+        return;
+    }
+    if (gate == ImageGate::Ok)
+    {
+        const qint64 estimate = qint64(size.width()) * qint64(size.height()) * 4;
+        if (estimate > kMaxImageDecodeBytes)
+        {
+            if (!sCacheKey.isEmpty()) m_failedImages.insert(sCacheKey);
+            markTruncated(QStringLiteral("图片解码内存超过预算"));
+            return;
+        }
+    }
+
     const QImage img = QImage::fromData(bytes);
-    if (img.isNull()) return;      // WMF/EMF 等 Qt 不能直接解码的格式
+    if (img.isNull())
+    {
+        // WMF/EMF 等 Qt 不能直接解码的格式：记入负缓存，不再重复尝试
+        if (!sCacheKey.isEmpty()) m_failedImages.insert(sCacheKey);
+        return;
+    }
 
     const QString url = m_urlPrefix + QString::number(++m_imageSeq);
     m_images.insert(url, img);
@@ -216,20 +351,24 @@ bool SlidesDocument::parsePptx(QString *error)
     // 页序：p:sldIdLst/p:sldId r:id
     QStringList slidePaths;
     QDomElement sldIdLst;
-    std::function<void(const QDomElement &)> findList = [&](const QDomElement &el) {
+    // P1-13：递归下钻带深度 + 访问元素总量上限
+    int nVisited = 0;
+    std::function<void(const QDomElement &, int)> findList = [&](const QDomElement &el, int nDepth) {
         if (!sldIdLst.isNull()) return;
+        if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+        if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
         if (el.tagName() == QLatin1String("p:sldIdLst")) { sldIdLst = el; return; }
         for (QDomElement c = el.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-            findList(c);
+            findList(c, nDepth + 1);
     };
-    findList(pres.documentElement());
+    findList(pres.documentElement(), 0);
 
     // 先按 kMaxSlides 截断再查表：畸形文档的 sldId 数量不受限，逐个处理会拖死 UI
     int sldIdCount = 0;
     for (QDomElement e = sldIdLst.firstChildElement(QStringLiteral("p:sldId")); !e.isNull();
          e = e.nextSiblingElement(QStringLiteral("p:sldId")))
     {
-        if (++sldIdCount > kMaxSlides) { m_truncated = true; break; }
+        if (++sldIdCount > kMaxSlides) { markTruncated(QStringLiteral("幻灯片数量超过上限")); break; }
         const QString target = presRelTargets.value(e.attribute(QStringLiteral("r:id")));
         if (target.isEmpty()) continue;
         const bool bAbsoluteTarget = target.trimmed().startsWith(QLatin1Char('/'));
@@ -262,8 +401,12 @@ bool SlidesDocument::parsePptx(QString *error)
         const QHash<QString, QString> slideRelTargets = parseRels(slideRels);
 
         // 收集所有 p:sp / p:pic（含图片）
-        std::function<void(const QDomElement &)> walk = [&](const QDomElement &el) {
-            if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
+        // P1-13：主遍历带结构深度与访问元素总量上限；find* 下钻只加深度限制
+        // （它们的搜索范围就是一个形状的子树，已随 walk 计过数）。
+        std::function<void(const QDomElement &, int)> walk = [&](const QDomElement &el, int nDepth) {
+            if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); return; }
+            if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+            if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
 
             const QString tag = el.tagName();
             if (tag == QLatin1String("p:sp") || tag == QLatin1String("p:pic")
@@ -271,7 +414,9 @@ bool SlidesDocument::parsePptx(QString *error)
             {
                 // 位置：a:off x/y + a:ext cx/cy（用来近似阅读顺序与图片尺寸）
                 double x = 0.0, y = 0.0, cx = 0.0, cy = 0.0;
-                std::function<void(const QDomElement &)> findXfrm = [&](const QDomElement &e) {
+                std::function<void(const QDomElement &, int)> findXfrm =
+                    [&](const QDomElement &e, int d) {
+                    if (d > kMaxXmlDepth) return;
                     if (e.tagName() == QLatin1String("a:xfrm"))
                     {
                         const QDomElement off = e.firstChildElement(QStringLiteral("a:off"));
@@ -283,13 +428,15 @@ bool SlidesDocument::parsePptx(QString *error)
                         return;
                     }
                     for (QDomElement c = e.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-                        findXfrm(c);
+                        findXfrm(c, d + 1);
                 };
-                findXfrm(el);
+                findXfrm(el, 0);
 
                 // 是否标题占位符
                 bool isTitle = false;
-                std::function<void(const QDomElement &)> findPh = [&](const QDomElement &e) {
+                std::function<void(const QDomElement &, int)> findPh =
+                    [&](const QDomElement &e, int d) {
+                    if (d > kMaxXmlDepth) return;
                     if (e.tagName() == QLatin1String("p:ph"))
                     {
                         const QString type = e.attribute(QStringLiteral("type"));
@@ -298,16 +445,18 @@ bool SlidesDocument::parsePptx(QString *error)
                         return;
                     }
                     for (QDomElement c = e.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-                        findPh(c);
+                        findPh(c, d + 1);
                 };
-                findPh(el);
+                findPh(el, 0);
 
                 if (tag == QLatin1String("p:pic"))
                 {
-                    std::function<void(const QDomElement &)> findBlip = [&](const QDomElement &e) {
+                    std::function<void(const QDomElement &, int)> findBlip =
+                        [&](const QDomElement &e, int d) {
                         // 达到块预算后不再解压后续图片：只挡 append 的话，
                         // 重复引用仍会反复 inflate 同一图片。
-                        if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
+                        if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); return; }
+                        if (d > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
                         if (e.tagName() == QLatin1String("a:blip"))
                         {
                             const QString rid = e.attribute(QStringLiteral("r:embed"));
@@ -318,36 +467,42 @@ bool SlidesDocument::parsePptx(QString *error)
                                 Block b;
                                 b.order = y * 100000.0 + x;
                                 bool bNewDecoded = false;
-                                addImage(m_zip.entry(mediaPath), cx / kEmuPerPt, cy / kEmuPerPt,
-                                         &b, mediaPath, &bNewDecoded);
+                                // P1-15：这里只传路径，缓存/负缓存都在 addImageFromZip 里先判断，
+                                // 命中时不再 m_zip.entry()（原实现无条件先解压再查缓存）。
+                                addImageFromZip(mediaPath, cx / kEmuPerPt, cy / kEmuPerPt,
+                                                &b, &bNewDecoded);
                                 if (bNewDecoded && !b.imageUrl.isEmpty()
                                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                                 {
-                                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删
+                                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删。
+                                    // P1-15：同时记入负缓存，后续引用不再解压/解码。
                                     m_images.remove(b.imageUrl);
-                                    m_imageByKey.remove(mediaPath.toLower());
+                                    m_imageByKey.remove(mediaKeyOf(mediaPath));
+                                    m_failedImages.insert(mediaKeyOf(mediaPath));
                                     b.imageUrl.clear();
-                                    m_truncated = true;
+                                    markTruncated(QStringLiteral("图片解码内存超过预算"));
                                 }
                                 if (!b.imageUrl.isEmpty())
                                 {
                                     // 图片分支同样受块预算约束：同一 rId 重复引用时
                                     // 缓存不再解码、也不消耗解码预算，但仍会每引用一次追加一个 Block。
-                                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
+                                    if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); return; }
                                     slide.blocks.append(b);
                                 }
                             }
                             return;
                         }
                         for (QDomElement c = e.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-                            findBlip(c);
+                            findBlip(c, d + 1);
                     };
-                    findBlip(el);
+                    findBlip(el, 0);
                 }
                 else
                 {
                     // 文本框：p:txBody/a:p（段落），每个段落一个 Block
-                    std::function<void(const QDomElement &)> findTxBody = [&](const QDomElement &e) {
+                    std::function<void(const QDomElement &, int)> findTxBody =
+                        [&](const QDomElement &e, int d) {
+                        if (d > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
                         if (e.tagName() == QLatin1String("p:txBody") || e.tagName() == QLatin1String("a:txBody"))
                         {
                             for (QDomElement p = e.firstChildElement(QStringLiteral("a:p")); !p.isNull();
@@ -378,9 +533,9 @@ bool SlidesDocument::parsePptx(QString *error)
                                     }
                                 }
                                 if (text.trimmed().isEmpty()) continue;
-                                if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                                if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); break; }
                                 totalTextChars += text.size();
-                                if (totalTextChars > kMaxSlidesTextChars) { m_truncated = true; break; }
+                                if (totalTextChars > kMaxSlidesTextChars) { markTruncated(QStringLiteral("正文字符总数超过上限")); break; }
                                 Block b;
                                 b.text = text;
                                 b.sizePt = sizePt;
@@ -392,21 +547,23 @@ bool SlidesDocument::parsePptx(QString *error)
                             return;
                         }
                         for (QDomElement c = e.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-                            findTxBody(c);
+                            findTxBody(c, d + 1);
                     };
-                    findTxBody(el);
+                    findTxBody(el, 0);
                 }
                 return;
             }
 
             for (QDomElement c = el.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-                walk(c);
+                walk(c, nDepth + 1);
         };
-        walk(slideDoc.documentElement());
+        walk(slideDoc.documentElement(), 0);
 
         std::stable_sort(slide.blocks.begin(), slide.blocks.end(),
                          [](const Block &a, const Block &b) { return a.order < b.order; });
         m_slides.append(slide);
+        // P1-13：整份文档的元素预算已用尽，后续页不再解析（避免一串空白页）
+        if (nVisited > kMaxVisitedNodes) break;
     }
 
     m_ok = !m_slides.isEmpty();
@@ -430,14 +587,18 @@ bool SlidesDocument::parseOdp(QString *error)
     if (!doc.setContent(odpXml))
         return fail(QStringLiteral("无法解析 ODP 的 content.xml。"));
 
+    // P1-13：递归遍历带深度 + 访问元素总量上限（整份 ODP 共用一个计数）
+    int nVisited = 0;
     QVector<QDomElement> pages;
-    std::function<void(const QDomElement &)> findPages = [&](const QDomElement &el) {
+    std::function<void(const QDomElement &, int)> findPages = [&](const QDomElement &el, int nDepth) {
         if (pages.size() >= kMaxSlides) return;
+        if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+        if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
         if (el.tagName() == QLatin1String("draw:page")) { pages.append(el); return; }
         for (QDomElement c = el.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
-            findPages(c);
+            findPages(c, nDepth + 1);
     };
-    findPages(doc.documentElement());
+    findPages(doc.documentElement(), 0);
     if (pages.isEmpty())
         return fail(QStringLiteral("ODP 里找不到 draw:page。"));
 
@@ -452,7 +613,8 @@ bool SlidesDocument::parseOdp(QString *error)
         for (QDomElement frame = page.firstChildElement(QStringLiteral("draw:frame")); !frame.isNull();
              frame = frame.nextSiblingElement(QStringLiteral("draw:frame")))
         {
-            if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+            if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); break; }
+            if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); break; }
 
             double wPt = 0.0, hPt = 0.0;
             // svg:width/height 是长度值（数字 + 可选单位）。先把单位后缀摘下来再解析数字，
@@ -486,7 +648,7 @@ bool SlidesDocument::parseOdp(QString *error)
             for (QDomElement img = frame.firstChildElement(QStringLiteral("draw:image")); !img.isNull();
                  img = img.nextSiblingElement(QStringLiteral("draw:image")))
             {
-                if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); break; }
                 QString href = img.attribute(QStringLiteral("xlink:href")).trimmed();
                 while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
                 // ODF 的 xlink:href 是 IRI：空格/非 ASCII 写成 %XX，
@@ -495,19 +657,22 @@ bool SlidesDocument::parseOdp(QString *error)
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
                 bool bNewDecoded = false;
-                addImage(m_zip.entry(href), wPt, hPt, &b, href, &bNewDecoded);
+                // P1-15：先查缓存/负缓存，未命中才解压
+                addImageFromZip(href, wPt, hPt, &b, &bNewDecoded);
                 if (bNewDecoded && !b.imageUrl.isEmpty()
                     && !chargeDecodeBudget(&decodedBytes, m_images.value(b.imageUrl)))
                 {
-                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删
+                    // 超整份文档的累计解码预算：丢弃新图；缓存命中的共享图不能删。
+                    // P1-15：记入负缓存，后续引用不再解压/解码。
                     m_images.remove(b.imageUrl);
-                    m_imageByKey.remove(href.toLower());
+                    m_imageByKey.remove(mediaKeyOf(href));
+                    m_failedImages.insert(mediaKeyOf(href));
                     b.imageUrl.clear();
-                    m_truncated = true;
+                    markTruncated(QStringLiteral("图片解码内存超过预算"));
                 }
                 if (!b.imageUrl.isEmpty())
                 {
-                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                    if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); break; }
                     slide.blocks.append(b);
                 }
             }
@@ -519,25 +684,28 @@ bool SlidesDocument::parseOdp(QString *error)
                 // 正文可能在 text:list/list-item、表格或 draw:g 内；递归收集段落，
                 // 不再只取 text-box 的直接子 text:p。
                 QVector<QDomElement> paras;
-                std::function<void(const QDomElement &)> collectParas = [&](const QDomElement &parent) {
+                std::function<void(const QDomElement &, int)> collectParas =
+                    [&](const QDomElement &parent, int nDepth) {
+                    if (nDepth > kMaxXmlDepth) { markTruncated(QStringLiteral("文档结构过深")); return; }
+                    if (++nVisited > kMaxVisitedNodes) { markTruncated(QStringLiteral("文档结构过大")); return; }
                     for (QDomElement c = parent.firstChildElement(); !c.isNull(); c = c.nextSiblingElement())
                     {
                         const QString tag = c.tagName();
                         if (tag == QLatin1String("text:p") || tag == QLatin1String("text:h"))
                             paras.append(c);
                         else
-                            collectParas(c);
+                            collectParas(c, nDepth + 1);
                     }
                 };
-                collectParas(box);
+                collectParas(box, 0);
                 for (const QDomElement &p : paras)
                 {
                     const bool heading = (p.tagName() == QLatin1String("text:h"));
                     const QString text = p.text().trimmed();
                     if (text.isEmpty()) continue;
-                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                    if (slide.blocks.size() >= kMaxBlocks) { markTruncated(QStringLiteral("单页内容块超过上限")); break; }
                     totalTextChars += text.size();
-                    if (totalTextChars > kMaxSlidesTextChars) { m_truncated = true; break; }
+                    if (totalTextChars > kMaxSlidesTextChars) { markTruncated(QStringLiteral("正文字符总数超过上限")); break; }
                     Block b;
                     b.text = text;
                     b.title = heading;
@@ -549,6 +717,8 @@ bool SlidesDocument::parseOdp(QString *error)
         }
 
         m_slides.append(slide);
+        // P1-13：整份文档的元素预算已用尽，后续页不再解析（避免一串空白页）
+        if (nVisited > kMaxVisitedNodes) break;
     }
 
     m_ok = !m_slides.isEmpty();
@@ -604,7 +774,13 @@ SlidesDocument::RenderResult SlidesDocument::render(double fontScale) const
     }
 
     if (m_truncated)
-        out << QStringLiteral("<p><i>（演示文稿过大，仅显示前一部分内容）</i></p>");
+    {
+        // P1-9 / P2-9：把触发原因（页数/内容块/图片/结构上限）写进最终 HTML，
+        // 而不是只置一个上层看不到的布尔量
+        const QString why = m_truncatedReason.isEmpty()
+                ? QStringLiteral("演示文稿过大") : m_truncatedReason;
+        out << QStringLiteral("<p><i>（%1，仅显示前一部分内容）</i></p>").arg(esc(why));
+    }
 
     res.html = out.join(QString());
     return res;

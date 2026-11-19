@@ -54,6 +54,11 @@ public:
 
     static PluginManager *getInstance();
 
+    // P0-3：宿主存在「停播未确认」的插件实例时，禁止卸载/重载 DLL。
+    // 进程退出阶段由 MainWindow 调用 false，PluginManager 析构会跳过 unload。
+    void setUnloadEnabled(bool bEnabled);
+    bool isUnloadEnabled() const { return m_bUnloadEnabled; }
+
     void loadAllPlugins();
 
     PluginInterface* getInterface(QString sPluginPath);
@@ -137,6 +142,7 @@ private:
     // 已加载成功但被拒（接口不符 / 版本自查不符）的 loader：对象已创建，
     // 销毁 loader 会尝试卸载 DLL，导致对象虚表悬空 —— 只能留着。
     QList<QPluginLoader *>          m_listRejectedLoaders;
+    bool                            m_bUnloadEnabled = true;   // P0-3
 };
 
 #endif // PLUGINMANAGER_H
