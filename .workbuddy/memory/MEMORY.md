@@ -51,10 +51,16 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下有 171 项断言的插件测试套件，
+- **回归测试在仓库里（C4）**：`tests/` 下插件测试套件（当前基线 194 PASS / 3 SKIP），
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
+  ⚠️ **验证 runner 退出码必须用独立子进程**：不要在 PowerShell 工具里用
+  `& runner.ps1 2>&1 | Out-File ...` —— PS 5.1 在 `2>&1` 重定向下会把测试程序写 stderr
+  的 `[INFO]` 当终止错误，误报 `EXITCODE=1`（第三轮两维度踩过，白查半天）。
+  正确做法：写脚本用 `Start-Process -RedirectStandardOutput/-RedirectStandardError -Wait -PassThru`
+  启动 `powershell -File runner.ps1`，再读 `$p.ExitCode`（若遇 HTTPS_PROXY 大小写冲突，
+  先清空 `$env:HTTPS_PROXY`/`$env:HTTP_PROXY`）。
 - **测试里加载插件只从 `<exe>/plugins`**（PluginManager 用的那一份），用
   `QPluginLoader` 取模板 + `createInstance()` 渲染 + 显式 `delete`；
   **绝不能从另一个路径再加载同一个 DLL** —— Windows 会当成两个模块，
@@ -201,3 +207,62 @@
   已加载归档时加载新归档会先确认"关闭所有标签页"。
 - **可运行打包**：`FileWrapper/deploy/package.ps1`（复制依赖后跑 windeployqt，
   产出可直接双击的目录；构建目录本身不可双击运行）。
+  ⚠️ 该脚本守卫缺 `OutDir==repoRoot` 判断：build 树在仓库外、`-OutDir` 指仓库根
+  并带 `-Overwrite` 时会递归删库（第三轮 P1，见下）。
+- **全工程审计历史**：仓库根 `CODE_AUDIT_FINAL_2026-11-18.md`（43 项）、
+  `CODE_AUDIT_CYCLE2_2026-11-18.md`（109 项）、`CODE_AUDIT_CYCLE3_2026-11-19.md`（16 项，
+  HEAD=28dbbe5，P1 为 package.ps1 删库）。前两轮项已在 52 个 audit/audit2 提交中修复；
+  第三轮主要是修复引入的回归（CRC 后台校验生命周期、d28b3d4/72bf3fa/38d3476）
+  与"上限只覆盖主路径"家族（rels/findBlip/OPC Target 百分号解码）。
+  修复同类问题时优先查"缓存集合生命周期""辅助路径是否漏检""失败分支是否复位"。
+
+## 2026-11-19 审查改进（P0 全修 / P1、P2 大部）实施笔记
+- 报告与逐项状态见仓库根 **`AUDIT_2026-11-19_FIX_REPORT.md`**（对应
+  `FileWrapper_代码审查与改进建议_2026-11-19.md`，P0×5/P1×24/P2×17）。
+- **归档写入不变量**（后续改 filemanager 必须保持）：
+  - 临时/备份文件一律"随机名 + NewOnly 原子创建"，由 `OwnedAuxFiles` 登记，
+    **禁止**再出现 `<输出>.tmp.fwda`/`.bak.fwda` 这种固定名或预删路径；
+  - 保存/合并顺序：唯一备份 → 换入 → **重新解析成功** → 删备份；失败回滚，
+    回滚失败要把备份绝对路径告诉用户；
+  - 跨进程锁是自实现的 `<输出>.fwdalock`（NewOnly+PID+30s 陈旧），**不要换回
+    QLockFile**：受限权限/沙箱下它返回 PermissionError，会把正常保存全挡死；
+  - 墓碑式原地快速删除已停用（`markDeletedOnly` 保留但无调用）；大归档删除会重写内容区，
+    若要恢复必须先做写前日志 + 启动恢复。
+- **标签/实例生命周期**：`MainWindow::ensureInstanceStopped()` 是唯一停止入口；
+  `stopPlaybackAndWait()==false` 的实例进 `m_setStopUnsafe`/延期队列，映射/实例/loader
+  全部保留，`PluginManager::setUnloadEnabled(false)` 禁止 unload。标签下标不再是身份：
+  一律走 `docIndexForTab()`（按插件窗口指针），`tabMoved` 会同步 `m_vTabDocs`。
+- **媒体线程**：`m_videoThread` 无父对象，只有 doDecode 退出 + 事件循环 wait 成功才 delete；
+  解码任务签名是 `doDecodeRun(quint64 runId)`，与 `m_contextRunId`/`m_runId` 绑定，
+  换文件/停止要 `invalidateDecodeRun()`；`AVIOInterruptCB` 通过 `m_ioInterrupt` 取消阻塞 I/O。
+- **插件资源预算**：`ZipReader` 自带 `ParseBudget`（单条 64 MiB/累计 256 MiB/提取次数），
+  stored 与 deflate 同入口并按 central CRC 校验；Word/Sheet/Slides 有 200 层 XML 深度 +
+  50 万节点 + 输出字符预算；图片先 `QImageReader::size()` 预算再解码。
+- **构建**：`plugin_common.pri` 不再 touch 源码头文件 → 只读源码可构建；代价是
+  **改插件 JSON 后要重跑 qmake**（不会自动重嵌元数据）。
+- **测试**：新增 `AUDIT-2026-11` 组（11 条）与 `FW_TEST_SETTINGS_DIR` /
+  `FW_TEST_SCRATCH_DIR` 覆盖入口。沙箱下 `QTemporaryDir` 会把目录 ACL 收成 owner-only，
+  测试进程反而写不进去 → 受限环境必须用这两个环境变量指向预创建的可写目录。
+  无音频设备时 V13 断言"纯音频明确失败并复位界面"；D6 在沙箱按环境 SKIP。
+- **验证基线**：全量构建 0 error；`plugin_tests --integrate` = 226 PASS / 0 FAIL / 0 SKIP
+  （`-SkipShots` 为 223 PASS + 3 SKIP；数字随用例增长，以 `tests/build/logs/plugin_tests.log` 为准）。
+
+## 2026-11-19 插件失败信息（接口 v6）
+- **起因（用户报的真实问题）**：打开 `1.dat` 里的 `audio.wav` 时提示「插件无法显示该文件：audio.wav」，
+  日志却是 `[ShowVideo] 音频设备启动失败（纯音频）: 1`。查下来是这台机器 **没有可用的音频输出设备**
+  （注册表里 3 个 Render 端点全是 `DeviceState=4/8`：不存在/未插入），被界面说成了"文件坏了"。
+- **接口**：`PluginInterface::lastError()`（PLUGIN_API_VERSION 5→6，8 个插件 JSON 同步 `apiVersion:6`）。
+  约定：空串 = 没提供原因，宿主退回通用提示；非空 = 插件**已自行复位界面**并写了说明，
+  宿主不要再 `sendFileData(nullptr, 0)` 清屏；每次新的打开尝试插件必须清空上一次的原因。
+- **PluginMedia**：所有失败出口走 `failOpen(短原因, 明细)`；纯音频 + 音频输出不可用 = 明确失败
+  （`QMediaDevices::defaultAudioOutput()` 为空 / 格式不支持 / 启动失败三种原因分开说），
+  带视频 = 无声降级并在状态栏说明；明细同时写进画面区（`showFailurePage()`）——
+  状态栏消息 10 秒后消失，用户回头看标签页不能只剩一块黑屏。
+- **判设备用 QMediaDevices，不要只看 `QAudioSink::start()==nullptr` + `error()`**：
+  error=1（OpenError）把"没有设备/被独占/格式不支持/音频服务没起"全压成一个数字。
+- **宿主**：`MainWindow::pluginFailureText()` 统一文案——有原因写「无法打开 X：原因」，
+  没原因才回落到老的「插件无法显示该文件」；映射通道/临时文件通道失败时也先看 `lastError()`，
+  避免插件已经报出真实原因、宿主还拿「文件过大…无法通过文件路径读取」敷衍。
+- **测试**：V13 扩展为 V13/V13b–f（无设备分支断言原因与画面区文案；坏媒体文件与声卡无关地覆盖同样两条），
+  A11a/b 断言宿主文案。`tests/build` 在旧沙箱里是只读的（应用目录 ACL 收紧），
+  受限环境跑测试要给 `TEMP`/`TMP` 指到可写目录，否则 H10–H14/H19 会因 `QDir::tempPath()` 不可写而假失败。
