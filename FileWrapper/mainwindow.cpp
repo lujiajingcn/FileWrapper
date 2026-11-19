@@ -46,6 +46,9 @@
 #include <QLineEdit>
 #include <QTimer>
 #include <QEventLoop>
+#include <QFile>
+#include <QMutexLocker>
+#include <QDeadlineTimer>
 #include <utility>          // std::move（C2：把读到的 QByteArray 移动进 PluginFile）
 #include <cstring>          // std::memcmp（合并前探测已合并归档）
 
@@ -471,6 +474,12 @@ void MainWindow::closeAllTabs()
     // 旧归档的临时副本已无人使用，立即回收磁盘（避免反复加载大归档堆积 GB 级副本）
     discardTempCache();
     releaseAllMappedInputs();
+
+    // 归档/标签页重置：CRC 缓存以展示路径为键，跨归档会碰撞（同名但内容不同的
+    // 大文件会被误判为已校验）；推进代数让仍在飞的后台校验结果不再写回。
+    ++m_nArchiveEpoch;
+    m_setMappedCrcPending.clear();
+    m_setMappedCrcVerified.clear();
 
     m_pCurrentInterface = nullptr;
 
@@ -1253,7 +1262,8 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
                         && !m_setMappedCrcPending.contains(info.sFilePath))
                     {
                         m_setMappedCrcPending.insert(info.sFilePath);
-                        checkMappedCrcAsync(info.sFilePath, sp, nExpected);
+                        checkMappedCrcAsync(info.sFilePath, info.nContentPositon,
+                                            info.nFileLen, nExpected);
                     }
                     return;
                 }
@@ -1355,31 +1365,90 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     // sendFile() 返回 false 表示插件明确放弃（格式不支持/解码失败），
     // 宿主必须给出可见提示，不能只留空白画面。
     if (!iface->sendFile(PluginFile::fromMemory(std::move(data), info.sFileName)))
+    {
+        // 与同函数其它失败出口一致：插件已明确放弃，必须复位内容区，
+        // 否则第三方插件不自清时会残留上一个文件的内容。
+        iface->sendFileData(nullptr, 0);
+        syncActionStates();
         onFileManagerWarning(tr("插件无法显示该文件：%1").arg(info.sFileName));
+    }
     // 新内容已生效：旧的内存映射不再被插件引用，可以释放（Windows 下不释放会阻止归档重写）
     releaseMappedInput(iface);
 }
 
-void MainWindow::checkMappedCrcAsync(const QString &sPath,
-                                     const QSharedPointer<MappedInput> &mapped,
-                                     quint32 nExpected)
+void MainWindow::checkMappedCrcAsync(const QString &sPath, qint64 nPosition,
+                                     qint64 nLen, quint32 nExpected)
 {
+    // 后台线程自己打开归档读取内容区：QFile 在工作线程创建并销毁，不与主线程
+    // 共享 QObject。不捕获映射对象，避免映射在工作线程析构（跨线程 unmap + delete）。
+    // 代价是保存前必须等它读完：Windows 下仍打开的归档句柄会让 rename 失败。
+    const QString sArchive = m_fileManager->archivePath();
+    const quint64 nEpoch = m_nArchiveEpoch;
+    const QSharedPointer<MappedCrcGate> gate = m_crcGate;
+    {
+        QMutexLocker locker(&gate->mutex);
+        ++gate->inFlight;
+    }
     QPointer<MainWindow> self(this);
-    std::thread([self, sPath, mapped, nExpected]() {
-        FwArc::Crc32 crc;
-        crc.update(reinterpret_cast<const char *>(mapped->pData), mapped->nLen);
-        const bool bOk = (crc.value() == nExpected);
+    std::thread([self, gate, sArchive, sPath, nPosition, nLen, nExpected, nEpoch]() {
+        bool bOk = false;
+        bool bReadOk = false;
+        {
+            QFile f(sArchive);
+            if (f.open(QIODevice::ReadOnly) && f.seek(nPosition))
+            {
+                FwArc::Crc32 crc;
+                QByteArray buf(1 << 20, '\0');
+                qint64 nLeft = nLen;
+                bReadOk = true;
+                while (nLeft > 0)
+                {
+                    const qint64 n = f.read(buf.data(), qMin<qint64>(qint64(buf.size()), nLeft));
+                    if (n <= 0) { bReadOk = false; break; }
+                    crc.update(buf.constData(), n);
+                    nLeft -= n;
+                }
+                bOk = bReadOk && nLeft == 0 && crc.value() == nExpected;
+            }
+        }
+        // 句柄已随局部 QFile 关闭：计数器归零后主线程保存/改名才安全。
+        {
+            QMutexLocker locker(&gate->mutex);
+            if (--gate->inFlight == 0)
+                gate->idle.wakeAll();
+        }
         if (self.isNull()) return;
-        QMetaObject::invokeMethod(self.data(), [self, sPath, bOk]() {
+        QMetaObject::invokeMethod(self.data(), [self, sPath, bOk, bReadOk, nEpoch]() {
             if (self.isNull()) return;
+            if (nEpoch != self->m_nArchiveEpoch) return;   // 归档已切换：丢弃过期结果
             self->m_setMappedCrcPending.remove(sPath);
             if (bOk)
                 self->m_setMappedCrcVerified.insert(sPath);
+            else if (!bReadOk)
+                self->onFileManagerWarning(tr("读取归档内容失败，未能完成校验：%1")
+                                               .arg(QFileInfo(sPath).fileName()));
             else
                 self->onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
                                                .arg(QFileInfo(sPath).fileName()));
         }, Qt::QueuedConnection);
     }).detach();
+}
+
+bool MainWindow::waitForMappedCrc(int nTimeoutMs)
+{
+    const QSharedPointer<MappedCrcGate> gate = m_crcGate;
+    QElapsedTimer timer;
+    timer.start();
+    QMutexLocker locker(&gate->mutex);
+    while (gate->inFlight > 0)
+    {
+        const qint64 nLeft = qint64(nTimeoutMs) - timer.elapsed();
+        if (nLeft <= 0)
+            return false;
+        if (!gate->idle.wait(&gate->mutex, QDeadlineTimer(nLeft)))
+            return false;
+    }
+    return true;
 }
 
 void MainWindow::releaseMappedInput(PluginInterface *iface)
@@ -1672,6 +1741,13 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
 
     if (btn == QMessageBox::Save)
     {
+        // 后台 CRC 仍持有归档句柄时 rename 会失败：先等它结束（超时则明确提示）。
+        if (!waitForMappedCrc(15000))
+        {
+            QMessageBox::warning(this, tr("保存失败"),
+                tr("后台仍在校验归档内容，暂时无法保存。请稍等几秒后重试。"));
+            return false;
+        }
         // 保存会重写归档：先释放内存映射并停止播放（Windows 下映射中的文件不能改名）
         if (!m_mapMappedInputs.isEmpty())
         {
@@ -1767,6 +1843,10 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
 
     // 加载成功后重置所有已打开的文件标签页（旧归档的文件路径已失效）
     closeAllTabs();
+
+    // 换归档：上一份的树展开状态与路径同名的目录无关，不能套到新归档上
+    m_setExpandedTree.clear();
+    m_bResetTreeExpansion = true;
 
     populateFilePathView(m_bShowPath);
     syncActionStates();
@@ -1885,6 +1965,9 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
     // 空目录（或 exists 真但枚举失败）不能先 list.at(0)；
     // 同时用 canonical 路径 + 深度上限防止 junction/symlink 自指导致无限递归。
     QSet<QString> visited;
+    // 扫描在 UI 线程同步执行：必须定期泵事件，否则「取消」按钮的点击只能排队，
+    // 大目录扫描期间整个窗口无响应。计数跨递归共享，每 512 个条目处理一次。
+    int nVisited = 0;
     std::function<void(const QString &, int)> walk = [&](const QString &sCurrent, int nDepth) {
         if (nDepth > 64 || m_fileManager->isCancelRequested())
             return;
@@ -1906,6 +1989,12 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
         {
             if (m_fileManager->isCancelRequested())
                 return;
+            if ((++nVisited & 0x1FF) == 0)
+            {
+                QApplication::processEvents();
+                if (m_fileManager->isCancelRequested())
+                    return;
+            }
             if (!fi.isDir())
             {
                 if (!CheckFileExt(fi.fileName(), arrFileExts))
@@ -2174,11 +2263,19 @@ static qint64 finalizeTreeRows(QStandardItem *pParent)
 }
 
 void MainWindow::populateFilePathTree()
-{    // 先记录重建前已展开的目录，重建后恢复，避免增删一个文件导致整棵树被折叠
+{
+    // 先记录重建前已展开的目录，重建后恢复，避免增删一个文件导致整棵树被折叠。
+    // 换归档后（m_bResetTreeExpansion）不能沿用旧键：展开键是路径文本链，与归档无关，
+    // 直接把上一份的目录套到新归档上会"无端展开"。
+    const bool bResetExpansion = m_bResetTreeExpansion;
+    m_bResetTreeExpansion = false;
     const bool bWasEmpty = (m_hModelFilePath->rowCount() == 0);
     QSet<QString> setExpanded;
-    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
-        collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), setExpanded);
+    if (!bResetExpansion)
+    {
+        for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+            collectExpandedItems(m_hModelFilePath->index(i, 0), QString(), setExpanded);
+    }
 
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
 
@@ -2263,7 +2360,7 @@ void MainWindow::populateFilePathTree()
     applyCurrentSortToModel();
 
     // 展开状态：首次加载展开根与顶层；用户主动全折叠后刷新不得强制展开。
-    if (setExpanded.isEmpty() && bWasEmpty)
+    if (bResetExpansion || (setExpanded.isEmpty() && bWasEmpty))
     {
         m_tvFilePath->expandToDepth(0);
         if (pRoot != nullptr)
@@ -2719,6 +2816,15 @@ void MainWindow::onActionSaveFileTriggered()
         return;
     }
 
+    // 后台 CRC 仍在读归档时不能改名重写（Windows 共享冲突）：先等它结束；
+    // 超时给出明确提示，避免保存只报"被占用"却查不出原因。
+    if (!waitForMappedCrc(15000))
+    {
+        QMessageBox::warning(this, tr("保存文件"),
+            tr("后台仍在校验归档内容，暂时无法保存。\n请稍等几秒后重试。"));
+        return;
+    }
+
     // 有视频/音频正在直接读取归档（内存映射）时，保存需要先停止播放并释放映射：
     // Windows 下正在映射的文件无法被改名/替换，不释放会直接导致保存失败。
     if (!m_mapMappedInputs.isEmpty())
@@ -2861,6 +2967,9 @@ void MainWindow::on_actionUnloadFile_triggered()
 
     m_fileManager->unLoadMergedFile();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
+    // 卸载后模型已清空：树展开状态也一并作废，避免下次加载同名目录被无端展开
+    m_setExpandedTree.clear();
+    m_bResetTreeExpansion = true;
     m_tvFilePath->header()->setVisible(false);
     setWindowTitle(tr("文件查看器"));
     if (m_leFilter && !m_leFilter->text().isEmpty())

@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QStringList>
 #include <QRegularExpression>
+#include <QUrl>
 #include "xmlguard.h"
 
 namespace {
@@ -16,6 +17,7 @@ constexpr int kMaxCols    = 120;
 constexpr int kMaxCells   = 30000;
 constexpr int kMaxCellLen = 400;
 constexpr int kMaxXlsxCols = 16384;   // xlsx 列号上限（XFD，1 基），超过视为畸形引用
+constexpr int kMaxRelationships = 10000;   // 单个 .rels 条目上限（防 QDom 节点放大）
 
 
 QString odsCellText(const QDomElement &cell)
@@ -103,12 +105,19 @@ bool parseCellRef(const QString &ref, int *col, int *row)
 QHash<QString, QString> parseRels(const QByteArray &relsXml)
 {
     QHash<QString, QString> targets;
+    // 与其它 XML 部件同等的预算：rels 也可能被放大成几十万个节点。
+    if (!xmlWithinTagBudget(relsXml)) return targets;
     QDomDocument doc;
     if (!doc.setContent(relsXml)) return targets;
+    int nRel = 0;
     for (QDomElement e = doc.documentElement().firstChildElement(QStringLiteral("Relationship"));
          !e.isNull(); e = e.nextSiblingElement(QStringLiteral("Relationship")))
     {
-        targets.insert(e.attribute(QStringLiteral("Id")), e.attribute(QStringLiteral("Target")));
+        if (++nRel > kMaxRelationships) break;
+        // OPC 的 Target 是 IRI：部件名含空格/非 ASCII 时写成 %XX，
+        // 而 ZIP 条目名是解码后的字面值，查表前必须解码。
+        targets.insert(e.attribute(QStringLiteral("Id")),
+                       QUrl::fromPercentEncoding(e.attribute(QStringLiteral("Target")).toUtf8()));
     }
     return targets;
 }
@@ -267,10 +276,24 @@ bool SheetDocument::parseXlsx(QString *error)
             if (sheetList.size() >= kMaxSheets) { sheetListCapped = true; break; }
             const QString name = e.attribute(QStringLiteral("name"));
             const QString rid  = e.attribute(QStringLiteral("r:id"));
-            QString target = wbRelTargets.value(rid);
+            // OPC 的 Target 可以是包根绝对路径（/xl/... 或 /custom/...）：
+            // 绝对路径已是完整部件名，不能再补 "xl/"；相对路径才相对 workbook.xml 所在目录。
+            QString target = wbRelTargets.value(rid).trimmed();
+            target.replace(QLatin1Char('\\'), QLatin1Char('/'));
+            const bool bAbsolute = target.startsWith(QLatin1Char('/'));
             while (target.startsWith(QLatin1Char('/'))) target.remove(0, 1);
-            if (!target.isEmpty() && !target.startsWith(QLatin1String("xl/")))
-                target = QStringLiteral("xl/") + target;
+            const QStringList segs = target.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+            QStringList rel;
+            if (!bAbsolute
+                && (segs.isEmpty() || segs.first().compare(QLatin1String("xl"), Qt::CaseInsensitive) != 0))
+                rel << QStringLiteral("xl");
+            for (const QString &seg : segs)
+            {
+                if (seg == QLatin1String(".")) continue;
+                if (seg == QLatin1String("..")) { if (!rel.isEmpty()) rel.removeLast(); continue; }
+                rel.append(seg);
+            }
+            target = rel.join(QLatin1Char('/'));
             sheetList.append(qMakePair(name, target));
         }
     }

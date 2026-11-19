@@ -148,8 +148,10 @@ void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
         return;
 
     if (m_sws && outW.load(std::memory_order_relaxed) == newW
-                 && outH.load(std::memory_order_relaxed) == newH)
-        return;   // 尺寸没变，复用现有上下文
+                 && outH.load(std::memory_order_relaxed) == newH
+                 && m_swsSrcW == srcW && m_swsSrcH == srcH
+                 && m_swsSrcFmt == srcPixFmt)
+        return;   // 输出尺寸与源参数都没变，复用现有上下文
 
     if (m_sws) { sws_freeContext(m_sws); m_sws = nullptr; }
 
@@ -184,6 +186,9 @@ void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
     }
     outW.store(newW, std::memory_order_relaxed);
     outH.store(newH, std::memory_order_relaxed);
+    m_swsSrcW = srcW;
+    m_swsSrcH = srcH;
+    m_swsSrcFmt = srcPixFmt;
 }
 
 // 释放解码线程持有的 sws 上下文与输出缓冲。
@@ -452,11 +457,28 @@ void VideoWorker::doDecode()
                     // 既保证新帧按新尺寸输出，也不会出现「主线程释放旧缓冲、
                     // 解码线程还在 sws_scale」的 use-after-free。
                     const quint64 reqSize = m_reqOutSize.load(std::memory_order_relaxed);
+                    // 源分辨率/像素格式也可能在播放中变化（TS 自适应、拼接片段）：
+                    // 每帧与解码器当前帧对齐，变化时重建 sws。否则会用打开时的旧
+                    // srcH/旧源格式读 pFrame->data（越界读/花屏）；打开时 pix_fmt
+                    // 为 NONE 的码流也能在首帧到达后恢复出画。
+                    const bool bSrcChanged =
+                        (pFrame->width > 0 && pFrame->height > 0
+                         && (pFrame->width != srcW || pFrame->height != srcH
+                             || pFrame->format != int(m_srcPixFmt)));
+                    if (bSrcChanged)
+                    {
+                        srcW = pFrame->width;
+                        srcH = pFrame->height;
+                        m_srcPixFmt = AVPixelFormat(pFrame->format);
+                    }
+                    if (bSrcChanged && reqSize == 0)
+                        continue;   // 还没有可用的输出尺寸：不能拿旧 sws 配新源参数
                     if (reqSize != 0)
                     {
                         const int reqW = int(reqSize & 0xffffffffu);
                         const int reqH = int(reqSize >> 32);
-                        if (reqW != outW.load(std::memory_order_relaxed)
+                        if (bSrcChanged
+                         || reqW != outW.load(std::memory_order_relaxed)
                          || reqH != outH.load(std::memory_order_relaxed))
                             rebuildVideoSws(srcW, srcH, m_srcPixFmt, reqW, reqH);
                     }

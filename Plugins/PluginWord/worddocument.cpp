@@ -5,6 +5,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
+#include <QUrl>
 #include <QtGlobal>
 
 // ============================================================================
@@ -385,10 +386,12 @@ QString baseNameOf(const QString &path)
     return i < 0 ? path : path.mid(i + 1);
 }
 
-// OPC 部件名归一化：去掉前导 '/'，反斜杠转 '/'
+// OPC 部件名归一化：百分号解码、反斜杠转 '/'、去掉前导 '/'
 QString normalizePart(const QString &p)
 {
-    QString r = p.trimmed();
+    // OPC 的 Target 是 IRI：部件名含空格/非 ASCII 时写成 %XX，
+    // 而 ZIP 条目名是解码后的字面值（"word/media/a b.png"），查表前必须解码。
+    QString r = QUrl::fromPercentEncoding(p.trimmed().toUtf8());
     r.replace(QLatin1Char('\\'), QLatin1Char('/'));
     while (r.startsWith(QLatin1Char('/'))) r.remove(0, 1);
     return r;
@@ -2144,6 +2147,8 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     QString href = img.attribute(QStringLiteral("xlink:href")).trimmed();
     if (href.isEmpty()) return QString();
     while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
+    // ODF 的 xlink:href 是 IRI：空格/非 ASCII 写成 %XX，ZIP 条目名是解码后的字面值。
+    href = QUrl::fromPercentEncoding(href.toUtf8());
     if (href.contains(QLatin1String("://"))) return QString();   // 外链图片不联网
 
     // 先查缓存，再决定是否解压；重复引用/缩放重渲染不再重复 inflate。

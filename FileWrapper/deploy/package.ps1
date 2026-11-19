@@ -54,6 +54,10 @@ $outRoot   = [System.IO.Path]::GetPathRoot($outFull).TrimEnd('\')
 
 if ($outFull -ieq $buildFull) { Fail "OutDir must not be the build dir: $OutDir" }
 if ($outRoot -ne '' -and $outFull -ieq $outRoot) { Fail "OutDir must not be a drive root: $OutDir" }
+# Test equality separately: the ancestor check below requires $protected to
+# start with "$outFull\", which is never true when both paths are equal.
+# Without this, -OutDir pointing at the repo root would recursively delete it.
+if ($outFull -ieq $repoRoot) { Fail "OutDir must not be the repository root: $OutDir" }
 foreach ($protected in @($buildFull, $repoRoot)) {
     if ($protected.ToLowerInvariant().StartsWith($outFull.ToLowerInvariant() + '\')) {
         Fail "OutDir must not be an ancestor of $protected : $OutDir"

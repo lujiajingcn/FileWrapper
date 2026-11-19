@@ -980,22 +980,46 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
     int nRenamedTotal = 0;
     {
         QSet<QString> used;
+        // 每个基名记住上次用到的序号：第 k 个重名从 k 继续试，而不是每次都从 1 重来
+        // （原来 N 个同名条目是 O(N²)，且循环里没有上限/取消检查）。
+        QHash<QString, int> nextIndex;
         int nRenamed = 0;
+        int nProbe = 0;
         for (MergeSource &s : sources)
         {
-            const QString base = s.sStoredPath;
-            QString candidate = base;
-            int n = 1;
-            while (used.contains(candidate.toLower()))
+            if (m_bCancelRequested)
             {
-                ++n;
-                const int slash = base.lastIndexOf(QLatin1Char('/'));
-                const QString dir  = slash >= 0 ? base.left(slash + 1) : QString();
-                const QString name = slash >= 0 ? base.mid(slash + 1) : base;
-                const int dot = name.lastIndexOf(QLatin1Char('.'));
-                const QString stem = dot > 0 ? name.left(dot) : name;
-                const QString ext  = dot > 0 ? name.mid(dot) : QString();
-                candidate = dir + stem + QStringLiteral(" (%1)").arg(n) + ext;
+                finish(false, tr("操作已取消"));
+                return;
+            }
+            const QString base = s.sStoredPath;
+            const int slash = base.lastIndexOf(QLatin1Char('/'));
+            const QString dir  = slash >= 0 ? base.left(slash + 1) : QString();
+            const QString name = slash >= 0 ? base.mid(slash + 1) : base;
+            const int dot = name.lastIndexOf(QLatin1Char('.'));
+            const QString stem = dot > 0 ? name.left(dot) : name;
+            const QString ext  = dot > 0 ? name.mid(dot) : QString();
+            const QString key = base.toLower();
+
+            QString candidate = base;
+            if (used.contains(key))
+            {
+                int n = nextIndex.value(key, 1);
+                while (used.contains(candidate.toLower()))
+                {
+                    if (++n > 100000)   // 与 chooseOutputPath 同量级的硬上限，避免病态输入死循环
+                    {
+                        finish(false, tr("同名文件过多，无法自动改名：%1").arg(base));
+                        return;
+                    }
+                    candidate = dir + stem + QStringLiteral(" (%1)").arg(n) + ext;
+                    if ((++nProbe & 0x3FF) == 0)
+                    {
+                        QApplication::processEvents();
+                        if (m_bCancelRequested) { finish(false, tr("操作已取消")); return; }
+                    }
+                }
+                nextIndex.insert(key, n);
             }
             if (candidate != base) ++nRenamed;
             s.sStoredPath = candidate;

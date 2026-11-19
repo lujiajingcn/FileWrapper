@@ -42,11 +42,9 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
     if (szBuf == nullptr || nFileLen <= 0)
         return;
-    // QPixmap::loadFromData(const uchar*, uint, ...) 的长度形参是 uint
-    // （本机 Qt 6.8.3 的 qpixmap.h:97 实测只有这一个重载），不是 qsizetype。
-    // 64 位下 qsizetype 与 qint64 同宽，原「超过 qsizetype::max()」判断恒为
-    // false（死代码）；按 uint 的真实范围显式判断，避免隐式截断成错误长度。
-    if (nFileLen > qint64(std::numeric_limits<uint>::max()))
+    // QByteArray/QBuffer 的长度形参是 qsizetype，但 QByteArray 自身上限仍是 int：
+    // 超过 2GiB 的超大图先拒绝，避免长度窄化成负数（以前的 uint 判断会放行 2~4GiB）。
+    if (nFileLen > qint64(std::numeric_limits<int>::max()))
     {
         // 同样先清 pixmap 再写提示：QLabel::setPixmap() 会清除文本，
         // 反之 setText 也会清掉 pixmap，顺序不能反。
@@ -61,7 +59,7 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
     QImage img;
     {
         QBuffer buf;
-        buf.setData(szBuf, static_cast<int>(nFileLen));
+        buf.setData(szBuf, qsizetype(nFileLen));
         buf.open(QIODevice::ReadOnly);
         QImageReader reader(&buf);
         reader.setAutoTransform(true);

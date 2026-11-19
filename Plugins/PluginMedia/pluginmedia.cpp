@@ -65,10 +65,22 @@ bool PluginMedia::prefersFileByPath() const
 bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName)
 {
     Q_UNUSED(displayName);
-    if (path.isEmpty() || !QFileInfo::exists(path) || m_wMainWindow == nullptr)
+    if (m_wMainWindow == nullptr)
         return false;
+    if (path.isEmpty() || !QFileInfo::exists(path))
+    {
+        // 与 showFile/sendFileMapped 的失败路径一致：打开失败必须复位进度条/时间/图标，
+        // 否则会保留上一个文件的 UI 状态（死控件）。
+        m_wMainWindow->clearContent();
+        return false;
+    }
     // 临时文件在整个会话期间有效，FFmpeg 的后台解码线程可以持续按路径读取
-    return m_wMainWindow->showVideoFile(path) >= 0;
+    if (m_wMainWindow->showVideoFile(path) < 0)
+    {
+        m_wMainWindow->clearContent();
+        return false;
+    }
+    return true;
 }
 
 bool PluginMedia::sendFileMapped(char *pData, qint64 nFileLen, const QString &displayName)

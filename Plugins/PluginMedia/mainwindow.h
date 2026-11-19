@@ -142,6 +142,11 @@ private:
     // 当前 sws 输出尺寸（= 生成的 QImage 尺寸）；原子量：主线程可无锁读取做诊断
     std::atomic<int> outW{0}, outH{0};
     AVPixelFormat m_srcPixFmt = AV_PIX_FMT_NONE;
+    // 当前 sws 上下文对应的源参数：源尺寸/像素格式变化时必须重建，
+    // 只比较输出尺寸会误判为"没变"而复用旧上下文。
+    int           m_swsSrcW = 0;
+    int           m_swsSrcH = 0;
+    AVPixelFormat m_swsSrcFmt = AV_PIX_FMT_NONE;
 
     // 视频缩放上下文与 RGB 输出缓冲：由解码线程自己拥有。
     // 放在解码线程里，是为了让「窗口缩放 → 换输出尺寸」能在同一线程内完成：

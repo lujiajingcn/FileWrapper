@@ -21,6 +21,8 @@
 #include <QElapsedTimer>
 #include <QSharedPointer>
 #include <QPointer>
+#include <QMutex>
+#include <QWaitCondition>
 
 class QProgressDialog;
 class QCloseEvent;
@@ -172,7 +174,18 @@ private:
     QHash<PluginInterface*, QSharedPointer<MappedInput>> m_mapMappedInputs;
     QSet<QString> m_setMappedCrcPending;
     QSet<QString> m_setMappedCrcVerified;
-    void checkMappedCrcAsync(const QString &sPath, const QSharedPointer<MappedInput> &mapped, quint32 nExpected);
+    // 后台 CRC 校验线程的等待门：保存前要等它归零（Windows 下未关闭的归档句柄
+    // 会让 rename 失败）；用共享对象保存计数，窗口析构后线程仍能安全归还。
+    struct MappedCrcGate
+    {
+        QMutex mutex;
+        QWaitCondition idle;
+        int inFlight = 0;
+    };
+    QSharedPointer<MappedCrcGate> m_crcGate = QSharedPointer<MappedCrcGate>::create();
+    quint64 m_nArchiveEpoch = 0;   // 归档切换代数：过期校验结果不再写回新归档
+    void checkMappedCrcAsync(const QString &sPath, qint64 nPosition, qint64 nLen, quint32 nExpected);
+    bool waitForMappedCrc(int nTimeoutMs);
     void releaseMappedInput(PluginInterface *iface);
     void releaseAllMappedInputs();
 
@@ -184,6 +197,7 @@ private:
     QSet<QString>            m_setTempFiles;
     QSet<QString>            m_setExpandedBeforeSort;   // 树形点列头排序前记住的展开目录
     QSet<QString>            m_setExpandedTree;
+    bool                     m_bResetTreeExpansion = false; // 归档切换后首次建树不恢复旧展开键
     QString                  m_sSelectedPathBeforeSort;  // 点列头排序前选中的文件
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用
     QStringList              m_listTempOrder;   // 创建顺序，用于上限淘汰

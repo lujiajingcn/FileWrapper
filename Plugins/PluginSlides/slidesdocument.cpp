@@ -4,6 +4,7 @@
 #include <QDomElement>
 #include <QHash>
 #include <QStringList>
+#include <QUrl>
 #include <algorithm>
 #include <functional>
 #include "xmlguard.h"
@@ -12,6 +13,7 @@ namespace {
 
 constexpr int    kMaxSlides   = 200;
 constexpr int    kMaxBlocks   = 2000;
+constexpr int    kMaxRelationships = 10000;   // 单个 .rels 条目上限（防 QDom 节点放大）
 constexpr double kEmuPerPt    = 12700.0;      // 1pt = 12700 EMU
 constexpr qint64 kMaxImageBytes = 32LL * 1024 * 1024;
 constexpr qint64 kMaxDecodedImageBytes = 256LL * 1024 * 1024;   // 整份文档累计解码预算
@@ -65,12 +67,19 @@ QString joinPath(const QString &baseDir, const QString &rel)
 QHash<QString, QString> parseRels(const QByteArray &relsXml)
 {
     QHash<QString, QString> targets;
+    // 与其它 XML 部件同等的预算：rels 也可能被放大成几十万个节点。
+    if (!xmlWithinTagBudget(relsXml)) return targets;
     QDomDocument doc;
     if (!doc.setContent(relsXml)) return targets;
+    int nRel = 0;
     for (QDomElement e = doc.documentElement().firstChildElement(QStringLiteral("Relationship"));
          !e.isNull(); e = e.nextSiblingElement(QStringLiteral("Relationship")))
     {
-        targets.insert(e.attribute(QStringLiteral("Id")), e.attribute(QStringLiteral("Target")));
+        if (++nRel > kMaxRelationships) break;
+        // OPC 的 Target 是 IRI：部件名含空格/非 ASCII 时写成 %XX，
+        // 而 ZIP 条目名是解码后的字面值，查表前必须解码。
+        targets.insert(e.attribute(QStringLiteral("Id")),
+                       QUrl::fromPercentEncoding(e.attribute(QStringLiteral("Target")).toUtf8()));
     }
     return targets;
 }
@@ -307,7 +316,13 @@ bool SlidesDocument::parsePptx(QString *error)
                                     b.imageUrl.clear();
                                     m_truncated = true;
                                 }
-                                if (!b.imageUrl.isEmpty()) slide.blocks.append(b);
+                                if (!b.imageUrl.isEmpty())
+                                {
+                                    // 图片分支同样受块预算约束：同一 rId 重复引用时
+                                    // 缓存不再解码、也不消耗解码预算，但仍会每引用一次追加一个 Block。
+                                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
+                                    slide.blocks.append(b);
+                                }
                             }
                             return;
                         }
@@ -460,6 +475,9 @@ bool SlidesDocument::parseOdp(QString *error)
             {
                 QString href = img.attribute(QStringLiteral("xlink:href")).trimmed();
                 while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
+                // ODF 的 xlink:href 是 IRI：空格/非 ASCII 写成 %XX，
+                // 而 ZIP 条目名是解码后的字面值（"Pictures/图 1.png"）。
+                href = QUrl::fromPercentEncoding(href.toUtf8());
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
                 bool bNewDecoded = false;
@@ -473,7 +491,11 @@ bool SlidesDocument::parseOdp(QString *error)
                     b.imageUrl.clear();
                     m_truncated = true;
                 }
-                if (!b.imageUrl.isEmpty()) slide.blocks.append(b);
+                if (!b.imageUrl.isEmpty())
+                {
+                    if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
+                    slide.blocks.append(b);
+                }
             }
 
             // 文本框
