@@ -5,8 +5,8 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
-#include <QUrl>
 #include <QtGlobal>
+#include "percentdecode.h"
 
 // ============================================================================
 // 实现说明
@@ -386,12 +386,10 @@ QString baseNameOf(const QString &path)
     return i < 0 ? path : path.mid(i + 1);
 }
 
-// OPC 部件名归一化：百分号解码、反斜杠转 '/'、去掉前导 '/'
+// OPC 部件名归一化：反斜杠转 '/'、去掉前导 '/'（百分号解码在 resolvePart/主部件处做）
 QString normalizePart(const QString &p)
 {
-    // OPC 的 Target 是 IRI：部件名含空格/非 ASCII 时写成 %XX，
-    // 而 ZIP 条目名是解码后的字面值（"word/media/a b.png"），查表前必须解码。
-    QString r = QUrl::fromPercentEncoding(p.trimmed().toUtf8());
+    QString r = p.trimmed();
     r.replace(QLatin1Char('\\'), QLatin1Char('/'));
     while (r.startsWith(QLatin1Char('/'))) r.remove(0, 1);
     return r;
@@ -400,9 +398,12 @@ QString normalizePart(const QString &p)
 // 相对主文档目录解析部件路径（"media/image1.png" -> "word/media/image1.png"）
 QString resolvePart(const QString &baseDir, const QString &target)
 {
-    const bool bAbsolute = target.trimmed().startsWith(QLatin1Char('/'))
-                           || target.trimmed().startsWith(QLatin1Char('\\'));
-    QString t = normalizePart(target);
+    // OPC 的 Target 是 IRI：先解码合法的 %XX，再判断绝对/相对——
+    // 否则编码形式的前导分隔符（%2F）会被当成相对路径而拼错目录。
+    const QString decoded = percentDecodeStrict(target.trimmed());
+    const bool bAbsolute = decoded.startsWith(QLatin1Char('/'))
+                           || decoded.startsWith(QLatin1Char('\\'));
+    QString t = normalizePart(decoded);
     if (t.contains(QLatin1String("://"))) return QString();   // 外部链接
     QStringList parts = bAbsolute ? QStringList()
                                   : baseDir.split(QLatin1Char('/'), Qt::SkipEmptyParts);
@@ -697,7 +698,7 @@ bool WordDocument::open(const QByteArray &data, QString *error)
         {
             if (e.attribute(QStringLiteral("Type")).endsWith(QLatin1String("/officeDocument")))
             {
-                mainPart = normalizePart(e.attribute(QStringLiteral("Target")));
+                mainPart = normalizePart(percentDecodeStrict(e.attribute(QStringLiteral("Target"))));
                 break;
             }
         }
@@ -2148,7 +2149,7 @@ QString WordDocument::odtImageTag(const QDomElement &frame, double scale)
     if (href.isEmpty()) return QString();
     while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
     // ODF 的 xlink:href 是 IRI：空格/非 ASCII 写成 %XX，ZIP 条目名是解码后的字面值。
-    href = QUrl::fromPercentEncoding(href.toUtf8());
+    href = percentDecodeStrict(href);
     if (href.contains(QLatin1String("://"))) return QString();   // 外链图片不联网
 
     // 先查缓存，再决定是否解压；重复引用/缩放重渲染不再重复 inflate。

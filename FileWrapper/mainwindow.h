@@ -23,6 +23,7 @@
 #include <QPointer>
 #include <QMutex>
 #include <QWaitCondition>
+#include <atomic>
 
 class QProgressDialog;
 class QCloseEvent;
@@ -181,10 +182,12 @@ private:
         QMutex mutex;
         QWaitCondition idle;
         int inFlight = 0;
+        std::atomic<bool> cancelRequested{false};   // 保存/析构要求尽快中止
     };
     QSharedPointer<MappedCrcGate> m_crcGate = QSharedPointer<MappedCrcGate>::create();
     quint64 m_nArchiveEpoch = 0;   // 归档切换代数：过期校验结果不再写回新归档
-    void checkMappedCrcAsync(const QString &sPath, qint64 nPosition, qint64 nLen, quint32 nExpected);
+    void checkMappedCrcAsync(const QString &sCrcKey, const QString &sPath,
+                             qint64 nPosition, qint64 nLen, quint32 nExpected);
     bool waitForMappedCrc(int nTimeoutMs);
     void releaseMappedInput(PluginInterface *iface);
     void releaseAllMappedInputs();
@@ -198,6 +201,7 @@ private:
     QSet<QString>            m_setExpandedBeforeSort;   // 树形点列头排序前记住的展开目录
     QSet<QString>            m_setExpandedTree;
     bool                     m_bResetTreeExpansion = false; // 归档切换后首次建树不恢复旧展开键
+    bool                     m_bScanningFiles = false;      // 合并前的目录扫描进行中（禁止关闭窗口）
     QString                  m_sSelectedPathBeforeSort;  // 点列头排序前选中的文件
     QHash<QString, QString>  m_mapTempCache;    // 条目标识 -> 临时文件，重复打开时复用
     QStringList              m_listTempOrder;   // 创建顺序，用于上限淘汰

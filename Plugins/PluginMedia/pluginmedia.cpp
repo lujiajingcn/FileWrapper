@@ -67,16 +67,14 @@ bool PluginMedia::sendFileByPath(const QString &path, const QString &displayName
     Q_UNUSED(displayName);
     if (m_wMainWindow == nullptr)
         return false;
+    // 非法输入与 showFile/sendFileMapped 的空数据分支保持一致：只返回 false，
+    // 由宿主决定是否复位（不在这里产生"停掉正在播放文件"的副作用）。
     if (path.isEmpty() || !QFileInfo::exists(path))
-    {
-        // 与 showFile/sendFileMapped 的失败路径一致：打开失败必须复位进度条/时间/图标，
-        // 否则会保留上一个文件的 UI 状态（死控件）。
-        m_wMainWindow->clearContent();
         return false;
-    }
     // 临时文件在整个会话期间有效，FFmpeg 的后台解码线程可以持续按路径读取
     if (m_wMainWindow->showVideoFile(path) < 0)
     {
+        // 打开失败（showVideo 已停掉旧播放并清画面，但进度条/时间/图标仍是旧状态）
         m_wMainWindow->clearContent();
         return false;
     }

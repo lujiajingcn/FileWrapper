@@ -42,8 +42,9 @@ void MainWindow::showPicture(char *szBuf, qint64 nFileLen)
 {
     if (szBuf == nullptr || nFileLen <= 0)
         return;
-    // QByteArray/QBuffer 的长度形参是 qsizetype，但 QByteArray 自身上限仍是 int：
-    // 超过 2GiB 的超大图先拒绝，避免长度窄化成负数（以前的 uint 判断会放行 2~4GiB）。
+    // QBuffer/QByteArray 的长度形参是 qsizetype；这里仍按 2GiB 设一个实际可用上限
+    // （超大图不可能在内存里解码显示），同时避免把长度窄化成 int 后变成负数
+    // （旧实现按 uint 上限判断、却按 int 传参，2~4GiB 会变成负值）。
     if (nFileLen > qint64(std::numeric_limits<int>::max()))
     {
         // 同样先清 pixmap 再写提示：QLabel::setPixmap() 会清除文本，

@@ -3,11 +3,12 @@
 #include <QDomDocument>
 #include <QDomElement>
 #include <QHash>
+#include <QDebug>
 #include <QStringList>
-#include <QUrl>
 #include <algorithm>
 #include <functional>
 #include "xmlguard.h"
+#include "percentdecode.h"
 
 namespace {
 
@@ -68,18 +69,27 @@ QHash<QString, QString> parseRels(const QByteArray &relsXml)
 {
     QHash<QString, QString> targets;
     // 与其它 XML 部件同等的预算：rels 也可能被放大成几十万个节点。
-    if (!xmlWithinTagBudget(relsXml)) return targets;
+    if (!xmlWithinTagBudget(relsXml, 20000))
+    {
+        // 正常 rels 只有几百条；放行到默认的 50 万标签会让 QDom 再放大成 GB 级
+        qWarning() << "[Slides] rels XML 超过预算，已忽略";
+        return targets;
+    }
     QDomDocument doc;
     if (!doc.setContent(relsXml)) return targets;
     int nRel = 0;
     for (QDomElement e = doc.documentElement().firstChildElement(QStringLiteral("Relationship"));
          !e.isNull(); e = e.nextSiblingElement(QStringLiteral("Relationship")))
     {
-        if (++nRel > kMaxRelationships) break;
+        if (++nRel > kMaxRelationships)
+        {
+            qWarning() << "[Slides] rels 条目超过上限，已截断";
+            break;
+        }
         // OPC 的 Target 是 IRI：部件名含空格/非 ASCII 时写成 %XX，
         // 而 ZIP 条目名是解码后的字面值，查表前必须解码。
         targets.insert(e.attribute(QStringLiteral("Id")),
-                       QUrl::fromPercentEncoding(e.attribute(QStringLiteral("Target")).toUtf8()));
+                       percentDecodeStrict(e.attribute(QStringLiteral("Target"))));
     }
     return targets;
 }
@@ -295,6 +305,9 @@ bool SlidesDocument::parsePptx(QString *error)
                 if (tag == QLatin1String("p:pic"))
                 {
                     std::function<void(const QDomElement &)> findBlip = [&](const QDomElement &e) {
+                        // 达到块预算后不再解压后续图片：只挡 append 的话，
+                        // 重复引用仍会反复 inflate 同一图片。
+                        if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; return; }
                         if (e.tagName() == QLatin1String("a:blip"))
                         {
                             const QString rid = e.attribute(QStringLiteral("r:embed"));
@@ -473,11 +486,12 @@ bool SlidesDocument::parseOdp(QString *error)
             for (QDomElement img = frame.firstChildElement(QStringLiteral("draw:image")); !img.isNull();
                  img = img.nextSiblingElement(QStringLiteral("draw:image")))
             {
+                if (slide.blocks.size() >= kMaxBlocks) { m_truncated = true; break; }
                 QString href = img.attribute(QStringLiteral("xlink:href")).trimmed();
                 while (href.startsWith(QLatin1String("./"))) href.remove(0, 2);
                 // ODF 的 xlink:href 是 IRI：空格/非 ASCII 写成 %XX，
                 // 而 ZIP 条目名是解码后的字面值（"Pictures/图 1.png"）。
-                href = QUrl::fromPercentEncoding(href.toUtf8());
+                href = percentDecodeStrict(href);
                 if (href.isEmpty() || href.contains(QLatin1String("://"))) continue;
                 Block b;
                 bool bNewDecoded = false;

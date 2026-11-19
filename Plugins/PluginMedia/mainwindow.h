@@ -127,8 +127,9 @@ public slots:
     int currentOutH() const { return outH.load(std::memory_order_relaxed); }
 
 private:
-    // 在解码线程内重建视频缩放上下文与输出缓冲（输出尺寸变化时调用）
-    void rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt, int outW, int outH);
+    // 在解码线程内重建视频缩放上下文与输出缓冲（输出尺寸或源参数变化时调用）。
+    // 返回 false 表示本次重建失败、上下文不可用；调用方不应提交新的源参数。
+    bool rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt, int outW, int outH);
 
 private:
     AVFormatContext *pFormatCtx = nullptr;

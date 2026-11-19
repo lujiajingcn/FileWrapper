@@ -137,21 +137,21 @@ void VideoWorker::requestOutputSize(int w, int h)
 
 // 在解码线程内重建视频缩放上下文与 RGB 输出缓冲。
 // 必须与 sws_scale 在同一线程：否则主线程释放旧缓冲时解码线程可能还在用它。
-void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
+bool VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
                                   int newW, int newH)
 {
     if (newW <= 0 || newH <= 0)
-        return;
+        return false;
     if (srcW <= 0 || srcH <= 0)
-        return;
+        return false;
     if (srcPixFmt == AV_PIX_FMT_NONE)
-        return;
+        return false;
 
     if (m_sws && outW.load(std::memory_order_relaxed) == newW
                  && outH.load(std::memory_order_relaxed) == newH
                  && m_swsSrcW == srcW && m_swsSrcH == srcH
                  && m_swsSrcFmt == srcPixFmt)
-        return;   // 输出尺寸与源参数都没变，复用现有上下文
+        return true;   // 输出尺寸与源参数都没变，复用现有上下文
 
     if (m_sws) { sws_freeContext(m_sws); m_sws = nullptr; }
 
@@ -159,7 +159,7 @@ void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
     if (need < 0)
     {
         qWarning() << "[VideoWorker] 输出缓冲大小计算失败";
-        return;
+        return false;
     }
     if (!m_outBuf || m_outBufSize < need)
     {
@@ -170,7 +170,7 @@ void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
     if (!m_outBuf)
     {
         qWarning() << "[VideoWorker] 输出缓冲分配失败";
-        return;
+        return false;
     }
 
     av_image_fill_arrays(m_outData, m_outLinesize, m_outBuf,
@@ -182,13 +182,14 @@ void VideoWorker::rebuildVideoSws(int srcW, int srcH, AVPixelFormat srcPixFmt,
     if (!m_sws)
     {
         qWarning() << "[VideoWorker] sws_getContext 失败";
-        return;
+        return false;
     }
     outW.store(newW, std::memory_order_relaxed);
     outH.store(newH, std::memory_order_relaxed);
     m_swsSrcW = srcW;
     m_swsSrcH = srcH;
     m_swsSrcFmt = srcPixFmt;
+    return true;
 }
 
 // 释放解码线程持有的 sws 上下文与输出缓冲。
@@ -346,12 +347,28 @@ void VideoWorker::doDecode()
                         && (pFrame->width != srcW || pFrame->height != srcH
                             || pFrame->format != int(m_srcPixFmt)))
                     {
-                        srcW = pFrame->width;
-                        srcH = pFrame->height;
-                        m_srcPixFmt = AVPixelFormat(pFrame->format);
-                        rebuildVideoSws(srcW, srcH, m_srcPixFmt,
-                                        outW.load(std::memory_order_relaxed),
-                                        outH.load(std::memory_order_relaxed));
+                        // 目标尺寸优先用主线程请求值：若整段没有帧走过正常路径
+                        // （单帧/极短视频、seek 到结尾），outW/outH 还是 0，
+                        // 用它们重建会永远出不了画。
+                        const quint64 reqSize = m_reqOutSize.load(std::memory_order_relaxed);
+                        int newW = outW.load(std::memory_order_relaxed);
+                        int newH = outH.load(std::memory_order_relaxed);
+                        if (reqSize != 0)
+                        {
+                            newW = int(reqSize & 0xffffffffu);
+                            newH = int(reqSize >> 32);
+                        }
+                        if (rebuildVideoSws(pFrame->width, pFrame->height,
+                                            AVPixelFormat(pFrame->format), newW, newH))
+                        {
+                            srcW = pFrame->width;
+                            srcH = pFrame->height;
+                            m_srcPixFmt = AVPixelFormat(pFrame->format);
+                        }
+                        else
+                        {
+                            continue;   // 重建失败：不能用旧 sws 配新帧
+                        }
                     }
                     if (!m_sws || !m_outData[0]) continue;
                     sws_scale(m_sws, (const unsigned char * const *)pFrame->data,
@@ -465,14 +482,6 @@ void VideoWorker::doDecode()
                         (pFrame->width > 0 && pFrame->height > 0
                          && (pFrame->width != srcW || pFrame->height != srcH
                              || pFrame->format != int(m_srcPixFmt)));
-                    if (bSrcChanged)
-                    {
-                        srcW = pFrame->width;
-                        srcH = pFrame->height;
-                        m_srcPixFmt = AVPixelFormat(pFrame->format);
-                    }
-                    if (bSrcChanged && reqSize == 0)
-                        continue;   // 还没有可用的输出尺寸：不能拿旧 sws 配新源参数
                     if (reqSize != 0)
                     {
                         const int reqW = int(reqSize & 0xffffffffu);
@@ -480,7 +489,24 @@ void VideoWorker::doDecode()
                         if (bSrcChanged
                          || reqW != outW.load(std::memory_order_relaxed)
                          || reqH != outH.load(std::memory_order_relaxed))
-                            rebuildVideoSws(srcW, srcH, m_srcPixFmt, reqW, reqH);
+                        {
+                            // 源参数只在重建成功后才提交：失败时保留旧缓存，
+                            // 下一帧仍会判定"源变了"并重试；本帧直接丢弃，
+                            // 避免拿旧 sws 去缩放新分辨率的帧。
+                            const int nNewSrcW = bSrcChanged ? pFrame->width : srcW;
+                            const int nNewSrcH = bSrcChanged ? pFrame->height : srcH;
+                            const AVPixelFormat newFmt =
+                                bSrcChanged ? AVPixelFormat(pFrame->format) : m_srcPixFmt;
+                            if (!rebuildVideoSws(nNewSrcW, nNewSrcH, newFmt, reqW, reqH))
+                                continue;
+                            srcW = nNewSrcW;
+                            srcH = nNewSrcH;
+                            m_srcPixFmt = newFmt;
+                        }
+                    }
+                    else if (bSrcChanged)
+                    {
+                        continue;   // 还没有可用的输出尺寸：不能拿旧 sws 配新源参数
                     }
 
                     if (!m_sws || !m_outData[0])
@@ -959,6 +985,14 @@ void MainWindow::refreshVideoArea()
 
 void MainWindow::clearContent()
 {
+    // 先作废当前世代并落下播放标志：即使停止线程超时，排队中的旧帧也不能再画回，
+    // 播放图标也不能停在"播放中"（m_bPlaying 只由这里和 clearFFmpegResources 复位，
+    // 后者不刷新图标）。
+    ++m_genCounter;
+    m_bPlaying = false;
+    m_bPaused = false;
+    updatePlayPauseIcon();
+
     // 主程序在读文件失败或 0 字节时会送 (nullptr, 0)。此时必须停掉仍在运行的
     // 解码线程与音频输出，否则上一个文件会在后台继续播放/发声。
     stopPlayback();

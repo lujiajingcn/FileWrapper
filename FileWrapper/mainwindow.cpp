@@ -235,6 +235,10 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
+    // 后台 CRC 线程可能仍在读归档并通过 qApp 投递回调：析构前先请求中止并等它退出，
+    // 避免析构期间回调再去访问窗口状态。
+    waitForMappedCrc(3000);
+
     // 析构期间不再触发 activateTab，避免销毁标签页时重入渲染逻辑
     disconnect(ui->tabWidget, nullptr, this, nullptr);
 
@@ -1252,12 +1256,16 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
                     m_mapMappedInputs.insert(iface, sp);
 
                     quint32 nExpected = 0;
+                    // 缓存键带上条目偏移/长度：删除后重新添加"同名但不同内容"的条目时，
+                    // 不能复用之前那条"已校验"的结论（只清归档切换还不够）。
+                    const QString sCrcKey = QStringLiteral("%1|%2|%3")
+                            .arg(info.sFilePath).arg(info.nContentPositon).arg(info.nFileLen);
                     if (m_fileManager->contentCrcFor(info.sFilePath, &nExpected)
-                        && !m_setMappedCrcVerified.contains(info.sFilePath)
-                        && !m_setMappedCrcPending.contains(info.sFilePath))
+                        && !m_setMappedCrcVerified.contains(sCrcKey)
+                        && !m_setMappedCrcPending.contains(sCrcKey))
                     {
-                        m_setMappedCrcPending.insert(info.sFilePath);
-                        checkMappedCrcAsync(info.sFilePath, info.nContentPositon,
+                        m_setMappedCrcPending.insert(sCrcKey);
+                        checkMappedCrcAsync(sCrcKey, info.sFilePath, info.nContentPositon,
                                             info.nFileLen, nExpected);
                     }
                     return;
@@ -1371,8 +1379,8 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
     releaseMappedInput(iface);
 }
 
-void MainWindow::checkMappedCrcAsync(const QString &sPath, qint64 nPosition,
-                                     qint64 nLen, quint32 nExpected)
+void MainWindow::checkMappedCrcAsync(const QString &sCrcKey, const QString &sPath,
+                                     qint64 nPosition, qint64 nLen, quint32 nExpected)
 {
     // 后台线程自己打开归档读取内容区：QFile 在工作线程创建并销毁，不与主线程
     // 共享 QObject。不捕获映射对象，避免映射在工作线程析构（跨线程 unmap + delete）。
@@ -1380,58 +1388,98 @@ void MainWindow::checkMappedCrcAsync(const QString &sPath, qint64 nPosition,
     const QString sArchive = m_fileManager->archivePath();
     const quint64 nEpoch = m_nArchiveEpoch;
     const QSharedPointer<MappedCrcGate> gate = m_crcGate;
+    gate->cancelRequested.store(false, std::memory_order_relaxed);
     {
         QMutexLocker locker(&gate->mutex);
         ++gate->inFlight;
     }
     QPointer<MainWindow> self(this);
-    std::thread([self, gate, sArchive, sPath, nPosition, nLen, nExpected, nEpoch]() {
-        bool bOk = false;
-        bool bReadOk = false;
-        {
-            QFile f(sArchive);
-            if (f.open(QIODevice::ReadOnly) && f.seek(nPosition))
+    try
+    {
+        std::thread([self, gate, sArchive, sCrcKey, sPath, nPosition, nLen, nExpected, nEpoch]() {
+            bool bOk = false;
+            bool bReadOk = false;
+            bool bCancelled = false;
+            try
             {
-                FwArc::Crc32 crc;
-                QByteArray buf(1 << 20, '\0');
-                qint64 nLeft = nLen;
-                bReadOk = true;
-                while (nLeft > 0)
+                QFile f(sArchive);
+                if (f.open(QIODevice::ReadOnly) && f.seek(nPosition))
                 {
-                    const qint64 n = f.read(buf.data(), qMin<qint64>(qint64(buf.size()), nLeft));
-                    if (n <= 0) { bReadOk = false; break; }
-                    crc.update(buf.constData(), n);
-                    nLeft -= n;
+                    FwArc::Crc32 crc;
+                    QByteArray buf(1 << 20, '\0');
+                    qint64 nLeft = nLen;
+                    bReadOk = true;
+                    while (nLeft > 0)
+                    {
+                        // 保存需要"归档句柄已关闭"，不需要校验结论：主线程等待时置位，
+                        // 这里最多再读一个块就退出，避免 GUI 被整段读取卡住。
+                        if (gate->cancelRequested.load(std::memory_order_relaxed))
+                        {
+                            bCancelled = true;
+                            bReadOk = false;
+                            break;
+                        }
+                        const qint64 n = f.read(buf.data(), qMin<qint64>(qint64(buf.size()), nLeft));
+                        if (n <= 0) { bReadOk = false; break; }
+                        crc.update(buf.constData(), n);
+                        nLeft -= n;
+                    }
+                    bOk = !bCancelled && bReadOk && nLeft == 0 && crc.value() == nExpected;
                 }
-                bOk = bReadOk && nLeft == 0 && crc.value() == nExpected;
             }
-        }
-        // 句柄已随局部 QFile 关闭：计数器归零后主线程保存/改名才安全。
+            catch (...)
+            {
+                // 线程内的分配失败等异常不能逃出 detached 线程（会 terminate）
+                bReadOk = false;
+            }
+            // 句柄已随局部 QFile 关闭：计数器归零后主线程保存/改名才安全。
+            {
+                QMutexLocker locker(&gate->mutex);
+                if (--gate->inFlight == 0)
+                    gate->idle.wakeAll();
+            }
+            if (self.isNull()) return;
+            // 投递到 qApp 而不是 MainWindow：窗口析构与投递之间没有原子性，
+            // 用 qApp 作 context 可避免向已释放的窗口投递事件。
+            // 应用对象已经销毁（极端退出顺序）时直接放弃结果。
+            QCoreApplication *pApp = QCoreApplication::instance();
+            if (pApp == nullptr) return;
+            QMetaObject::invokeMethod(pApp, [self, sCrcKey, sPath, bOk, bReadOk, bCancelled, nEpoch]() {
+                if (self.isNull()) return;
+                if (nEpoch != self->m_nArchiveEpoch) return;   // 归档已切换：丢弃过期结果
+                self->m_setMappedCrcPending.remove(sCrcKey);
+                if (bCancelled)
+                    return;   // 保存触发的主动取消：不下结论、不告警，下次打开会重新校验
+                if (bOk)
+                    self->m_setMappedCrcVerified.insert(sCrcKey);
+                else if (!bReadOk)
+                    self->onFileManagerWarning(tr("读取归档内容失败，未能完成校验：%1")
+                                                   .arg(QFileInfo(sPath).fileName()));
+                else
+                    self->onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
+                                                   .arg(QFileInfo(sPath).fileName()));
+            }, Qt::QueuedConnection);
+        }).detach();
+    }
+    catch (const std::exception &)
+    {
+        // 线程创建失败：回滚计数与 pending，否则保存入口会永久等待。
         {
             QMutexLocker locker(&gate->mutex);
             if (--gate->inFlight == 0)
                 gate->idle.wakeAll();
         }
-        if (self.isNull()) return;
-        QMetaObject::invokeMethod(self.data(), [self, sPath, bOk, bReadOk, nEpoch]() {
-            if (self.isNull()) return;
-            if (nEpoch != self->m_nArchiveEpoch) return;   // 归档已切换：丢弃过期结果
-            self->m_setMappedCrcPending.remove(sPath);
-            if (bOk)
-                self->m_setMappedCrcVerified.insert(sPath);
-            else if (!bReadOk)
-                self->onFileManagerWarning(tr("读取归档内容失败，未能完成校验：%1")
-                                               .arg(QFileInfo(sPath).fileName()));
-            else
-                self->onFileManagerWarning(tr("内容校验失败（CRC32 不匹配），文件可能已损坏：%1")
-                                               .arg(QFileInfo(sPath).fileName()));
-        }, Qt::QueuedConnection);
-    }).detach();
+        m_setMappedCrcPending.remove(sCrcKey);
+        onFileManagerWarning(tr("无法启动后台校验线程，本次跳过内容校验：%1")
+                                 .arg(QFileInfo(sPath).fileName()));
+    }
 }
 
 bool MainWindow::waitForMappedCrc(int nTimeoutMs)
 {
     const QSharedPointer<MappedCrcGate> gate = m_crcGate;
+    // 先请求取消：保存只需要归档句柄关闭，等整段 CRC 读完只会让 GUI 无谓冻结。
+    gate->cancelRequested.store(true, std::memory_order_relaxed);
     QElapsedTimer timer;
     timer.start();
     QMutexLocker locker(&gate->mutex);
@@ -1855,6 +1903,8 @@ void MainWindow::on_actionMergeFile_triggered()
             tr("正在保存/合并归档，请等待完成后再执行其它文件操作。"));
         return;
     }
+    if (m_bScanningFiles)
+        return;   // 上一次合并的目录扫描尚未结束
 
     DlgMergeFile dlgMergeFile(this);
     if(dlgMergeFile.exec() == QDialog::Accepted)
@@ -1876,6 +1926,9 @@ void MainWindow::on_actionMergeFile_triggered()
         QApplication::processEvents();
         setOperationsEnabled(false);
 
+        // 扫描期间会周期性泵事件（FindFile），此时 FileManager 尚未 busy，
+        // 用独立标志挡住 closeEvent / 重入，避免"窗口关了还继续合并"。
+        m_bScanningFiles = true;
         QVector<QString> vtFilesPaths;
         foreach(QString sFilePath, qLFilePaths)
         {
@@ -1896,6 +1949,7 @@ void MainWindow::on_actionMergeFile_triggered()
                 vtFilesPaths.push_back(sFilePath);
             }
         }
+        m_bScanningFiles = false;
 
         if (m_fileManager->isCancelRequested())
         {
@@ -2889,6 +2943,12 @@ void MainWindow::closeEvent(QCloseEvent *event)
         QMessageBox::information(this, tr("操作进行中"),
             tr("正在合并/分割/保存归档，请等待完成，或先在进度对话框中点击“取消”。"));
         event->ignore();
+        return;
+    }
+    if (m_bScanningFiles)
+    {
+        event->ignore();
+        statusBar()->showMessage(tr("正在扫描待合并文件，请先取消进度框"), 3000);
         return;
     }
     if (!confirmDiscardOrSaveIfDirty())
