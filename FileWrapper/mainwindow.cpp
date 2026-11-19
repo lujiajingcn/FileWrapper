@@ -383,11 +383,6 @@ void MainWindow::initWidgetFilePath()
     ui->mainToolBar->addSeparator();
     ui->mainToolBar->addAction(ui->actionMergeFile);
     ui->mainToolBar->addAction(ui->actionSplitFile);
-    ui->mainToolBar->addSeparator();
-    ui->mainToolBar->addAction(m_acAddFile);
-    ui->mainToolBar->addAction(m_acDelFile);
-    ui->mainToolBar->addAction(m_acOutputFile);
-    ui->mainToolBar->addAction(m_acSaveFile);
 
     // 将工具栏放置在文件列表栏的上头
     QVBoxLayout *vbLytFilePath = new QVBoxLayout();
