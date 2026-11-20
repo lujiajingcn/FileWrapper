@@ -34,6 +34,7 @@
 #include <QApplication>
 #include <QDateTime>
 #include <QDirIterator>
+#include <QEventLoop>
 #include <QProcess>
 #include <QDir>
 #include <QElapsedTimer>
@@ -80,6 +81,7 @@
 #include <functional>
 
 #include "dlgfileproperty.h"
+#include "dlgentrytags.h"
 #include "filemanager.h"
 #include "filemetadata.h"
 #include "dlgmergefile.h"
@@ -2333,6 +2335,7 @@ static void verifyMergeDialog()
     bool bContextMenuOk = false;
     bool bFileDataOk = false;
     bool bFolderDataOk = false;
+    bool bTagColumnOk = false;
     if (bMerged)
     {
         ProbeTreeWindow mwProp;
@@ -2342,6 +2345,9 @@ static void verifyMergeDialog()
         auto *pPropModel = pPropView
                                ? qobject_cast<QStandardItemModel *>(pPropView->model())
                                : nullptr;
+        bTagColumnOk = pPropModel != nullptr && pPropModel->columnCount() == 4
+                       && pPropModel->headerData(3, Qt::Horizontal).toString()
+                              == QStringLiteral("标记");
         QStandardItem *pPropRoot = pPropModel ? pPropModel->item(0, 0) : nullptr;
         QStandardItem *pPropFile = nullptr;
         QStandardItem *pPropDir = nullptr;
@@ -2385,6 +2391,7 @@ static void verifyMergeDialog()
         }
         bContextMenuOk = (fileActs == QStringList{ QStringLiteral("打开"),
                                                    QStringLiteral("打开新标签页"),
+                                                   QStringLiteral("标记…"),
                                                    QStringLiteral("以文本查看"),
                                                    QStringLiteral("以十六进制查看"),
                                                    QStringLiteral("属性") })
@@ -2400,7 +2407,8 @@ static void verifyMergeDialog()
                           && fd.sLocation == FwArc::normalizePath(sTreeDir)
                           && fd.sEntryPath == FwArc::normalizePath(sTreeDir + QStringLiteral("/top.txt"))
                           && fd.sArchivePath == FwArc::normalizePath(sTreeArc)
-                          && fd.nArchiveVersion == FwArc::VERSION_V3
+                          && fd.nArchiveVersion == FwArc::CURRENT_VERSION
+                          && fd.listTags.isEmpty()
                           && fd.bHasFsMetadata
                           && fd.nModifiedTime > 0
                           && fd.bHasCrc
@@ -2435,6 +2443,8 @@ static void verifyMergeDialog()
            QStringLiteral("H19b: file property data carries name/type/size/location/CRC"));
     report(bFolderDataOk,
            QStringLiteral("H19c: dir property data aggregates visible subtree size/counts"));
+    report(bTagColumnOk,
+           QStringLiteral("H19d: file list exposes a 标记 column (4 columns)"));
 
     // H20: 属性文本——大小格式、CRC、待保存条目、v1 旧归档、文件夹汇总与筛选说明
     bool bPropTextOk = false;
@@ -2476,7 +2486,17 @@ static void verifyMergeDialog()
                       && DlgFileProperty::formatSize(1024 * 1024)
                              == QStringLiteral("1.00 MB（1,048,576 字节）")
                       && DlgFileProperty::typeTextForFile(QStringLiteral("README"))
-                             == QStringLiteral("文件");
+                             == QStringLiteral("文件")
+                      && sText.contains(QStringLiteral("标记：—"));
+
+        // v4：归档格式写 v4，标记按顿号连接显示
+        DlgFileProperty::Data tagged = d;
+        tagged.nArchiveVersion = FwArc::CURRENT_VERSION;
+        tagged.listTags = QStringList{ QStringLiteral("合同"), QStringLiteral("重要") };
+        const QString sTagged = DlgFileProperty::formatInfoText(tagged);
+        bPropTextOk = bPropTextOk
+                      && sTagged.contains(QStringLiteral("归档格式：FWDA v4"))
+                      && sTagged.contains(QStringLiteral("标记：合同、重要"));
 
         DlgFileProperty::Data pending = d;
         pending.bHasCrc = false;
@@ -2980,8 +3000,8 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     QString sErr;
     const bool bInspect = FileManager::inspectArchive(sArc, meta, sErr);
     report(bMergeDone && bMergeOk && bInspect
-               && meta.version == FwArc::VERSION_V3 && meta.entries.size() == 2,
-           QStringLiteral("P1b: merge writes FWDA v3 (%1 entries, err=%2)")
+               && meta.version == FwArc::VERSION_V4 && meta.entries.size() == 2,
+           QStringLiteral("P1b: merge writes FWDA v4 (%1 entries, err=%2)")
                .arg(bInspect ? meta.entries.size() : -1).arg(sErr));
 
     auto entryIndexBySuffix = [&meta](const QString &sSuffix) {
@@ -3176,6 +3196,305 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     fmLoad.unLoadMergedFile();
     fmV2.unLoadMergedFile();
     clearReadOnlyForCleanup(sDir);
+    QDir(sDir).removeRecursively();
+}
+
+// ---------------------------------------------------------------------------
+// Q: FWDA v4 条目标记
+//   合并写出 v4；标记可归一化/去重/拒绝非法输入；保存后重新加载仍在；
+//   展开归档再合并时标记跟随；文件列表有「标记」列且筛选框能按标记命中；
+//   属性文本显示标记，标记对话框能合并已有勾选与新增输入。
+// ---------------------------------------------------------------------------
+static void verifyArchiveTags(const QString &work, const QString &scratchDir)
+{
+    Q_UNUSED(work);
+    Q_UNUSED(scratchDir);
+    const QString sDir = makeWritableTestDir(QStringLiteral("archive_tags"));
+    report(QDir(sDir).exists(), QStringLiteral("Q0: tag test dir"));
+    if (!QDir(sDir).exists())
+        return;
+
+    auto writeFile = [](const QString &sPath, const QByteArray &data) {
+        QFile f(sPath);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate)
+               && f.write(data) == data.size();
+    };
+    auto findInfo = [](const QVector<FILEINFO> &infos, const QString &sSuffix) {
+        for (const FILEINFO &fi : infos)
+            if (fi.sFilePath.endsWith(sSuffix, Qt::CaseInsensitive))
+                return fi;
+        return FILEINFO();
+    };
+
+    const QString sOne   = sDir + QStringLiteral("/one.txt");
+    const QString sTwo   = sDir + QStringLiteral("/two.txt");
+    const QString sThree = sDir + QStringLiteral("/three.txt");
+    const bool bFiles = writeFile(sOne, QByteArray(64, '1'))
+                        && writeFile(sTwo, QByteArray(64, '2'))
+                        && writeFile(sThree, QByteArray(64, '3'));
+    report(bFiles, QStringLiteral("Q1: tag source files ready"));
+    if (!bFiles)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    const QString sArc = sDir + QStringLiteral("/tags.fwda");
+    FileManager fm;
+    bool bMergeDone = false, bMergeOk = false;
+    QObject::connect(&fm, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bMergeDone = true; bMergeOk = ok; });
+    fm.QMergeFiles(QVector<QString>{ sOne, sTwo, sThree }, sArc);
+
+    FwArc::Meta meta;
+    QString sErr;
+    const bool bInspect = FileManager::inspectArchive(sArc, meta, sErr);
+    report(bMergeDone && bMergeOk && bInspect
+               && meta.version == FwArc::VERSION_V4 && meta.entries.size() == 3,
+           QStringLiteral("Q2: merge writes FWDA v4 (v=%1, n=%2, err=%3)")
+               .arg(bInspect ? int(meta.version) : -1)
+               .arg(bInspect ? meta.entries.size() : -1)
+               .arg(sErr));
+
+    const bool bLoaded = fm.QLoadMergedFile(sArc);
+    QVector<FILEINFO> infos = fm.getFileInfos();
+    const QString sPathOne   = findInfo(infos, QStringLiteral("one.txt")).sFilePath;
+    const QString sPathTwo   = findInfo(infos, QStringLiteral("two.txt")).sFilePath;
+    const QString sPathThree = findInfo(infos, QStringLiteral("three.txt")).sFilePath;
+
+    QString sTagErr;
+    const bool bSet = !sPathOne.isEmpty() && !sPathTwo.isEmpty()
+                      && fm.setEntryTags(sPathOne,
+                                         QStringList{ QStringLiteral("合同"),
+                                                      QStringLiteral("重要") }, &sTagErr)
+                      && fm.setEntryTags(sPathTwo, QStringList{ QStringLiteral("重要") },
+                                         &sTagErr);
+    infos = fm.getFileInfos();
+    const FILEINFO fiOne = findInfo(infos, QStringLiteral("one.txt"));
+    const FILEINFO fiTwo = findInfo(infos, QStringLiteral("two.txt"));
+    report(bLoaded && bSet && fm.isDirty()
+               && fiOne.listTags == QStringList{ QStringLiteral("合同"),
+                                                 QStringLiteral("重要") }
+               && fiTwo.listTags == QStringList{ QStringLiteral("重要") },
+           QStringLiteral("Q3: setEntryTags updates entries and marks archive dirty"));
+
+    QString sNormErr;
+    const bool bNorm = !sPathThree.isEmpty()
+                       && fm.setEntryTags(sPathThree,
+                              QStringList{ QStringLiteral(" 合同 "), QStringLiteral("合同"),
+                                           QStringLiteral("  机密  ") }, &sNormErr);
+    const FILEINFO fiThree = findInfo(fm.getFileInfos(), QStringLiteral("three.txt"));
+    report(bNorm
+               && fiThree.listTags == QStringList{ QStringLiteral("合同"),
+                                                   QStringLiteral("机密") },
+           QStringLiteral("Q4: tags are trimmed/deduped before storing (%1)")
+               .arg(fiThree.listTags.join(QStringLiteral("|"))));
+
+    QString sBadErr;
+    const bool bRejectSep = !fm.setEntryTags(sPathThree,
+                                             QStringList{ QStringLiteral("a,b") }, &sBadErr)
+                            && !sBadErr.isEmpty();
+    const QString sTooLong(int(FwArc::MAX_TAG_CHARS) + 5, QLatin1Char('x'));
+    const bool bRejectLong = !fm.setEntryTags(sPathThree, QStringList{ sTooLong }, &sBadErr);
+    report(bRejectSep && bRejectLong,
+           QStringLiteral("Q5: invalid tags (separator / too long) are rejected"));
+
+    const QStringList allTags = fm.allTags();
+    report(allTags.size() == 3
+               && allTags.contains(QStringLiteral("合同"))
+               && allTags.contains(QStringLiteral("重要"))
+               && allTags.contains(QStringLiteral("机密")),
+           QStringLiteral("Q6: allTags() lists the archive's tags once (%1)")
+               .arg(allTags.join(QStringLiteral("|"))));
+
+    const bool bSaved = fm.save();
+    FileManager fmReload;
+    const bool bReloaded = bSaved && fmReload.QLoadMergedFile(sArc);
+    const QVector<FILEINFO> infos2 = fmReload.getFileInfos();
+    const FILEINFO fiOne2 = findInfo(infos2, QStringLiteral("one.txt"));
+    const FILEINFO fiThree2 = findInfo(infos2, QStringLiteral("three.txt"));
+    FwArc::Meta meta2;
+    const bool bHeaderOk = FileManager::inspectArchive(sArc, meta2, sErr)
+                           && meta2.version == FwArc::VERSION_V4
+                           && meta2.entries.size() == 3;
+    bool bEntryInHeader = false;
+    for (const FwArc::Entry &e : meta2.entries)
+        if (e.displayPath.endsWith(QStringLiteral("one.txt"), Qt::CaseInsensitive))
+            bEntryInHeader = e.tags.size() == 2;
+    report(bReloaded && !fmReload.isDirty()
+               && fiOne2.listTags == QStringList{ QStringLiteral("合同"),
+                                                  QStringLiteral("重要") }
+               && fiThree2.listTags == QStringList{ QStringLiteral("合同"),
+                                                    QStringLiteral("机密") }
+               && bHeaderOk && bEntryInHeader,
+           QStringLiteral("Q7: tags survive save + reload and are stored in the v4 header"));
+
+    const QString sArc2 = sDir + QStringLiteral("/merged2.fwda");
+    FileManager fmMerge;
+    bool bMerge2Done = false, bMerge2Ok = false;
+    QObject::connect(&fmMerge, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bMerge2Done = true; bMerge2Ok = ok; });
+    fmMerge.QMergeFiles(QVector<QString>{ sArc }, sArc2);
+    FwArc::Meta meta3;
+    bool bCarry = false;
+    if (bMerge2Done && bMerge2Ok && FileManager::inspectArchive(sArc2, meta3, sErr))
+    {
+        for (const FwArc::Entry &e : meta3.entries)
+            if (e.displayPath.endsWith(QStringLiteral("two.txt"), Qt::CaseInsensitive))
+                bCarry = e.tags == QStringList{ QStringLiteral("重要") };
+    }
+    report(bCarry, QStringLiteral("Q8: merging a tagged archive carries entry tags"));
+
+    bool bColumn = false, bCell = false, bFilter = false;
+    {
+        ProbeTreeWindow mw;
+        QMetaObject::invokeMethod(&mw, "onActionViewTreeTriggered", Qt::DirectConnection);
+        mw.loadArchiveFile(sArc);
+        auto *pView = mw.findChild<QTreeView *>();
+        auto *pModel = pView ? qobject_cast<QStandardItemModel *>(pView->model()) : nullptr;
+        bColumn = pModel != nullptr && pModel->columnCount() == 4
+                  && pModel->headerData(3, Qt::Horizontal).toString()
+                         == QStringLiteral("标记");
+
+        QStandardItem *pOneItem = nullptr;
+        if (pModel != nullptr)
+        {
+            QList<QStandardItem *> stack;
+            for (int r = 0; r < pModel->rowCount(); ++r)
+                if (QStandardItem *p = pModel->item(r, 0))
+                    stack << p;
+            while (!stack.isEmpty())
+            {
+                QStandardItem *p = stack.takeLast();
+                if (p->text().endsWith(QStringLiteral("one.txt")))
+                {
+                    pOneItem = p;
+                    break;
+                }
+                for (int r = 0; r < p->rowCount(); ++r)
+                    if (QStandardItem *c = p->child(r, 0))
+                        stack << c;
+            }
+        }
+        if (pOneItem != nullptr && pModel != nullptr)
+        {
+            const QModelIndex tagIndex =
+                pModel->indexFromItem(pOneItem).siblingAtColumn(3);
+            const QStandardItem *pTagsCell = pModel->itemFromIndex(tagIndex);
+            bCell = pTagsCell != nullptr
+                    && pTagsCell->text().contains(QStringLiteral("合同"));
+        }
+
+        auto *pFilter = mw.findChild<QLineEdit *>(QStringLiteral("leFilter"));
+        if (pFilter != nullptr && pModel != nullptr)
+        {
+            pFilter->setText(QStringLiteral("机密"));
+            QElapsedTimer tWait;
+            tWait.start();
+            while (tWait.elapsed() < 500)
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+
+            std::function<int(const QStandardItem *)> countLeaves =
+                [&](const QStandardItem *pParent) {
+                    int n = 0;
+                    for (int r = 0; r < pParent->rowCount(); ++r)
+                    {
+                        const QStandardItem *c = pParent->child(r, 0);
+                        if (c == nullptr)
+                            continue;
+                        if (c->data(FileListModel::InfoRole).isValid())
+                            ++n;
+                        else
+                            n += countLeaves(c);
+                    }
+                    return n;
+                };
+            int nVisible = 0;
+            for (int r = 0; r < pModel->rowCount(); ++r)
+            {
+                const QStandardItem *p = pModel->item(r, 0);
+                if (p == nullptr)
+                    continue;
+                if (p->data(FileListModel::InfoRole).isValid())
+                    ++nVisible;
+                else
+                    nVisible += countLeaves(p);
+            }
+            bFilter = nVisible == 1;   // 只有 three.txt 的标记是「机密」
+            pFilter->clear();
+            tWait.restart();
+            while (tWait.elapsed() < 300)
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        }
+    }
+    report(bColumn && bCell && bFilter,
+           QStringLiteral("Q9: tag column, cell text and tag-based filtering work"));
+
+    {
+        DlgEntryTags dlgTags(QStringLiteral("one.txt"),
+                             QStringList{ QStringLiteral("合同"), QStringLiteral("重要") },
+                             QStringList{ QStringLiteral("合同") });
+        auto *pEdit = dlgTags.findChild<QLineEdit *>(QStringLiteral("leNewTag"));
+        auto *pAddTag = dlgTags.findChild<QPushButton *>(QStringLiteral("btnAddTag"));
+        bool bDlgOk = false;
+        if (pEdit != nullptr && pAddTag != nullptr)
+        {
+            pEdit->setText(QStringLiteral("机密，机密"));
+            pAddTag->click();
+            const QStringList tags = dlgTags.tags();
+            bDlgOk = tags.size() == 2 && tags.contains(QStringLiteral("合同"))
+                     && tags.contains(QStringLiteral("机密"));
+        }
+        report(bDlgOk,
+               QStringLiteral("Q10: tag dialog merges checked and typed tags without duplicates"));
+    }
+
+    // Q11: 伪造的 v4 头部（TagCount 超限）必须被拒绝。
+    // 只改字段不改 CRC 会先被头部校验拦住，所以这里按格式规则重算一遍头部 CRC，
+    // 确保真正走到「标记数量异常」这条分支，而不是碰巧被别的检查挡下。
+    const QString sBadTags = sDir + QStringLiteral("/bad_tags.fwda");
+    bool bBadHeaderReady = false;
+    if (QFile::copy(sArc, sBadTags) && bHeaderOk)
+    {
+        QFile f(sBadTags);
+        if (f.open(QIODevice::ReadWrite))
+        {
+            const qint64 nHeaderSize = qint64(meta2.headerSize);
+            QByteArray hdr(qsizetype(nHeaderSize), Qt::Uninitialized);
+            if (f.seek(0) && f.read(hdr.data(), nHeaderSize) == nHeaderSize)
+            {
+                // 第一条目的 TagCount 位于「全局头 + 根长度 + 根 + 固定字段末尾」
+                const qint64 nTagCountPos = qint64(FwArc::GLOBAL_HDR) + 4
+                                            + qint64(meta2.root.toUtf8().size())
+                                            + qint64(FwArc::ENTRY_FIXED_V4) - 4;
+                const quint32 nBadCount = FwArc::MAX_TAGS + 1;
+                for (int k = 0; k < 4; ++k)
+                    hdr[int(nTagCountPos) + k] = char((nBadCount >> (8 * k)) & 0xFF);
+                FwArc::Crc32 crc;
+                crc.update(hdr.constData(), 16);
+                crc.update(hdr.constData() + 20, 4);
+                crc.update(hdr.constData() + FwArc::GLOBAL_HDR,
+                           nHeaderSize - qint64(FwArc::GLOBAL_HDR));
+                const quint32 nCrc = crc.value();
+                for (int k = 0; k < 4; ++k)
+                    hdr[16 + k] = char((nCrc >> (8 * k)) & 0xFF);
+                bBadHeaderReady = f.seek(0) && f.write(hdr) == hdr.size();
+                f.close();
+            }
+        }
+    }
+    FileManager fmBadTags;
+    QString sBadTagsErr;
+    const bool bBadTagsRejected = bBadHeaderReady
+                                  && !fmBadTags.validateMergedFile(sBadTags, &sBadTagsErr);
+    report(bBadTagsRejected,
+           QStringLiteral("Q11: oversized TagCount in a forged v4 header is rejected (%1)")
+               .arg(sBadTagsErr));
+    QFile::remove(sBadTags);
+
+    fm.unLoadMergedFile();
+    fmReload.unLoadMergedFile();
+    QFile::remove(sArc2);
     QDir(sDir).removeRecursively();
 }
 
@@ -4013,8 +4332,9 @@ int main(int argc, char **argv)
     // ---------- K: 保存路径规划（P0：添加文件后不得拍平目录） ----------
     verifySavePathPreservation(work, scratchDir);
 
-    // ---------- P: v3 元数据（合并保存 / 导出恢复 / 旧归档兼容） ----------
+    // ---------- P: v3/v4 元数据与标记（合并保存 / 导出恢复 / 旧归档兼容） ----------
     verifyArchiveMetadata(work, scratchDir);
+    verifyArchiveTags(work, scratchDir);
 
     // ---------- AUDIT-2026-11: 本轮审查修复的回归 ----------
     verifyAudit2026Fixes(work, scratchDir);

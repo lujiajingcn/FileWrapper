@@ -17,6 +17,7 @@ FW_CORE = $$PWD
 SOURCES += \
     $$FW_CORE/builtinviewer.cpp \
     $$FW_CORE/dlgabout.cpp \
+    $$FW_CORE/dlgentrytags.cpp \
     $$FW_CORE/dlgfileproperty.cpp \
     $$FW_CORE/dlgmergefile.cpp \
     $$FW_CORE/dlgoutputfile.cpp \
@@ -33,6 +34,7 @@ HEADERS += \
     $$FW_CORE/archiveformat.h \
     $$FW_CORE/builtinviewer.h \
     $$FW_CORE/dlgabout.h \
+    $$FW_CORE/dlgentrytags.h \
     $$FW_CORE/dlgfileproperty.h \
     $$FW_CORE/dlgmergefile.h \
     $$FW_CORE/dlgoutputfile.h \

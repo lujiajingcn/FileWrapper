@@ -4,13 +4,14 @@
 #include <QDialog>
 #include <QPair>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 // 文件列表「右键 → 属性」对话框。
 //
 // 文件行与目录行共用这一个对话框，数据由 MainWindow 从 FileManager 和文件列表
 // 模型收集（本类不直接访问归档，便于在无归档的单元测试里构造 Data 验证排版内容）：
-//   文件：类型 / 位置 / 大小 / 压缩方式
+//   文件：类型 / 位置 / 大小 / 压缩方式 / 标记
 //         所属归档 / 归档格式 / 归档内路径 / 内容校验 / 状态
 //   文件夹：类型 / 位置 / 大小（合计）/ 包含
 //         所属归档 / 归档格式 / 归档内路径
@@ -37,8 +38,9 @@ public:
         int     nDirCount = 0;         // 文件夹：包含的子文件夹数（递归）
         bool    bFiltered = false;     // 大小/数量是否来自当前搜索筛选结果
 
+        QStringList listTags;          // v4 条目标记（v1–v3 归档为空）
         QString sArchivePath;          // 所属归档的完整路径
-        quint32 nArchiveVersion = 0;   // 1 / 2 / 3
+        quint32 nArchiveVersion = 0;   // 1 / 2 / 3 / 4
         QString sEntryPath;            // 归档内路径（FILEINFO::sFilePath）
         bool    bPending = false;      // 新增条目，尚未保存进归档
         bool    bHasCrc = false;

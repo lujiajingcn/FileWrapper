@@ -11,6 +11,7 @@
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
 #include "dlgfileproperty.h"
+#include "dlgentrytags.h"
 #include "builtinviewer.h"
 #include "pluginmanager.h"
 #include "plugindiag.h"
@@ -101,6 +102,12 @@ static const int kThumbnailMaxInFlight  = 1;
 static bool isFileLeafItem(const QStandardItem *pItem)
 {
     return pItem != nullptr && pItem->data(FileListModel::InfoRole).isValid();
+}
+
+// 「标记」列显示文本：多个标记用顿号连接；空串 = 没有标记。
+static QString tagsColumnText(const FILEINFO &info)
+{
+    return info.listTags.join(QStringLiteral("、"));
 }
 
 // 路径归一化：统一分隔符为 '/'，去掉结尾多余的 '/'（保留盘符根如 "E:/"）
@@ -795,22 +802,27 @@ QString MainWindow::pluginFailureText(const QString &sFileName, const QString &s
 void MainWindow::initWidgetFilePath()
 {
     m_hModelFilePath = new FileListModel;
-    m_hModelFilePath->setColumnCount(3);
+    m_hModelFilePath->setColumnCount(4);
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     m_hModelFilePath->setHeaderData(1, Qt::Horizontal, tr("大小"));
     m_hModelFilePath->setHeaderData(2, Qt::Horizontal, tr("类型"));
+    m_hModelFilePath->setHeaderData(3, Qt::Horizontal, tr("标记"));
     m_tvFilePath = ui->treeView;
     m_tvFilePath->setModel(m_hModelFilePath);
     // 列宽策略：
-    //   0 文件路径 —— 自己管理（Interactive），宽度 = 视口宽 - 其余两列，且不低于
+    //   0 文件路径 —— 自己管理（Interactive），宽度 = 视口宽 - 其余三列，且不低于
     //               kMinPathColumnWidth；这样面板拖窄时路径列不会被挤成一条缝，
     //               放不下就出横向滚动条。
     //   1 大小 / 2 类型 —— 按内容自适应。
+    //   3 标记 —— 固定初始宽度、允许手动调整：标记长度差异很大，按内容自适应会
+    //             被某个超长标记把路径列挤没。
     QHeaderView *pHeader = m_tvFilePath->header();
     pHeader->setStretchLastSection(false);
     pHeader->setSectionResizeMode(0, QHeaderView::Interactive);
     pHeader->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     pHeader->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    pHeader->setSectionResizeMode(3, QHeaderView::Interactive);
+    pHeader->resizeSection(3, 110);
     connect(pHeader, &QHeaderView::geometriesChanged, this, [this]() {
         if (m_bAdjustingPathColumn)
             return;
@@ -907,7 +919,7 @@ void MainWindow::initWidgetFilePath()
     pViewMenu->addAction(ui->mainToolBar->toggleViewAction());
     pViewMenu->addAction(ui->dwFilePath->toggleViewAction());
 
-    // 筛选框：单独占一行并拉满宽度（按路径/文件名过滤，树形与平铺模式都生效）
+    // 筛选框：单独占一行并拉满宽度（按路径/文件名/标记过滤，三种视图都生效）
     QWidget *pSearchRow = new QWidget(ui->dockWidgetContents);
     pSearchRow->setObjectName(QStringLiteral("searchRow"));
     QHBoxLayout *pSearchLayout = new QHBoxLayout(pSearchRow);
@@ -916,7 +928,7 @@ void MainWindow::initWidgetFilePath()
 
     m_leFilter = new QLineEdit(pSearchRow);
     m_leFilter->setObjectName(QStringLiteral("leFilter"));
-    m_leFilter->setPlaceholderText(tr("搜索文件名或路径…"));
+    m_leFilter->setPlaceholderText(tr("搜索文件名、路径或标记…"));
     m_leFilter->setClearButtonEnabled(true);
     m_leFilter->setMinimumWidth(160);
     pSearchLayout->addWidget(m_leFilter);
@@ -2717,7 +2729,7 @@ void MainWindow::showFileListContextMenu(QAbstractItemView *pView, const QPoint 
 }
 
 // 构造文件列表右键菜单（不 exec，便于单元测试检查菜单项）：
-//   文件：打开 / 打开新标签页 / ─── / 以文本查看 / 以十六进制查看 / ─── / 属性
+//   文件：打开 / 打开新标签页 / ─── / 标记… / 以文本查看 / 以十六进制查看 / ─── / 属性
 //   目录：属性（目录不能"打开"，双击只做展开/收起）
 QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
 {
@@ -2752,6 +2764,13 @@ QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
         });
         pMenu->addSeparator();
 
+        // v4 标记：改的是归档条目本身，保存后随 .fwda 一起分发
+        QAction *pTags = pMenu->addAction(tr("标记…"));
+        connect(pTags, &QAction::triggered, this, [this, info]() {
+            editEntryTags(info);
+        });
+        pMenu->addSeparator();
+
         // 不合格式也想要"看一眼内容"时的兜底：只作用于这一个文件，
         // 不改变后缀路由（原「插件映射」的手工兜底由它取代）。
         QAction *pText = pMenu->addAction(tr("以文本查看"));
@@ -2781,6 +2800,38 @@ QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
         });
     }
     return pMenu;
+}
+
+// 「标记…」：编辑一个归档条目的 v4 标记。
+// 候选列表来自整个归档（复用已有分类），确认后由 FileManager 归一化并置脏；
+// 视图必须重建：当前筛选词可能正好是某个标记，改完标记后该行可能应该出现/消失。
+void MainWindow::editEntryTags(const FILEINFO &info)
+{
+    if (!m_fileManager->isArchiveLoaded())
+        return;
+
+    QStringList tags = info.listTags;
+    if (!DlgEntryTags::edit(this, info.sFileName, m_fileManager->allTags(),
+                            info.listTags, &tags))
+    {
+        return;   // 用户取消：不动归档
+    }
+
+    QString sErr;
+    if (!m_fileManager->setEntryTags(info.sFilePath, tags, &sErr))
+    {
+        QMessageBox::warning(this, tr("设置标记失败"),
+                             tr("「%1」的标记未保存：\n%2").arg(info.sFileName, sErr));
+        return;
+    }
+
+    refreshFilePathView();
+    syncActionStates();   // 保存按钮与标题的 "*" 跟随脏标记
+    statusBar()->showMessage(
+        tags.isEmpty() ? tr("已清除「%1」的标记").arg(info.sFileName)
+                       : tr("已设置「%1」的标记：%2")
+                             .arg(info.sFileName, tags.join(QStringLiteral("、"))),
+        5000);
 }
 
 // 统计目录子树里的文件数与子文件夹数（目录节点本身不计入）。
@@ -2840,6 +2891,7 @@ DlgFileProperty::Data MainWindow::filePropertyData(const FILEINFO &info) const
     data.nModifiedTime  = info.nModifiedTime;
     data.nAccessedTime  = info.nAccessedTime;
     data.nAttributes    = info.nAttributes;
+    data.listTags       = info.listTags;
     quint32 nCrc = 0;
     data.bHasCrc = m_fileManager->contentCrcFor(info.sFilePath, &nCrc);
     if (data.bHasCrc)
@@ -3596,7 +3648,8 @@ void MainWindow::adjustPathColumnWidth()
     if (pHeader == nullptr)
         return;
 
-    const int nOther = pHeader->sectionSize(1) + pHeader->sectionSize(2);
+    const int nOther = pHeader->sectionSize(1) + pHeader->sectionSize(2)
+                     + pHeader->sectionSize(3);
     const int nAvail = m_tvFilePath->viewport()->width();
     const int nWant = qMax(kMinPathColumnWidth, nAvail - nOther);
     if (nWant <= 0 || pHeader->sectionSize(0) == nWant)
@@ -3638,9 +3691,13 @@ void MainWindow::populateFilePathList(bool bShowPath)
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
         QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
+        QStandardItem *pTags = new QStandardItem(tagsColumnText(info));
+        if (!info.listTags.isEmpty())
+            pTags->setToolTip(tr("标记：%1").arg(tagsColumnText(info)));
         m_hModelFilePath->setItem(nRow, 0, hItemName);
         m_hModelFilePath->setItem(nRow, 1, pSize);
         m_hModelFilePath->setItem(nRow, 2, pType);
+        m_hModelFilePath->setItem(nRow, 3, pTags);
         ++nRow;
     }
 }
@@ -3664,10 +3721,13 @@ void MainWindow::populateFilePathThumbnails(bool bShowPath)
 
         auto *pItem = new QStandardItem(bShowPath ? normalizePath(info.sFilePath)
                                                   : info.sFileName);
-        pItem->setToolTip(tr("%1\n%2 · %3")
-                              .arg(normalizePath(info.sFilePath),
-                                   FwArc::formatSize(info.nFileLen),
-                                   typeLabel(info.sFileName)));
+        QString sTip = tr("%1\n%2 · %3")
+                           .arg(normalizePath(info.sFilePath),
+                                FwArc::formatSize(info.nFileLen),
+                                typeLabel(info.sFileName));
+        if (!info.listTags.isEmpty())
+            sTip += tr("\n标记：%1").arg(tagsColumnText(info));
+        pItem->setToolTip(sTip);
         QVariant var;
         var.setValue(info);
         pItem->setData(var, FileListModel::InfoRole);
@@ -3683,10 +3743,14 @@ void MainWindow::populateFilePathThumbnails(bool bShowPath)
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pSize->setData(info.nFileLen, Qt::UserRole);
         QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
+        QStandardItem *pTags = new QStandardItem(tagsColumnText(info));
+        if (!info.listTags.isEmpty())
+            pTags->setToolTip(tr("标记：%1").arg(tagsColumnText(info)));
 
         m_hModelFilePath->setItem(nRow, 0, pItem);
         m_hModelFilePath->setItem(nRow, 1, pSize);
         m_hModelFilePath->setItem(nRow, 2, pType);
+        m_hModelFilePath->setItem(nRow, 3, pTags);
 
         if (!bHasCachedThumb && info.nFileLen > 0 && info.nFileLen <= kThumbnailMaxBytes
             && isThumbnailImageName(info.sFileName))
@@ -4153,8 +4217,14 @@ bool MainWindow::matchesFilter(const FILEINFO &info) const
 {
     if (m_sFilter.isEmpty())
         return true;
-    return info.sFilePath.contains(m_sFilter, Qt::CaseInsensitive)
-        || info.sFileName.contains(m_sFilter, Qt::CaseInsensitive);
+    if (info.sFilePath.contains(m_sFilter, Qt::CaseInsensitive)
+        || info.sFileName.contains(m_sFilter, Qt::CaseInsensitive))
+        return true;
+    // v4 标记也参与搜索：用户记住的往往是「合同」这类分类，而不是文件名。
+    for (const QString &sTag : info.listTags)
+        if (sTag.contains(m_sFilter, Qt::CaseInsensitive))
+            return true;
+    return false;
 }
 
 QString MainWindow::typeLabel(const QString &sFileName)
@@ -4283,7 +4353,10 @@ void MainWindow::populateFilePathTree()
         }
 
         QStandardItem *hFile = new QStandardItem(iconFile, info.sFileName);
-        hFile->setToolTip(normalizePath(info.sFilePath));
+        QString sTip = normalizePath(info.sFilePath);
+        if (!info.listTags.isEmpty())
+            sTip += tr("\n标记：%1").arg(tagsColumnText(info));
+        hFile->setToolTip(sTip);
         QVariant var;
         var.setValue(info);
         hFile->setData(var, FileListModel::InfoRole);
@@ -4291,15 +4364,19 @@ void MainWindow::populateFilePathTree()
         pSize->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pSize->setData(info.nFileLen, Qt::UserRole);   // 大小列按数值排序用
         QStandardItem *pType = new QStandardItem(typeLabel(info.sFileName));
+        QStandardItem *pTags = new QStandardItem(tagsColumnText(info));
+        if (!info.listTags.isEmpty())
+            pTags->setToolTip(tr("标记：%1").arg(tagsColumnText(info)));
 
         if (pParent != nullptr)
-            pParent->appendRow(QList<QStandardItem *>() << hFile << pSize << pType);
+            pParent->appendRow(QList<QStandardItem *>() << hFile << pSize << pType << pTags);
         else
         {
             const int nRow = m_hModelFilePath->rowCount();
             m_hModelFilePath->setItem(nRow, 0, hFile);
             m_hModelFilePath->setItem(nRow, 1, pSize);
             m_hModelFilePath->setItem(nRow, 2, pType);
+            m_hModelFilePath->setItem(nRow, 3, pTags);
         }
     }
 

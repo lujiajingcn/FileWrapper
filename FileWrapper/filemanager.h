@@ -21,6 +21,8 @@ typedef struct FILEINFO
     qint64  nAccessedTime = 0;
     quint32 nAttributes = 0;    // FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h）
     bool    bHasFsMetadata = false;
+    // v4 条目级标记（归一化后保存；v1–v3 归档条目为空）
+    QStringList listTags;
 } FILEINFO;
 
 Q_DECLARE_METATYPE(FILEINFO)
@@ -78,6 +80,13 @@ public:
     // v1 归档即使用户没改动也需要重写为 v2；保存按钮据此启用
     bool needsSave() const;
     bool isCancelRequested() const;
+
+    // v4 条目标记：写入前统一归一化（去重/trim/长度校验）。
+    // 失败时 psErr 给具体原因，条目保持原样；成功设置脏标记（内容相同则不置脏）。
+    bool setEntryTags(const QString &sFilePath, const QStringList &listTags,
+                      QString *psErr = nullptr);
+    // 当前归档里出现过的全部标记（去重、按本地化顺序排序），供标记编辑器做候选。
+    QStringList allTags() const;
 
     // 最近一次失败的具体原因（含路径与系统错误），UI 据此给出可读提示（P2-5 / P1-3）
     QString lastError() const;

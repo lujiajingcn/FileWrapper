@@ -237,11 +237,13 @@ protected:
     // 把归档里的图片条目解码成缩略图（不是图片/读不出来时返回空 QPixmap）。
     // 与界面展示分离：测试派生类可以直接验证解码结果，不必等后台逐张生成。
     QPixmap renderEntryThumbnail(const FILEINFO &info) const;
-    // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 以文本查看 / 以十六进制查看 / 属性；
-    // 目录行 = 属性。
+    // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 标记… / 以文本查看 / 以十六进制查看 /
+    // 属性；目录行 = 属性。
     // 返回的菜单归调用方 delete；返回 nullptr 表示该行没有可用操作。
     // （protected 是为了让测试派生类能检查菜单项，不弹出真实的模态菜单。）
     QMenu *buildFileListContextMenu(const QModelIndex &index);
+    // 「标记…」：编辑当前条目的标签（v4）。写回失败时弹可见提示，不静默丢弃输入。
+    void editEntryTags(const FILEINFO &info);
     // 「属性」数据收集：把 FILEINFO / 目录子树整理成对话框要展示的字段。
     // 与 show 分离，测试派生类可以直接校验数值而不进入模态对话框。
     DlgFileProperty::Data filePropertyData(const FILEINFO &info) const;

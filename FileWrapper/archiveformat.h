@@ -2,7 +2,7 @@
 #define ARCHIVEFORMAT_H
 
 // ============================================================
-// FileWrapper 归档格式公共定义（v1/v2 兼容读取 / v3 写入）
+// FileWrapper 归档格式公共定义（v1–v3 兼容读取 / v4 写入）
 //
 // 全局头 24 字节（v1 / v2 / v3 完全相同，小端）:
 //   [0..3]   Magic "FWDA"
@@ -27,7 +27,7 @@
 //   头部 CRC 随之重算；内容区留待下一次完整重写时回收。
 //   FileCount 记录物理槽位数（含墓碑），因此可能大于实际可见条目数。
 //
-// v3 头部区（当前写入格式，v1/v2 仍可读取）:
+// v3 头部区（可读取；不再写入）:
 //   [24..27] RootLength u32
 //   [28..]   Root u8[RootLength] (UTF-8)
 //   重复 FileCount 次:
@@ -39,6 +39,21 @@
 //   用于导出/分割时把源文件的只读/隐藏/系统/存档属性写回磁盘。
 //   v3 不再使用墓碑（原地改头部）；删除与新增统一走完整重写。
 //
+// v4 头部区（当前写入格式，v1–v3 仍可读取）:
+//   [24..27] RootLength u32
+//   [28..]   Root u8[RootLength] (UTF-8)
+//   重复 FileCount 次:
+//     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
+//     CreatedMs u64 / ModifiedMs u64 / AccessedMs u64 / Attributes u32
+//     TagCount u32
+//     Path u8[PathLength]
+//     TagCount 个标记: TagLen u32 / Tag u8[TagLen] (UTF-8)
+//   标记是条目级的自定义分类（例如「合同」「重要」）。写入前统一归一化：
+//   去首尾空白、内部连续空白折叠为一个空格、大小写不敏感去重；最多 MAX_TAGS 个，
+//   单个最多 MAX_TAG_CHARS 个字符且不超过 MAX_TAG_LEN 字节（UTF-8）。
+//   旧版本读到 v4 会明确报「不支持的归档版本」并拒绝打开 —— 这是刻意的：
+//   宁可拒绝，也不接受后再保存把标记静默丢掉。
+//
 // 校验说明:
 //   HeaderChecksum 覆盖 全局头[0..15] + 全局头[20..23] + 整个头部区。
 //   v2/v3 每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
@@ -48,6 +63,7 @@
 #include <QtGlobal>
 #include <QString>
 #include <QStringList>
+#include <QSet>
 #include <QByteArray>
 #include <QVector>
 #include <QPair>
@@ -86,15 +102,22 @@ static const char MAGIC[4] = {'F', 'W', 'D', 'A'};
 static const quint32 VERSION_V1       = 1;
 static const quint32 VERSION_V2       = 2;
 static const quint32 VERSION_V3       = 3;
-static const quint32 CURRENT_VERSION  = VERSION_V3;
+static const quint32 VERSION_V4       = 4;   // 条目级标记
+static const quint32 CURRENT_VERSION  = VERSION_V4;
 static const quint32 GLOBAL_HDR       = 24;
 static const quint32 ENTRY_FIXED_V1   = 20;
 static const quint32 ENTRY_FIXED_V2   = 24;
 // v3：v2 的固定字段 + 3 个 u64 时间 + 1 个 u32 属性
 static const quint32 ENTRY_FIXED_V3   = 52;
+// v4：v3 的固定字段 + TagCount u32（标记正文在路径之后，变长）
+static const quint32 ENTRY_FIXED_V4   = 56;
 static const quint32 MAX_FILES        = 1000000;
 static const quint32 MAX_PATH_LEN     = 32768;
 static const quint32 MAX_ROOT_LEN     = 32768;
+// 标记上限：数量与单条长度都必须在解析/写入时收紧，避免伪造头部撑爆内存或界面
+static const quint32 MAX_TAGS         = 32;
+static const quint32 MAX_TAG_LEN      = 128;   // UTF-8 字节
+static const int     MAX_TAG_CHARS    = 40;    // 归一化后的字符数
 static const quint64 MAX_HDR_SIZE     = 512ULL * 1024 * 1024;
 static const quint64 MAX_CONTENT_LEN  = (1ULL << 62);
 // 时间戳合理上界（UTC 毫秒）：9999-12-31 23:59:59.999。
@@ -109,13 +132,15 @@ inline quint32 entryFixedSize(quint32 version)
     case VERSION_V1: return ENTRY_FIXED_V1;
     case VERSION_V2: return ENTRY_FIXED_V2;
     case VERSION_V3: return ENTRY_FIXED_V3;
+    case VERSION_V4: return ENTRY_FIXED_V4;
     default:         return 0;
     }
 }
 
-// v2 起每条都有内容 CRC；v3 起每条都有文件系统元数据。
+// v2 起每条都有内容 CRC；v3 起每条都有文件系统元数据；v4 起每条可带标记。
 inline bool versionHasContentCrc(quint32 version) { return version >= VERSION_V2; }
 inline bool versionHasFsMetadata(quint32 version) { return version >= VERSION_V3; }
+inline bool versionHasTags(quint32 version)       { return version >= VERSION_V4; }
 
 // 把任意时间值收敛到「可显示」的范围：0 或 [1, MAX_TIMESTAMP_MS]。
 inline quint64 sanitizeTimestamp(quint64 ms)
@@ -137,6 +162,8 @@ struct Entry
     quint64 modifiedMs    = 0;
     quint64 accessedMs    = 0;
     quint32 attributes    = 0;
+    // v4 条目级标记（v1–v3 条目为空）
+    QStringList tags;
 };
 
 struct Meta
@@ -449,6 +476,88 @@ inline QString formatSize(qint64 bytes)
     if (bytes >= mb) return QString::number(double(bytes) / mb, 'f', 2) + " MB";
     if (bytes >= kb) return QString::number(double(bytes) / kb, 'f', 2) + " KB";
     return QString::number(bytes) + " B";
+}
+
+// ============================================================
+// 条目标记（v4）
+//
+// 归一化规则由 UI 输入、写入端、解析端共用同一份，避免「界面能输入、
+// 写进归档时才报错」：
+//   * 去首尾空白，内部连续空白折叠成一个空格；
+//   * 大小写不敏感去重（保留首次出现的写法）；
+//   * 最多 MAX_TAGS 个，单个不超过 MAX_TAG_CHARS 字符 / MAX_TAG_LEN 字节；
+//   * 不允许控制字符与分隔符 , ， ; ； 、——这些是输入框里的分隔符，
+//     允许它们出现在标记正文里会让「重新编辑」时被拆成多个标记。
+// 解析端要求归档里的标记已经是归一化形式：手改/伪造的头部直接拒绝，
+// 而不是悄悄改写后再保存。
+// ============================================================
+inline QString normalizeTag(const QString &sTag)
+{
+    return sTag.simplified();
+}
+
+inline bool isValidTag(const QString &sTag, QString *psErr = nullptr)
+{
+    auto fail = [psErr](const QString &m) { if (psErr) *psErr = m; return false; };
+    if (sTag.isEmpty())
+        return fail(QStringLiteral("标记不能为空"));
+    if (sTag != normalizeTag(sTag))
+        return fail(QStringLiteral("标记不能有首尾空白或连续空白：%1").arg(sTag.left(20)));
+    if (sTag.size() > int(MAX_TAG_CHARS))
+        return fail(QStringLiteral("标记过长（最多 %1 个字符）：%2")
+                        .arg(int(MAX_TAG_CHARS)).arg(sTag.left(20)));
+    if (sTag.toUtf8().size() > int(MAX_TAG_LEN))
+        return fail(QStringLiteral("标记过长（最多 %1 字节）：%2")
+                        .arg(qulonglong(MAX_TAG_LEN)).arg(sTag.left(20)));
+    static const QString kSeparators = QStringLiteral(",，;；、");
+    for (const QChar ch : sTag)
+    {
+        if (ch.unicode() < 0x20 || ch.unicode() == 0x7F)
+            return fail(QStringLiteral("标记不能包含控制字符"));
+        if (kSeparators.contains(ch))
+            return fail(QStringLiteral("标记不能包含分隔符 , ， ; ； 、：%1").arg(sTag.left(20)));
+    }
+    return true;
+}
+
+// 归一化一组标记；psErr 非空表示失败（失败时返回空表）。
+inline QStringList normalizeTags(const QStringList &tags, QString *psErr = nullptr)
+{
+    if (psErr) psErr->clear();
+    QStringList out;
+    QSet<QString> seen;
+    for (const QString &raw : tags)
+    {
+        const QString tag = normalizeTag(raw);
+        if (tag.isEmpty())
+            continue;   // 输入框里的空段（"a,,b"）直接忽略
+        QString why;
+        if (!isValidTag(tag, &why))
+        {
+            if (psErr) *psErr = why;
+            return QStringList();
+        }
+        const QString key = tag.toCaseFolded();
+        if (seen.contains(key))
+            continue;
+        if (out.size() >= int(MAX_TAGS))
+        {
+            if (psErr) *psErr = QStringLiteral("标记过多（最多 %1 个）").arg(int(MAX_TAGS));
+            return QStringList();
+        }
+        seen.insert(key);
+        out << tag;
+    }
+    return out;
+}
+
+// 一条记录的标记区字节数（不含 v4 固定字段里的 TagCount）。
+inline quint64 tagPayloadBytes(const QStringList &tags)
+{
+    quint64 n = 0;
+    for (const QString &tag : tags)
+        n += 4 + quint64(tag.toUtf8().size());
+    return n;
 }
 
 } // namespace FwArc

@@ -29,6 +29,8 @@ QString archiveFormatText(quint32 nVersion)
         return QCoreApplication::translate("DlgFileProperty", "FWDA v2");
     case FwArc::VERSION_V3:
         return QCoreApplication::translate("DlgFileProperty", "FWDA v3");
+    case FwArc::VERSION_V4:
+        return QCoreApplication::translate("DlgFileProperty", "FWDA v4");
     default:
         return QCoreApplication::translate("DlgFileProperty", "未知");
     }
@@ -277,6 +279,9 @@ QVector<DlgFileProperty::Section> DlgFileProperty::buildSections(const Data &dat
     else
     {
         basic.rows.append(qMakePair(tr("压缩方式"), tr("不压缩（原样存储）")));
+        basic.rows.append(qMakePair(tr("标记"),
+            data.listTags.isEmpty() ? QStringLiteral("—")
+                                    : data.listTags.join(QStringLiteral("、"))));
     }
     sections.append(basic);
 
