@@ -19,15 +19,18 @@
      <item row="0" column="0">
       <layout class="QGridLayout" name="gridLayout_4">
        <item row="0" column="0">
-        <layout class="QGridLayout" name="gridLayout_3">
-         <item row="0" column="0">
-          <widget class="QLabel" name="label">
-           <property name="text">
-            <string>待合并的文件路径</string>
+        <layout class="QGridLayout" name="gridLayout_3" columnstretch="5,0,0">
+         <item row="1" column="0" colspan="2">
+          <widget class="QTreeView" name="treeView">
+           <property name="selectionMode">
+            <enum>QAbstractItemView::SelectionMode::ExtendedSelection</enum>
+           </property>
+           <property name="selectionBehavior">
+            <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>
            </property>
           </widget>
          </item>
-         <item row="1" column="0" colspan="2">
+         <item row="0" column="0" colspan="2">
           <widget class="QLabel" name="labelSummary">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Ignored" vsizetype="Preferred">
@@ -40,17 +43,7 @@
            </property>
           </widget>
          </item>
-         <item row="2" column="0" colspan="2">
-          <widget class="QTreeView" name="treeView">
-           <property name="selectionMode">
-            <enum>QAbstractItemView::SelectionMode::ExtendedSelection</enum>
-           </property>
-           <property name="selectionBehavior">
-            <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>
-           </property>
-          </widget>
-         </item>
-         <item row="2" column="2">
+         <item row="1" column="2">
           <layout class="QGridLayout" name="gridLayout_2">
            <item row="0" column="0">
             <widget class="QPushButton" name="btnAddDir">
@@ -92,15 +85,12 @@
        </item>
        <item row="1" column="0">
         <layout class="QGridLayout" name="gridLayout">
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_2">
+         <item row="0" column="1">
+          <widget class="QLineEdit" name="leMergedFilePath">
            <property name="text">
             <string>合并后的文件路径</string>
            </property>
           </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLineEdit" name="leMergedFilePath"/>
          </item>
          <item row="0" column="2">
           <widget class="QPushButton" name="btnMergedFilePath">
@@ -117,14 +107,14 @@
              <verstretch>0</verstretch>
             </sizepolicy>
            </property>
-           <property name="textInteractionFlags">
-            <set>Qt::TextInteractionFlag::TextSelectableByMouse</set>
+           <property name="text">
+            <string/>
            </property>
            <property name="wordWrap">
             <bool>true</bool>
            </property>
-           <property name="text">
-            <string/>
+           <property name="textInteractionFlags">
+            <set>Qt::TextInteractionFlag::TextSelectableByMouse</set>
            </property>
           </widget>
          </item>

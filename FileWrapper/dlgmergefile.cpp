@@ -57,7 +57,7 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
     m_hModelFilePath = new QStandardItemModel(this);
     m_hModelFilePath->setColumnCount(1);
-    m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
+    m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("待合并的文件路径"));
     ui->treeView->setModel(m_hModelFilePath);
     // 多选 + 整行选中；按 Delete 键等同于点「删除」
     ui->treeView->setSelectionMode(QAbstractItemView::ExtendedSelection);
