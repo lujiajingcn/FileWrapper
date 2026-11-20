@@ -51,7 +51,7 @@ int main(int argc, char *argv[])
     applyTheme(a);
     installChineseTranslator(a);
 
-    a.setWindowIcon(FwIcons::get(QStringLiteral("appicon")));
+    a.setWindowIcon(FwIcons::appIcon());
     MainWindow w;
     w.show();
 

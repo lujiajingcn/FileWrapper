@@ -1,0 +1,3327 @@
+{
+  "appicon": {
+    "query": "archive box package",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "box",
+        "label": "Package",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "box",
+          "parcel",
+          "shipping",
+          "product",
+          "carton"
+        ],
+        "score": 8.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "archive-chat-box",
+        "label": "Archive chat",
+        "set": "communication",
+        "category": "communication-messages",
+        "tags": [
+          "archive",
+          "box",
+          "hide chat",
+          "store",
+          "conversation"
+        ],
+        "score": 7.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "archive",
+        "label": "Archive",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "box",
+          "storage",
+          "store",
+          "backup"
+        ],
+        "score": 7.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-box",
+        "label": "File box",
+        "set": "business",
+        "category": "business-office",
+        "tags": [
+          "storage box",
+          "banker box",
+          "archive",
+          "records"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "package-minus",
+        "label": "Remove package",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "package minus",
+          "remove from order",
+          "box minus",
+          "subtract item",
+          "package loss",
+          "take out"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "package-lost",
+        "label": "Lost package",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "package off",
+          "lost parcel",
+          "missing box",
+          "box question mark",
+          "package loss",
+          "undelivered"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "evidence-box",
+        "label": "Evidence box",
+        "set": "legal",
+        "category": "legal-law",
+        "tags": [
+          "banker box",
+          "case file box",
+          "exhibit storage",
+          "archive box",
+          "evidence"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "archive-x",
+        "label": "Archive x",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "delete",
+          "remove",
+          "clear",
+          "box"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "pr-package",
+        "label": "PR package",
+        "set": "social",
+        "category": "social-marketing",
+        "tags": [
+          "press kit box",
+          "influencer mail",
+          "gifted product",
+          "seeding",
+          "send out"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "package-open",
+        "label": "Package open",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "box",
+          "unbox",
+          "parcel",
+          "delivered"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "package-check",
+        "label": "Package check",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "box",
+          "delivered",
+          "parcel",
+          "received"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "package-plus",
+        "label": "Add package",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "box",
+          "new",
+          "parcel",
+          "shipment"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "load": {
+    "query": "open archive package",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "package-open",
+        "label": "Package open",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "box",
+          "unbox",
+          "parcel",
+          "delivered"
+        ],
+        "score": 10.67,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-zip",
+        "label": "Zip file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "archive",
+          "compressed",
+          "rar",
+          "package"
+        ],
+        "score": -1.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "jar-file",
+        "label": "Jar file",
+        "set": "files",
+        "category": "files-dev",
+        "tags": [
+          "java archive",
+          "library bundle",
+          "packaged classes",
+          "jar archive",
+          "dependency"
+        ],
+        "score": -2.78,
+        "matchedAllWords": false
+      },
+      {
+        "name": "sliding-door",
+        "label": "Sliding door",
+        "set": "architecture",
+        "category": "architecture-structure",
+        "tags": [
+          "automatic door",
+          "glass door",
+          "patio door",
+          "slide open",
+          "entrance"
+        ],
+        "score": -3.51,
+        "matchedAllWords": false
+      },
+      {
+        "name": "bascule-bridge",
+        "label": "Bascule bridge",
+        "set": "architecture",
+        "category": "architecture-structure",
+        "tags": [
+          "lifting bridge",
+          "opening bridge",
+          "drawbridge",
+          "raised span",
+          "river crossing"
+        ],
+        "score": -4.73,
+        "matchedAllWords": false
+      },
+      {
+        "name": "floor-plan-door",
+        "label": "Door plan symbol",
+        "set": "architecture",
+        "category": "architecture-plans",
+        "tags": [
+          "door swing",
+          "plan symbol",
+          "door opening",
+          "drafting",
+          "floor plan"
+        ],
+        "score": -7.73,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "unload": {
+    "query": "close archive eject",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "archive-x",
+        "label": "Archive x",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "delete",
+          "remove",
+          "clear",
+          "box"
+        ],
+        "score": 8.53,
+        "matchedAllWords": false
+      },
+      {
+        "name": "usb-x",
+        "label": "USB x",
+        "set": "devices",
+        "category": "devices-connectivity",
+        "tags": [
+          "usb error",
+          "eject",
+          "remove drive",
+          "flash drive",
+          "not recognized"
+        ],
+        "score": 2.42,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-x",
+        "label": "File x",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "remove",
+          "error",
+          "document",
+          "cancel",
+          "write off",
+          "bad debt",
+          "void",
+          "uncollectible",
+          "veto",
+          "reject"
+        ],
+        "score": 1.2,
+        "matchedAllWords": false
+      },
+      {
+        "name": "clipboard-x",
+        "label": "Clipboard x",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "clear",
+          "remove",
+          "cancel",
+          "rejected"
+        ],
+        "score": 1.2,
+        "matchedAllWords": false
+      },
+      {
+        "name": "badge-x",
+        "label": "Badge x",
+        "set": "symbols",
+        "category": "symbols-badges",
+        "tags": [
+          "unverified",
+          "rejected",
+          "invalid",
+          "seal"
+        ],
+        "score": 0.87,
+        "matchedAllWords": false
+      },
+      {
+        "name": "plug-x",
+        "label": "Plug x",
+        "set": "devices",
+        "category": "devices-power",
+        "tags": [
+          "unplugged",
+          "no power",
+          "disconnect",
+          "power error",
+          "electric"
+        ],
+        "score": 0.87,
+        "matchedAllWords": false
+      },
+      {
+        "name": "coin-x",
+        "label": "Coin x",
+        "set": "crypto",
+        "category": "crypto-coins",
+        "tags": [
+          "rejected",
+          "scam",
+          "invalid",
+          "remove"
+        ],
+        "score": 0.87,
+        "matchedAllWords": false
+      },
+      {
+        "name": "passport-x",
+        "label": "Passport x",
+        "set": "travel",
+        "category": "travel-trips",
+        "tags": [
+          "passport rejected",
+          "invalid id",
+          "visa denied",
+          "expired",
+          "identity"
+        ],
+        "score": 0.87,
+        "matchedAllWords": false
+      },
+      {
+        "name": "cross-bracing",
+        "label": "Cross bracing",
+        "set": "architecture",
+        "category": "architecture-structure",
+        "tags": [
+          "x bracing",
+          "braced frame",
+          "diagonal bracing",
+          "lateral support",
+          "steel frame"
+        ],
+        "score": 0.8,
+        "matchedAllWords": false
+      },
+      {
+        "name": "invoice-x",
+        "label": "Invoice cancelled",
+        "set": "commerce",
+        "category": "commerce-payments",
+        "tags": [
+          "void invoice",
+          "rejected bill",
+          "cancel",
+          "statement",
+          "delete"
+        ],
+        "score": 0.67,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "merge": {
+    "query": "merge files",
+    "weak": false,
+    "results": [
+      {
+        "name": "file-merge",
+        "label": "Merge files",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "combine",
+          "join",
+          "consolidate",
+          "document",
+          "unite"
+        ],
+        "score": 34.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "git-merge",
+        "label": "Git merge",
+        "set": "files",
+        "category": "files-dev",
+        "tags": [
+          "git",
+          "version control",
+          "combine",
+          "join"
+        ],
+        "score": 11,
+        "matchedAllWords": true
+      },
+      {
+        "name": "folder-merge",
+        "label": "Merge folders",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "combine",
+          "join",
+          "consolidate",
+          "directories",
+          "unite"
+        ],
+        "score": 11,
+        "matchedAllWords": true
+      },
+      {
+        "name": "files",
+        "label": "Files",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "documents",
+          "pages",
+          "copies",
+          "multiple"
+        ],
+        "score": 3.13,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file",
+        "label": "File",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "document",
+          "page",
+          "paper",
+          "blank",
+          "sheet"
+        ],
+        "score": 3.04,
+        "matchedAllWords": false
+      },
+      {
+        "name": "merge",
+        "label": "Merge arrows",
+        "set": "arrows",
+        "category": "arrows-transfer",
+        "tags": [
+          "combine",
+          "join",
+          "converge",
+          "git"
+        ],
+        "score": 3,
+        "matchedAllWords": false
+      },
+      {
+        "name": "fireproof-document-box",
+        "label": "Fireproof box",
+        "set": "emergency",
+        "category": "emergency-prep",
+        "tags": [
+          "fire safe box",
+          "document safe",
+          "lock box",
+          "important papers",
+          "valuables box",
+          "fire resistant case"
+        ],
+        "score": 1.35,
+        "matchedAllWords": true
+      },
+      {
+        "name": "merge-layers",
+        "label": "Merge layers",
+        "set": "editor",
+        "category": "editor-shapes",
+        "tags": [
+          "merge down",
+          "combine layers",
+          "flatten two",
+          "layers",
+          "composite",
+          "stack"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "split": {
+    "query": "split file",
+    "weak": false,
+    "results": [
+      {
+        "name": "file-split",
+        "label": "Split file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "divide",
+          "separate",
+          "cut",
+          "document",
+          "break apart"
+        ],
+        "score": 34.98,
+        "matchedAllWords": true
+      },
+      {
+        "name": "multipart-upload",
+        "label": "Multipart upload",
+        "set": "network",
+        "category": "network-cloud",
+        "tags": [
+          "chunked upload",
+          "big file",
+          "pieces",
+          "resumable",
+          "split file"
+        ],
+        "score": 12,
+        "matchedAllWords": true
+      },
+      {
+        "name": "file",
+        "label": "File",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "document",
+          "page",
+          "paper",
+          "blank",
+          "sheet"
+        ],
+        "score": 3.19,
+        "matchedAllWords": false
+      },
+      {
+        "name": "split",
+        "label": "Split",
+        "set": "arrows",
+        "category": "arrows-transfer",
+        "tags": [
+          "fork",
+          "branch",
+          "divide",
+          "separate"
+        ],
+        "score": 3,
+        "matchedAllWords": false
+      },
+      {
+        "name": "side-canvas",
+        "label": "Side canvas",
+        "set": "ai",
+        "category": "ai-assistants",
+        "tags": [
+          "artifact",
+          "split view",
+          "document beside chat",
+          "workspace",
+          "editor panel"
+        ],
+        "score": 2,
+        "matchedAllWords": true
+      },
+      {
+        "name": "splits",
+        "label": "Splits",
+        "set": "wellness",
+        "category": "wellness-yoga",
+        "tags": [
+          "hanumanasana",
+          "front splits",
+          "flexibility",
+          "yoga pose",
+          "stretch"
+        ],
+        "score": 1.49,
+        "matchedAllWords": false
+      },
+      {
+        "name": "files",
+        "label": "Files",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "documents",
+          "pages",
+          "copies",
+          "multiple"
+        ],
+        "score": 1.41,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-plus",
+        "label": "New file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "file",
+          "add",
+          "create",
+          "document"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-json",
+        "label": "JSON file",
+        "set": "files",
+        "category": "files-dev",
+        "tags": [
+          "json",
+          "curly braces",
+          "data file",
+          "object",
+          "payload"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-sql",
+        "label": "SQL file",
+        "set": "files",
+        "category": "files-dev",
+        "tags": [
+          "sql",
+          "database file",
+          "query",
+          "dump",
+          "db"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "add": {
+    "query": "file plus add",
+    "weak": false,
+    "results": [
+      {
+        "name": "file-plus",
+        "label": "New file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "file",
+          "add",
+          "create",
+          "document"
+        ],
+        "score": 43.63,
+        "matchedAllWords": true
+      },
+      {
+        "name": "book-plus",
+        "label": "Add book",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "new",
+          "create",
+          "library",
+          "add"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "clipboard-plus",
+        "label": "Add clipboard",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "add",
+          "new task",
+          "create",
+          "paste",
+          "form"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "layers-plus",
+        "label": "Add layers",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "add layer",
+          "new layer",
+          "stack",
+          "create",
+          "overlay"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "printer-plus",
+        "label": "Add printer",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "new printer",
+          "install",
+          "connect",
+          "printer",
+          "add device"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "notebook-plus",
+        "label": "Add notebook",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "new notebook",
+          "journal",
+          "create",
+          "diary",
+          "add"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "server-plus",
+        "label": "Add server",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "new server",
+          "provision",
+          "host",
+          "add",
+          "infrastructure"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "database-plus",
+        "label": "Add database",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "new database",
+          "create",
+          "provision",
+          "data",
+          "add"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "note-plus",
+        "label": "Add note",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "new note",
+          "sticky",
+          "memo",
+          "create",
+          "post-it"
+        ],
+        "score": 17.4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "folder-plus",
+        "label": "New folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "add",
+          "create",
+          "directory",
+          "new folder",
+          "folder"
+        ],
+        "score": 16.05,
+        "matchedAllWords": true
+      }
+    ]
+  },
+  "add_dir": {
+    "query": "folder plus",
+    "weak": false,
+    "results": [
+      {
+        "name": "folder-plus",
+        "label": "New folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "add",
+          "create",
+          "directory",
+          "new folder",
+          "folder"
+        ],
+        "score": 37.42,
+        "matchedAllWords": true
+      },
+      {
+        "name": "map-plus",
+        "label": "Add map",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "new map",
+          "create map",
+          "add area",
+          "atlas",
+          "folded map"
+        ],
+        "score": 10.45,
+        "matchedAllWords": true
+      },
+      {
+        "name": "plus",
+        "label": "Plus",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "add",
+          "new",
+          "create",
+          "increase",
+          "insert"
+        ],
+        "score": 3.19,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder",
+        "label": "Folder",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "directory",
+          "files",
+          "project",
+          "collection",
+          "archive"
+        ],
+        "score": 3.19,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folders",
+        "label": "Folders",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "directories",
+          "collection",
+          "multiple",
+          "stack"
+        ],
+        "score": 1.41,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-open",
+        "label": "Folder open",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "directory",
+          "browse",
+          "files",
+          "open folder",
+          "explore"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-minus",
+        "label": "Folder minus",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "remove",
+          "delete",
+          "directory",
+          "remove folder",
+          "folder"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-closed",
+        "label": "Closed folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "directory",
+          "shut",
+          "collapsed",
+          "folder",
+          "files"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-home",
+        "label": "Home folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "home",
+          "user folder",
+          "house",
+          "directory",
+          "personal"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-mail",
+        "label": "Mail folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "email folder",
+          "mailbox",
+          "messages",
+          "envelope",
+          "directory"
+        ],
+        "score": 0.37,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "delete": {
+    "query": "trash delete",
+    "weak": false,
+    "results": [
+      {
+        "name": "trash",
+        "label": "Trash",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "delete",
+          "remove",
+          "bin",
+          "garbage",
+          "waste",
+          "discard"
+        ],
+        "score": 17.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "trash-clock",
+        "label": "Auto-delete",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "scheduled delete",
+          "expire",
+          "retention",
+          "bin",
+          "timer"
+        ],
+        "score": 17,
+        "matchedAllWords": true
+      },
+      {
+        "name": "trash-x",
+        "label": "Trash x",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "delete permanently",
+          "remove",
+          "discard",
+          "bin",
+          "cancel"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "trash-restore",
+        "label": "Restore from trash",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "undelete",
+          "recover",
+          "restore",
+          "bin",
+          "put back",
+          "recover delete",
+          "recover deleted",
+          "restore deleted"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "file-delete",
+        "label": "Delete file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "trash",
+          "remove",
+          "bin",
+          "document",
+          "discard"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "delete-account",
+        "label": "Delete account",
+        "set": "cyber",
+        "category": "cyber-privacy",
+        "tags": [
+          "remove user",
+          "close account",
+          "trash",
+          "profile"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "public-bin",
+        "label": "Public bin",
+        "set": "legal",
+        "category": "legal-public",
+        "tags": [
+          "litter bin",
+          "trash",
+          "waste",
+          "garbage"
+        ],
+        "score": 13.4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "bin-bag",
+        "label": "Bin bag",
+        "set": "home",
+        "category": "home-cleaning",
+        "tags": [
+          "trash bag",
+          "garbage bag",
+          "rubbish",
+          "waste"
+        ],
+        "score": 13.4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "recycle-bin",
+        "label": "Recycle bin",
+        "set": "energy",
+        "category": "energy-recycling",
+        "tags": [
+          "recycling",
+          "waste",
+          "trash",
+          "garbage"
+        ],
+        "score": 13.4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "trash-sparkle",
+        "label": "Emptied trash",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "empty trash",
+          "clean bin",
+          "cleared",
+          "purged",
+          "nothing deleted"
+        ],
+        "score": 13.25,
+        "matchedAllWords": true
+      }
+    ]
+  },
+  "export": {
+    "query": "file export download",
+    "weak": false,
+    "results": [
+      {
+        "name": "pdf-download-sheet",
+        "label": "Download PDF",
+        "set": "files",
+        "category": "files-documents",
+        "tags": [
+          "file download pdf",
+          "download pdf",
+          "save as pdf",
+          "export pdf",
+          "pdf arrow",
+          "get document"
+        ],
+        "score": 17.48,
+        "matchedAllWords": true
+      },
+      {
+        "name": "download",
+        "label": "Download",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "save",
+          "export",
+          "arrow",
+          "get",
+          "arrow down"
+        ],
+        "score": 7.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-down",
+        "label": "File download",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "download",
+          "import",
+          "save",
+          "document"
+        ],
+        "score": 6.88,
+        "matchedAllWords": false
+      },
+      {
+        "name": "message-download",
+        "label": "Download message",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "save chat",
+          "export conversation",
+          "download",
+          "bubble",
+          "archive"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "chart-export",
+        "label": "Export chart",
+        "set": "charts",
+        "category": "charts-data",
+        "tags": [
+          "download chart",
+          "save image",
+          "export graph",
+          "png",
+          "report"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "malicious-download",
+        "label": "Malicious download",
+        "set": "cyber",
+        "category": "cyber-threats",
+        "tags": [
+          "drive-by",
+          "infected file",
+          "download",
+          "warning"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "receipt-download",
+        "label": "Download receipt",
+        "set": "commerce",
+        "category": "commerce-payments",
+        "tags": [
+          "save receipt",
+          "export bill",
+          "pdf receipt",
+          "purchase",
+          "download"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "invoice-download",
+        "label": "Download invoice",
+        "set": "commerce",
+        "category": "commerce-payments",
+        "tags": [
+          "save invoice",
+          "export bill",
+          "pdf invoice",
+          "statement",
+          "download"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-up",
+        "label": "File upload",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "upload",
+          "export",
+          "send",
+          "document"
+        ],
+        "score": 4.99,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-share",
+        "label": "Share file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "send",
+          "forward",
+          "distribute",
+          "document",
+          "export"
+        ],
+        "score": 4.99,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "save": {
+    "query": "save file disk",
+    "weak": false,
+    "results": [
+      {
+        "name": "save-slot",
+        "label": "Save slot",
+        "set": "gaming",
+        "category": "gaming-hud",
+        "tags": [
+          "save game",
+          "floppy disk",
+          "checkpoint",
+          "save file",
+          "manual save",
+          "progress"
+        ],
+        "score": 20.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "save",
+        "label": "Save",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "floppy",
+          "disk",
+          "store",
+          "keep"
+        ],
+        "score": 17.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "save-all",
+        "label": "Save all",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "floppy",
+          "disk",
+          "multiple",
+          "store"
+        ],
+        "score": 14.9,
+        "matchedAllWords": true
+      },
+      {
+        "name": "save-as",
+        "label": "Save as",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "save copy",
+          "floppy",
+          "rename",
+          "export",
+          "duplicate file"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-down",
+        "label": "File download",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "download",
+          "import",
+          "save",
+          "document"
+        ],
+        "score": 4.99,
+        "matchedAllWords": false
+      },
+      {
+        "name": "disk-image",
+        "label": "Disk image",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "iso",
+          "dmg",
+          "image file",
+          "disc file",
+          "mount"
+        ],
+        "score": 4.66,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-email",
+        "label": "Email file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "eml",
+          "saved email",
+          "message",
+          "envelope",
+          "mail",
+          "document"
+        ],
+        "score": 4.1,
+        "matchedAllWords": false
+      },
+      {
+        "name": "disk-cleanup",
+        "label": "Disk cleanup",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "clean up",
+          "free space",
+          "junk files",
+          "broom",
+          "optimize storage"
+        ],
+        "score": 3.43,
+        "matchedAllWords": false
+      },
+      {
+        "name": "disk-usage",
+        "label": "Disk usage",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "storage space",
+          "disk space",
+          "capacity",
+          "pie",
+          "used space",
+          "drive"
+        ],
+        "score": 3.29,
+        "matchedAllWords": false
+      },
+      {
+        "name": "disk-platter",
+        "label": "Disk platter",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "hard disk",
+          "spindle",
+          "read arm",
+          "hdd",
+          "spinning"
+        ],
+        "score": 3.29,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "browse": {
+    "query": "folder open browse",
+    "weak": false,
+    "results": [
+      {
+        "name": "folder-open",
+        "label": "Folder open",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "directory",
+          "browse",
+          "files",
+          "open folder",
+          "explore"
+        ],
+        "score": 43.73,
+        "matchedAllWords": true
+      },
+      {
+        "name": "folder-unlock",
+        "label": "Unlocked folder",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "unlocked",
+          "open access",
+          "public folder",
+          "directory",
+          "unprotected"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-search",
+        "label": "Folder search",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "find",
+          "lookup",
+          "browse",
+          "directory"
+        ],
+        "score": 4.99,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-clock",
+        "label": "Recent folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "recent",
+          "time",
+          "history",
+          "directory",
+          "last opened"
+        ],
+        "score": 3.77,
+        "matchedAllWords": false
+      },
+      {
+        "name": "show-in-folder",
+        "label": "Show in folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "folder",
+          "open",
+          "reveal",
+          "show in folder",
+          "reveal in explorer",
+          "locate file",
+          "finder"
+        ],
+        "score": 2.21,
+        "matchedAllWords": false
+      },
+      {
+        "name": "browser-plus",
+        "label": "Add browser",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "new window",
+          "new tab",
+          "open website",
+          "add page",
+          "web"
+        ],
+        "score": 1.62,
+        "matchedAllWords": false
+      },
+      {
+        "name": "new-tab",
+        "label": "New tab",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "add tab",
+          "open tab",
+          "browser tab",
+          "plus",
+          "tab"
+        ],
+        "score": -2.78,
+        "matchedAllWords": false
+      },
+      {
+        "name": "door-wedge-stop",
+        "label": "Door wedge stop",
+        "set": "hotel",
+        "category": "hotel-room",
+        "tags": [
+          "doorstop",
+          "wedge",
+          "door holder",
+          "prop open",
+          "rubber stop"
+        ],
+        "score": -6.11,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "ok": {
+    "query": "check circle confirm",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "circle-check",
+        "label": "Success",
+        "set": "generic",
+        "category": "status",
+        "tags": [
+          "done",
+          "complete",
+          "verified",
+          "check"
+        ],
+        "score": 9.98,
+        "matchedAllWords": false
+      },
+      {
+        "name": "check",
+        "label": "Check",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "done",
+          "tick",
+          "confirm",
+          "success"
+        ],
+        "score": 7.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "plane-check",
+        "label": "Flight confirmed",
+        "set": "travel",
+        "category": "travel-transport",
+        "tags": [
+          "flight booked",
+          "checked in",
+          "ticket confirmed",
+          "on time",
+          "plane"
+        ],
+        "score": 4.16,
+        "matchedAllWords": false
+      },
+      {
+        "name": "settings-check",
+        "label": "Settings saved",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "preferences applied",
+          "config ok",
+          "setup done",
+          "gear",
+          "confirm"
+        ],
+        "score": 4,
+        "matchedAllWords": false
+      },
+      {
+        "name": "tag-check",
+        "label": "Price confirmed",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "approved price",
+          "tag verified",
+          "label done",
+          "price ok",
+          "checked"
+        ],
+        "score": 3.91,
+        "matchedAllWords": false
+      },
+      {
+        "name": "calendar-check",
+        "label": "Calendar check",
+        "set": "security",
+        "category": "security-time",
+        "tags": [
+          "booked",
+          "confirmed",
+          "event",
+          "date",
+          "appointment",
+          "booking",
+          "visit",
+          "schedule",
+          "calendar"
+        ],
+        "score": 3.67,
+        "matchedAllWords": false
+      },
+      {
+        "name": "coin-check",
+        "label": "Coin check",
+        "set": "crypto",
+        "category": "crypto-coins",
+        "tags": [
+          "verified",
+          "confirmed",
+          "approved",
+          "legit"
+        ],
+        "score": 3.67,
+        "matchedAllWords": false
+      },
+      {
+        "name": "ticket-check",
+        "label": "Ticket check",
+        "set": "events",
+        "category": "events-venues",
+        "tags": [
+          "valid",
+          "scanned",
+          "admitted",
+          "confirmed"
+        ],
+        "score": 3.67,
+        "matchedAllWords": false
+      },
+      {
+        "name": "basket-check",
+        "label": "Basket checked",
+        "set": "commerce",
+        "category": "commerce-shopping",
+        "tags": [
+          "added",
+          "groceries",
+          "done",
+          "shopping basket",
+          "confirmed"
+        ],
+        "score": 3.18,
+        "matchedAllWords": false
+      },
+      {
+        "name": "receipt-check",
+        "label": "Receipt paid",
+        "set": "commerce",
+        "category": "commerce-payments",
+        "tags": [
+          "paid bill",
+          "payment confirmed",
+          "settled",
+          "purchase",
+          "check"
+        ],
+        "score": 3,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "cancel": {
+    "query": "x circle close",
+    "weak": false,
+    "results": [
+      {
+        "name": "x-circle",
+        "label": "Error",
+        "set": "security",
+        "category": "security-alerts",
+        "tags": [
+          "close",
+          "cancel",
+          "failed",
+          "remove"
+        ],
+        "score": 37.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "letter-circle-x",
+        "label": "Letter X in circle",
+        "set": "symbols",
+        "category": "symbols-badges",
+        "tags": [
+          "circled x",
+          "letter x",
+          "x in circle",
+          "alphabet",
+          "initial",
+          "monogram"
+        ],
+        "score": 8.78,
+        "matchedAllWords": false
+      },
+      {
+        "name": "close",
+        "label": "Close",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "x",
+          "dismiss",
+          "cancel",
+          "cross"
+        ],
+        "score": 7.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "window-close",
+        "label": "Close window",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "close",
+          "quit window",
+          "dismiss",
+          "exit",
+          "x"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "menu-close",
+        "label": "Close menu",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "close navigation",
+          "hamburger close",
+          "dismiss menu",
+          "x",
+          "menu"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "terminal-x",
+        "label": "Close terminal",
+        "set": "dev",
+        "category": "dev-cli",
+        "tags": [
+          "error",
+          "failed",
+          "exit",
+          "console"
+        ],
+        "score": 5,
+        "matchedAllWords": false
+      },
+      {
+        "name": "x-square",
+        "label": "X square",
+        "set": "interface",
+        "category": "interface-controls",
+        "tags": [
+          "close",
+          "cancel",
+          "delete",
+          "box"
+        ],
+        "score": 4.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "browser-x",
+        "label": "Browser x",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "close window",
+          "close tab",
+          "page error",
+          "site blocked",
+          "web"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "dashboard-x",
+        "label": "Dashboard x",
+        "set": "charts",
+        "category": "charts-data",
+        "tags": [
+          "remove dashboard",
+          "delete",
+          "close",
+          "error",
+          "panels"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "close-friends",
+        "label": "Close friends",
+        "set": "social",
+        "category": "social-actions",
+        "tags": [
+          "private list",
+          "favorites",
+          "green star",
+          "circle",
+          "inner circle"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "about": {
+    "query": "info circle about",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "tooltip-info",
+        "label": "Info tooltip",
+        "set": "interface",
+        "category": "interface-states",
+        "tags": [
+          "info hint",
+          "help tooltip",
+          "information",
+          "hover hint",
+          "i"
+        ],
+        "score": 9.42,
+        "matchedAllWords": false
+      },
+      {
+        "name": "info",
+        "label": "Info",
+        "set": "generic",
+        "category": "status",
+        "tags": [
+          "information",
+          "about",
+          "details",
+          "help",
+          "i",
+          "notice"
+        ],
+        "score": 7.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "tooltip",
+        "label": "Tooltip",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "hint",
+          "hover",
+          "help",
+          "label"
+        ],
+        "score": 6.4,
+        "matchedAllWords": false
+      },
+      {
+        "name": "poi-info",
+        "label": "Information pin",
+        "set": "maps",
+        "category": "maps-poi",
+        "tags": [
+          "information",
+          "tourist info",
+          "help desk",
+          "visitor center",
+          "map marker"
+        ],
+        "score": 5,
+        "matchedAllWords": false
+      },
+      {
+        "name": "badge-info",
+        "label": "Badge info",
+        "set": "symbols",
+        "category": "symbols-badges",
+        "tags": [
+          "information",
+          "details",
+          "about",
+          "seal"
+        ],
+        "score": 4.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "info-square",
+        "label": "Info square",
+        "set": "security",
+        "category": "security-alerts",
+        "tags": [
+          "information",
+          "about",
+          "details",
+          "help"
+        ],
+        "score": 4.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "info-hexagon",
+        "label": "Info hexagon",
+        "set": "security",
+        "category": "security-alerts",
+        "tags": [
+          "information",
+          "about",
+          "details",
+          "help",
+          "hexagon"
+        ],
+        "score": 4.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-details",
+        "label": "File details",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "properties",
+          "info",
+          "metadata",
+          "document",
+          "attributes"
+        ],
+        "score": 3.96,
+        "matchedAllWords": false
+      },
+      {
+        "name": "information-point",
+        "label": "Information point",
+        "set": "legal",
+        "category": "legal-public",
+        "tags": [
+          "info",
+          "help desk",
+          "kiosk",
+          "tourist info"
+        ],
+        "score": 3.96,
+        "matchedAllWords": false
+      },
+      {
+        "name": "medical-info-card",
+        "label": "Medical information card",
+        "set": "emergency",
+        "category": "emergency-medical",
+        "tags": [
+          "medical id card",
+          "allergy card",
+          "wallet card",
+          "emergency contact card",
+          "health card",
+          "vial of life"
+        ],
+        "score": 1.11,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "diagnose": {
+    "query": "file check verify shield",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "file-check",
+        "label": "File check",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "approved",
+          "done",
+          "document",
+          "verified"
+        ],
+        "score": 27.31,
+        "matchedAllWords": false
+      },
+      {
+        "name": "shield-check",
+        "label": "Shield check",
+        "set": "security",
+        "category": "security-security",
+        "tags": [
+          "verified",
+          "secure",
+          "protected",
+          "trusted"
+        ],
+        "score": 14.51,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-shield",
+        "label": "Protected file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "protection",
+          "security",
+          "safe",
+          "document",
+          "guarded"
+        ],
+        "score": 5.93,
+        "matchedAllWords": false
+      },
+      {
+        "name": "key-check",
+        "label": "Key check",
+        "set": "security",
+        "category": "security-security",
+        "tags": [
+          "valid key",
+          "access granted",
+          "verified credential",
+          "password",
+          "approved"
+        ],
+        "score": 5.69,
+        "matchedAllWords": false
+      },
+      {
+        "name": "badge-check",
+        "label": "Verified",
+        "set": "security",
+        "category": "security-security",
+        "tags": [
+          "verified",
+          "approved",
+          "certified",
+          "seal",
+          "check",
+          "trusted",
+          "badge"
+        ],
+        "score": 5.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "security-check",
+        "label": "Security check",
+        "set": "security",
+        "category": "security-security",
+        "tags": [
+          "airport security",
+          "walk-through scanner",
+          "screening",
+          "checkpoint",
+          "metal detector gate"
+        ],
+        "score": 5.2,
+        "matchedAllWords": false
+      },
+      {
+        "name": "database-check",
+        "label": "Database check",
+        "set": "files",
+        "category": "files-storage",
+        "tags": [
+          "verified",
+          "healthy",
+          "connected",
+          "data",
+          "valid"
+        ],
+        "score": 5.1,
+        "matchedAllWords": false
+      },
+      {
+        "name": "doc-checklist",
+        "label": "Checklist document",
+        "set": "business",
+        "category": "business-docs",
+        "tags": [
+          "checklist",
+          "tasks",
+          "review",
+          "todo"
+        ],
+        "score": 3.29,
+        "matchedAllWords": false
+      },
+      {
+        "name": "shield-question",
+        "label": "Shield question",
+        "set": "security",
+        "category": "security-security",
+        "tags": [
+          "shield question mark",
+          "unknown protection",
+          "security help",
+          "verify status",
+          "unsure",
+          "shield help"
+        ],
+        "score": 1.64,
+        "matchedAllWords": false
+      },
+      {
+        "name": "fact-check-tick",
+        "label": "Fact check",
+        "set": "ai",
+        "category": "ai-assistants",
+        "tags": [
+          "verified claim",
+          "tick on quote",
+          "magnifier",
+          "truth",
+          "verify statement"
+        ],
+        "score": 1.44,
+        "matchedAllWords": false
+      },
+      {
+        "name": "id-check",
+        "label": "ID check",
+        "set": "legal",
+        "category": "legal-civic",
+        "tags": [
+          "verify identity",
+          "id card",
+          "verified",
+          "kyc"
+        ],
+        "score": 1.25,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-approve",
+        "label": "Approve file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "approved",
+          "accept",
+          "sign off",
+          "document",
+          "valid"
+        ],
+        "score": 0.99,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "manage": {
+    "query": "sliders settings",
+    "weak": false,
+    "results": [
+      {
+        "name": "sliders",
+        "label": "Adjust",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "controls",
+          "settings",
+          "equalizer",
+          "tune"
+        ],
+        "score": 15,
+        "matchedAllWords": true
+      },
+      {
+        "name": "sliders-vertical",
+        "label": "Adjust vertical",
+        "set": "security",
+        "category": "security-tools",
+        "tags": [
+          "controls",
+          "settings",
+          "mixer",
+          "tune"
+        ],
+        "score": 12,
+        "matchedAllWords": true
+      },
+      {
+        "name": "camera-slider",
+        "label": "Camera slider",
+        "set": "photo",
+        "category": "photo-gear",
+        "tags": [
+          "rail",
+          "dolly",
+          "motion",
+          "track"
+        ],
+        "score": 9.6,
+        "matchedAllWords": true
+      },
+      {
+        "name": "audio-mixer",
+        "label": "Audio mixer",
+        "set": "gaming",
+        "category": "gaming-hud",
+        "tags": [
+          "volume sliders",
+          "sound settings",
+          "equalizer",
+          "levels",
+          "music volume",
+          "mix"
+        ],
+        "score": 4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "settings",
+        "label": "Settings",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "gear",
+          "cog",
+          "preferences",
+          "options",
+          "preference",
+          "user preferences",
+          "app preferences",
+          "configuration",
+          "config",
+          "configure",
+          "setup"
+        ],
+        "score": 3.19,
+        "matchedAllWords": false
+      },
+      {
+        "name": "cog",
+        "label": "Cog",
+        "set": "security",
+        "category": "security-tools",
+        "tags": [
+          "gear",
+          "settings",
+          "mechanism",
+          "engine"
+        ],
+        "score": 2.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "users-settings",
+        "label": "Group settings",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "team settings",
+          "manage group",
+          "members admin",
+          "people",
+          "gear"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      },
+      {
+        "name": "globe-settings",
+        "label": "Website settings",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "site settings",
+          "web preferences",
+          "internet options",
+          "globe",
+          "gear"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      },
+      {
+        "name": "settings-search",
+        "label": "Find settings",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "search settings",
+          "find preferences",
+          "lookup option",
+          "gear",
+          "magnifier"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      },
+      {
+        "name": "settings-x",
+        "label": "Settings error",
+        "set": "generic",
+        "category": "objects",
+        "tags": [
+          "config failed",
+          "reset settings",
+          "invalid preferences",
+          "gear",
+          "cancel"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "show_path": {
+    "query": "file path route",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "route",
+        "label": "Route",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "path",
+          "journey",
+          "directions",
+          "trip"
+        ],
+        "score": 7.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "workout-route",
+        "label": "Workout route",
+        "set": "fitness",
+        "category": "fitness-tracking",
+        "tags": [
+          "route",
+          "track",
+          "gps",
+          "path"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "route-plus",
+        "label": "Add route",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "new route",
+          "create route",
+          "add stop",
+          "directions",
+          "path"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "route-check",
+        "label": "Route check",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "route done",
+          "arrived",
+          "trip complete",
+          "directions",
+          "path"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "route-x",
+        "label": "Route x",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "cancel route",
+          "remove route",
+          "end trip",
+          "directions",
+          "path"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "route-share",
+        "label": "Share route",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "send route",
+          "share trip",
+          "share directions",
+          "forward",
+          "path"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "route-search",
+        "label": "Find route",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "search route",
+          "plan trip",
+          "directions search",
+          "path",
+          "magnifier"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "swap-route",
+        "label": "Swap route",
+        "set": "crypto",
+        "category": "crypto-defi",
+        "tags": [
+          "routing",
+          "aggregator",
+          "path",
+          "best price",
+          "multi hop",
+          "dex"
+        ],
+        "score": 4.72,
+        "matchedAllWords": false
+      },
+      {
+        "name": "strategy-path",
+        "label": "Strategy path",
+        "set": "business",
+        "category": "business-strategy",
+        "tags": [
+          "route",
+          "a to b",
+          "journey",
+          "direction"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "map-route",
+        "label": "Map route",
+        "set": "travel",
+        "category": "travel-maps",
+        "tags": [
+          "directions",
+          "journey",
+          "destination",
+          "path"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "path-glob",
+        "label": "Path glob",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "wildcard",
+          "asterisk pattern",
+          "match files",
+          "star",
+          "pattern search"
+        ],
+        "score": 3.43,
+        "matchedAllWords": false
+      },
+      {
+        "name": "traceroute",
+        "label": "Traceroute",
+        "set": "network",
+        "category": "network-networking",
+        "tags": [
+          "route",
+          "hops",
+          "path",
+          "trace"
+        ],
+        "score": 2.04,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "show_name": {
+    "query": "file name tag label",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "name-tag",
+        "label": "Name tag",
+        "set": "events",
+        "category": "events-venues",
+        "tags": [
+          "hello",
+          "sticker",
+          "label",
+          "guest"
+        ],
+        "score": 24.89,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-tag",
+        "label": "Tagged file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "tag",
+          "label",
+          "category",
+          "document",
+          "metadata"
+        ],
+        "score": 12.99,
+        "matchedAllWords": false
+      },
+      {
+        "name": "cxu-rack-label-tag",
+        "label": "Rack label tag",
+        "set": "crypto",
+        "category": "crypto-mining",
+        "tags": [
+          "asset tag",
+          "serial label",
+          "worker name",
+          "hanging tag",
+          "inventory",
+          "ip label"
+        ],
+        "score": 8,
+        "matchedAllWords": false
+      },
+      {
+        "name": "web3-ens-name",
+        "label": "Name tag domain",
+        "set": "crypto",
+        "category": "crypto-nft",
+        "tags": [
+          "ens",
+          "dot eth",
+          "domain name",
+          "readable address",
+          "handle",
+          "label"
+        ],
+        "score": 5.67,
+        "matchedAllWords": false
+      },
+      {
+        "name": "pet-tag",
+        "label": "Pet tag",
+        "set": "animals",
+        "category": "animals-pets",
+        "tags": [
+          "id tag",
+          "name tag",
+          "dog tag",
+          "identity"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-rename",
+        "label": "Rename file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "rename",
+          "text cursor",
+          "edit name",
+          "document",
+          "title"
+        ],
+        "score": 4.99,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-tag",
+        "label": "Tagged folder",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "tag",
+          "label",
+          "category",
+          "directory",
+          "metadata"
+        ],
+        "score": 4.62,
+        "matchedAllWords": false
+      },
+      {
+        "name": "merge-tag",
+        "label": "Merge tag",
+        "set": "social",
+        "category": "social-content",
+        "tags": [
+          "personalization",
+          "placeholder",
+          "variable",
+          "mail merge",
+          "first name",
+          "dynamic field"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "exif-tag",
+        "label": "Photo metadata",
+        "set": "media",
+        "category": "media-images",
+        "tags": [
+          "exif",
+          "camera info",
+          "tag on photo",
+          "details",
+          "properties",
+          "file info"
+        ],
+        "score": 4.22,
+        "matchedAllWords": false
+      },
+      {
+        "name": "pet-id-tag",
+        "label": "Pet ID",
+        "set": "animals",
+        "category": "animals-pets",
+        "tags": [
+          "dog tag",
+          "bone tag",
+          "name tag",
+          "identity",
+          "collar tag"
+        ],
+        "score": 1.22,
+        "matchedAllWords": false
+      },
+      {
+        "name": "cursor-collaborator",
+        "label": "Collaborator cursor",
+        "set": "interface",
+        "category": "interface-controls",
+        "tags": [
+          "multiplayer cursor",
+          "live cursor",
+          "name tag",
+          "co-editing",
+          "pointer"
+        ],
+        "score": -1.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "visitor-badge",
+        "label": "Visitor badge",
+        "set": "business",
+        "category": "business-meetings",
+        "tags": [
+          "name tag",
+          "event pass",
+          "guest badge",
+          "id card",
+          "expo badge"
+        ],
+        "score": -1.56,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "view_tree": {
+    "query": "tree list hierarchy",
+    "weak": false,
+    "results": [
+      {
+        "name": "list-nested",
+        "label": "Nested list",
+        "set": "editor",
+        "category": "editor-formatting",
+        "tags": [
+          "sublist",
+          "indented list",
+          "hierarchy",
+          "outline",
+          "tree"
+        ],
+        "score": 20.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "tree-view",
+        "label": "Tree view",
+        "set": "interface",
+        "category": "interface-window",
+        "tags": [
+          "hierarchy",
+          "outline",
+          "nested list",
+          "explorer",
+          "nodes"
+        ],
+        "score": 19,
+        "matchedAllWords": true
+      },
+      {
+        "name": "hierarchy",
+        "label": "Hierarchy",
+        "set": "charts",
+        "category": "charts-data",
+        "tags": [
+          "org chart",
+          "tree",
+          "structure",
+          "parent"
+        ],
+        "score": 7.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "syntax-tree",
+        "label": "Syntax tree",
+        "set": "dev",
+        "category": "dev-code",
+        "tags": [
+          "ast",
+          "parse tree",
+          "hierarchy",
+          "nodes"
+        ],
+        "score": 5.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "treemap",
+        "label": "Treemap",
+        "set": "charts",
+        "category": "charts-charts",
+        "tags": [
+          "nested rectangles",
+          "hierarchy",
+          "proportions",
+          "tiles",
+          "area"
+        ],
+        "score": 4.62,
+        "matchedAllWords": false
+      },
+      {
+        "name": "folder-tree",
+        "label": "Folder tree",
+        "set": "files",
+        "category": "files-folders",
+        "tags": [
+          "hierarchy",
+          "structure",
+          "explorer",
+          "nested"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "process-tree",
+        "label": "Process tree",
+        "set": "dev",
+        "category": "dev-cli",
+        "tags": [
+          "parent child",
+          "hierarchy",
+          "pstree",
+          "process hierarchy",
+          "children",
+          "child process",
+          "subprocess",
+          "spawn child"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "topology-tree",
+        "label": "Tree topology",
+        "set": "network",
+        "category": "network-networking",
+        "tags": [
+          "hierarchy",
+          "network diagram",
+          "nodes",
+          "branches"
+        ],
+        "score": 4.56,
+        "matchedAllWords": false
+      },
+      {
+        "name": "course-outline-tree",
+        "label": "Course outline tree",
+        "set": "education",
+        "category": "education-online",
+        "tags": [
+          "syllabus tree",
+          "modules lessons",
+          "curriculum",
+          "structure",
+          "nested list",
+          "builder"
+        ],
+        "score": 2.11,
+        "matchedAllWords": false
+      },
+      {
+        "name": "sitemap",
+        "label": "Sitemap",
+        "set": "generic",
+        "category": "navigation",
+        "tags": [
+          "site structure",
+          "page tree",
+          "hierarchy",
+          "site map",
+          "pages"
+        ],
+        "score": 1.44,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "view_flat": {
+    "query": "list rows",
+    "weak": false,
+    "results": [
+      {
+        "name": "list",
+        "label": "List",
+        "set": "generic",
+        "category": "navigation",
+        "tags": [
+          "rows",
+          "bullets",
+          "view",
+          "items",
+          "unordered list"
+        ],
+        "score": 18.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "layout-list",
+        "label": "List layout",
+        "set": "interface",
+        "category": "interface-layout",
+        "tags": [
+          "list view",
+          "rows",
+          "items",
+          "thumbnails",
+          "media list"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "group-rows",
+        "label": "Group rows",
+        "set": "interface",
+        "category": "interface-layout",
+        "tags": [
+          "group by",
+          "grouped list",
+          "nested rows",
+          "categories",
+          "sections"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "reorder-rows",
+        "label": "Reorder rows",
+        "set": "interface",
+        "category": "interface-layout",
+        "tags": [
+          "drag rows",
+          "move row",
+          "rearrange list",
+          "sortable list",
+          "drag and drop"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "rows-3",
+        "label": "Three rows",
+        "set": "interface",
+        "category": "interface-layout",
+        "tags": [
+          "thirds",
+          "stack",
+          "list",
+          "layout"
+        ],
+        "score": 14,
+        "matchedAllWords": true
+      },
+      {
+        "name": "file-list-view",
+        "label": "File list",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "list view",
+          "rows",
+          "details view",
+          "documents",
+          "browse"
+        ],
+        "score": 12.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "agenda-list-view",
+        "label": "Agenda list",
+        "set": "time",
+        "category": "time-calendars",
+        "tags": [
+          "upcoming list",
+          "event list",
+          "day headings",
+          "schedule list",
+          "rows",
+          "chronological"
+        ],
+        "score": 12.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "cxq-token-list-scroll",
+        "label": "Token list",
+        "set": "crypto",
+        "category": "crypto-coins",
+        "tags": [
+          "asset list",
+          "tokens",
+          "rows of coins",
+          "balances list",
+          "manage tokens",
+          "scroll list"
+        ],
+        "score": 9.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "comparable-homes-row",
+        "label": "Comparable homes",
+        "set": "realestate",
+        "category": "realestate-listing",
+        "tags": [
+          "comps",
+          "similar sales",
+          "neighbouring houses",
+          "market comparison",
+          "appraisal"
+        ],
+        "score": 4.4,
+        "matchedAllWords": true
+      },
+      {
+        "name": "list-plus",
+        "label": "Add list",
+        "set": "generic",
+        "category": "navigation",
+        "tags": [
+          "new list",
+          "add item",
+          "create list",
+          "bullets",
+          "plus"
+        ],
+        "score": 0.31,
+        "matchedAllWords": false
+      }
+    ]
+  },
+  "reload": {
+    "query": "refresh reload",
+    "weak": false,
+    "results": [
+      {
+        "name": "refresh",
+        "label": "Refresh",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "reload",
+          "sync",
+          "rotate",
+          "retry",
+          "polling",
+          "interval",
+          "repeat",
+          "check"
+        ],
+        "score": 17.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "link-refresh",
+        "label": "Link refresh",
+        "set": "generic",
+        "category": "actions",
+        "tags": [
+          "link refresh",
+          "refresh link",
+          "reload link",
+          "update url",
+          "sync link",
+          "chain",
+          "renew",
+          "link refrash"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "refresh-off",
+        "label": "Refresh off",
+        "set": "arrows",
+        "category": "arrows-rotate",
+        "tags": [
+          "no reload",
+          "auto refresh off",
+          "paused",
+          "disabled",
+          "static"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "hot-reload",
+        "label": "Hot reload",
+        "set": "dev",
+        "category": "dev-devops",
+        "tags": [
+          "live reload",
+          "hot module replacement",
+          "refresh",
+          "watch"
+        ],
+        "score": 15.25,
+        "matchedAllWords": true
+      },
+      {
+        "name": "refresh-ccw",
+        "label": "Refresh counterclockwise",
+        "set": "arrows",
+        "category": "arrows-rotate",
+        "tags": [
+          "reload",
+          "reset",
+          "anticlockwise",
+          "retry"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "refresh-alert",
+        "label": "Refresh alert",
+        "set": "arrows",
+        "category": "arrows-rotate",
+        "tags": [
+          "reload failed",
+          "retry",
+          "error",
+          "warning",
+          "update"
+        ],
+        "score": 14.75,
+        "matchedAllWords": true
+      },
+      {
+        "name": "sync",
+        "label": "Sync",
+        "set": "arrows",
+        "category": "arrows-rotate",
+        "tags": [
+          "refresh",
+          "update",
+          "cycle",
+          "reload"
+        ],
+        "score": 7,
+        "matchedAllWords": true
+      },
+      {
+        "name": "video-error-retry",
+        "label": "Video error",
+        "set": "media",
+        "category": "media-playback",
+        "tags": [
+          "playback error",
+          "cannot load",
+          "something went wrong",
+          "failed video",
+          "alert player",
+          "warning"
+        ],
+        "score": 6,
+        "matchedAllWords": true
+      }
+    ]
+  },
+  "formats": {
+    "query": "file types format",
+    "weak": true,
+    "note": "No result matches every word well; the closest are below. The query was logged so the icon can be drawn.",
+    "results": [
+      {
+        "name": "file-convert",
+        "label": "Convert file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "file conversion",
+          "convert file",
+          "change format",
+          "file converter",
+          "transform",
+          "document"
+        ],
+        "score": 5.21,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-question",
+        "label": "Unknown file",
+        "set": "files",
+        "category": "files-files",
+        "tags": [
+          "unknown type",
+          "unsupported",
+          "question mark",
+          "missing",
+          "document"
+        ],
+        "score": 4.88,
+        "matchedAllWords": false
+      },
+      {
+        "name": "file-font",
+        "label": "Font file",
+        "set": "files",
+        "category": "files-dev",
+        "tags": [
+          "typeface",
+          "font",
+          "ttf",
+          "otf",
+          "type"
+        ],
+        "score": 4.54,
+        "matchedAllWords": false
+      },
+      {
+        "name": "page-margins",
+        "label": "Page margins",
+        "set": "editor",
+        "category": "editor-formatting",
+        "tags": [
+          "margins",
+          "page setup",
+          "print area",
+          "layout",
+          "document"
+        ],
+        "score": -4.27,
+        "matchedAllWords": false
+      },
+      {
+        "name": "structured-output-braces",
+        "label": "Structured output",
+        "set": "ai",
+        "category": "ai-models",
+        "tags": [
+          "json mode",
+          "schema",
+          "braces",
+          "fields",
+          "formatted response",
+          "typed"
+        ],
+        "score": -7.05,
+        "matchedAllWords": false
+      }
+    ]
+  }
+}

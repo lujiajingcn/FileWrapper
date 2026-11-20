@@ -11,6 +11,15 @@
 # --- 本地沙箱构建目录（不参与版本控制）---
 _bw/
 
+# --- 本地验证 / 界面对比的一次性产物 ---
+# 截图与试编译结果只用于当次确认，结论写在 ui-review/ 与审计报告里。
+/_eval_*/
+/_verify_build/
+
+# --- 图标生成工具的本地草稿与中间产物 ---
+/tools/icons/work/
+/tools/icons/svg2png/.build/
+
 # --- IDE / 编辑器本机配置 ---
 .idea/
 .qtcreator/

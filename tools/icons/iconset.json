@@ -1,0 +1,43 @@
+{
+  "$comment": "FileWrapper 图标清单。字形来自 IconMCP（https://iconmcp.com，MIT）。改图标：改这里的 iconmcp 名字/颜色，再运行 tools/icons/build-iconset.mjs。",
+  "meta": {
+    "source": "IconMCP",
+    "url": "https://iconmcp.com",
+    "license": "MIT",
+    "style": "outline",
+    "stroke": 1.5,
+    "ink": "#374151"
+  },
+  "sizes": [16, 18, 20, 24, 32, 40, 48, 64],
+  "icons": {
+    "about": "info",
+    "add": "file-plus",
+    "add_dir": "folder-plus",
+    "browse": "folder-open",
+    "delete": "trash",
+    "diagnose": "shield-check",
+    "export": "download",
+    "formats": "file-convert",
+    "load": "archive-restore",
+    "manage": "sliders",
+    "merge": "file-merge",
+    "reload": "refresh",
+    "save": "save",
+    "show_name": "name-tag",
+    "show_path": "route",
+    "split": "file-split",
+    "unload": "archive-x",
+    "view_flat": "list",
+    "view_thumb": "grid",
+    "view_tree": "tree-view"
+  },
+  "appicon": {
+    "glyph": "box",
+    "style": "solid",
+    "glyphColor": "#FFFFFF",
+    "background": ["#3D9BF6", "#1F6FE0"],
+    "radius": 56,
+    "scale": 10,
+    "sizes": [16, 20, 24, 32, 40, 48, 64, 128, 256]
+  }
+}
