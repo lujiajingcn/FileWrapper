@@ -240,6 +240,11 @@ Detection byContent(const QByteArray &head)
         return make(QStringLiteral("gif"), QStringLiteral("GIF 图像"), QStringLiteral("gif"),
                     QString(), QStringLiteral("文件头 GIF"), true);
 
+    // TIFF：II*\0（小端）或 MM\0*（大端）。.tif/.tiff 都是图片插件声明的后缀。
+    if (hasPrefix(head, "II*\0", 4) || hasPrefix(head, "MM\0*", 4))
+        return make(QStringLiteral("tiff"), QStringLiteral("TIFF 图像"), QStringLiteral("tiff"),
+                    QString(), QStringLiteral("文件头 II*/MM*（TIFF）"), true);
+
     if (hasPrefix(head, "BM", 2) && head.size() >= 10
         && head[6] == 0 && head[7] == 0 && head[8] == 0 && head[9] == 0)
         return make(QStringLiteral("bmp"), QStringLiteral("BMP 图像"), QStringLiteral("bmp"),
@@ -393,6 +398,19 @@ Detection byContent(const QByteArray &head)
         if (trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html"))
             return make(QStringLiteral("html"), QStringLiteral("HTML 网页"), QStringLiteral("html"),
                         QString(), QStringLiteral("内容以 <!DOCTYPE html 开头"), true);
+
+        // SVG / FictionBook 也是 XML，必须先于通用 xml 分支识别：否则它们会被判成
+        // 「XML 文档」交给文本插件，图片/电子书插件永远轮不到（改名后的 .svg/.fb2 尤其明显）。
+        // 只在开头 8 KB 里找根元素；HTML 里可能内联 <svg>，所以先排除 HTML。
+        const QByteArray probe = head.left(8192).toLower();
+        if (probe.contains("<fictionbook"))
+            return make(QStringLiteral("fb2"), QStringLiteral("FictionBook 电子书"),
+                        QStringLiteral("fb2"), QString(),
+                        QStringLiteral("XML 根元素为 <FictionBook>"), true);
+        if (!probe.contains("<html") && probe.contains("<svg"))
+            return make(QStringLiteral("svg"), QStringLiteral("SVG 矢量图"), QStringLiteral("svg"),
+                        QString(), QStringLiteral("XML 根元素为 <svg>"), true);
+
         if (trimmed.startsWith("<?xml"))
             return make(QStringLiteral("xml"), QStringLiteral("XML 文档"), QStringLiteral("xml"),
                         QString(), QStringLiteral("内容以 <?xml 开头"), true);

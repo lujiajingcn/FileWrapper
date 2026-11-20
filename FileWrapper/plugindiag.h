@@ -12,7 +12,7 @@
 // 的报错，而主程序此前只在 qDebug 里记一行 —— 用户双击文件后毫无反应。这里把构建期
 // 生成的「部署清单」(plugin-deploy-manifest.txt) 与实际文件比对，得出缺哪些依赖、
 // 每一项是干什么用的，再与 Qt 的原始错误一起组成可读报告，供「插件不可用」对话框和
-// 「插件诊断」入口使用。
+// 「插件设置」的「状态与依赖」页使用。
 //
 // 清单由 deploy/deploy-deps.ps1 生成，数据源是 deploy/plugin-deps.manifest；
 // 清单每行格式：<相对程序目录的路径>|<用途说明>
@@ -40,7 +40,7 @@ public:
                                const QString &appDir,
                                const QStringList &alsoFailedPlugins = QStringList());
 
-    // 一行摘要，供状态栏与「插件诊断」抬头使用
+    // 一行摘要，供状态栏与「插件设置」抬头使用
     static QString summaryLine(const QString &appDir, int failedPlugins);
 
     // 文件名（含扩展名）/ 逻辑名（去扩展名、去掉 MinGW 的 lib 前缀）

@@ -17,54 +17,18 @@ TEMPLATE = app
 CONFIG += c++17 console
 TARGET = plugin_tests
 
-# 主程序源码
+# 主程序源码（清单与 FileWrapper.pro 共用；测试有自己的 main，不编 main.cpp）
 SRC = $$PWD/../FileWrapper
 INCLUDEPATH += $$SRC
 INCLUDEPATH += $$PWD/../include
 VPATH += $$SRC
 
-SOURCES += \
-    $$SRC/builtinviewer.cpp \
-    $$SRC/dlgabout.cpp \
-    $$SRC/dlgfileproperty.cpp \
-    $$SRC/dlgmergefile.cpp \
-    $$SRC/dlgoutputfile.cpp \
-    $$SRC/dlgpluginmap.cpp \
-    $$SRC/dlgsplitfile.cpp \
-    $$SRC/filemanager.cpp \
-    $$SRC/filemetadata.cpp \
-    $$SRC/formatresolver.cpp \
-    $$SRC/mainwindow.cpp \
-    $$SRC/pluginmanager.cpp \
-    $$SRC/plugindiag.cpp \
-    $$PWD/plugin_tests.cpp
+include($$SRC/core.pri)
 
-HEADERS += \
-    $$SRC/archiveformat.h \
-    $$SRC/builtinviewer.h \
-    $$SRC/dlgabout.h \
-    $$SRC/dlgfileproperty.h \
-    $$SRC/dlgmergefile.h \
-    $$SRC/dlgoutputfile.h \
-    $$SRC/dlgpluginmap.h \
-    $$SRC/dlgsplitfile.h \
-    $$SRC/filemanager.h \
-    $$SRC/filemetadata.h \
-    $$SRC/formatresolver.h \
-    $$SRC/mainwindow.h \
-    $$PWD/../include/plugininterface.h \
-    $$SRC/pluginmanager.h \
-    $$SRC/plugindiag.h \
-    $$PWD/../Plugins/common/zipreader.h
+SOURCES += $$PWD/plugin_tests.cpp
 
 # ZIP 读取器与插件共用同一份源码：AUDIT 组直接对 ZipReader 做预算/CRC 单测
 INCLUDEPATH += $$PWD/../Plugins/common
 SOURCES += $$PWD/../Plugins/common/zipreader.cpp
+HEADERS += $$PWD/../Plugins/common/zipreader.h
 LIBS += -lz
-
-FORMS += \
-    $$SRC/dlgabout.ui \
-    $$SRC/dlgmergefile.ui \
-    $$SRC/dlgoutputfile.ui \
-    $$SRC/dlgsplitfile.ui \
-    $$SRC/mainwindow.ui

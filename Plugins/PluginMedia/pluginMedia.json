@@ -4,6 +4,7 @@
     "Author" : "lujiajing",
     "Date":"2023-07-09",
     "apiVersion":7,
+    "category":"media",
     "extensions":[
         "mp4", "m4v", "mov", "avi", "wmv", "flv", "mkv", "webm",
         "mpg", "mpeg", "ts", "3gp", "3g2", "ogv", "vob", "asf", "rm", "rmvb",

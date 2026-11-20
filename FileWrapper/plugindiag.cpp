@@ -170,7 +170,7 @@ QString PluginDiagnostics::pluginDisplayName(const QString &pluginPath)
 QString PluginDiagnostics::pluginId(const QString &pluginPath)
 {
     QString sId = QFileInfo(pluginPath).completeBaseName();
-    // MinGW 产出的导入库/某些平台命名带 lib 前缀，与用户映射里保存的名字对齐
+    // MinGW 产出的导入库/某些平台命名带 lib 前缀，与 PluginManager::knownPluginIds() 的口径保持一致
     if (sId.startsWith(QStringLiteral("lib"), Qt::CaseInsensitive))
         sId.remove(0, 3);
     return sId;

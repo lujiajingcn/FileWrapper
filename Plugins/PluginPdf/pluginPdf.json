@@ -4,6 +4,7 @@
     "Author" : "lujiajing",
     "Date":"2023-07-12",
     "apiVersion":7,
+    "category":"pdf",
     "extensions":[
         "pdf"
     ],

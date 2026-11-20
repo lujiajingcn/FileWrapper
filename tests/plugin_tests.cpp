@@ -2,7 +2,7 @@
 // plugin_tests：插件基础设施 + PluginWord 的端到端验证（真实链路，不掺假）
 //
 // 覆盖的行为（断言标签前缀）：
-//   W   后缀路由：用户映射 / 插件自描述 extensions / 未知后缀（C1）
+//   W   后缀路由：插件自描述 extensions / 未知后缀 / 内容优先仲裁（C1 + 自动路由）
 //   W8  API 版本门禁（B1）：当前版本接受、旧插件拒绝、版本不符拒绝、空元数据拒绝
 //   W9  加载失败的插件仍能路由后缀（sidecar 兜底，走"插件不可用"诊断）
 //   W1b 启动时对加载失败的插件给出可见提示（A2）
@@ -12,7 +12,7 @@
 //   M   多标签页实例独立性
 //   D   部署自检（清单比对、报告文本、失败登记、重试恢复、真实构建目录自检）
 //   A   主程序链路：PluginManager 加载、QMergeFiles 合并、resolvePlugin 三步、
-//       插件窗口挂进 QTabWidget、「插件诊断」入口存在
+//       插件窗口挂进 QTabWidget、「插件设置」入口存在
 //
 //   * 真实 FileManager 把真实 .docx 合并成 .dat 归档，再把字节读回来
 //     （与程序里双击文件时的取数据路径一致）
@@ -79,7 +79,6 @@
 #include <cstdio>
 #include <functional>
 
-#include "dlgpluginmap.h"
 #include "dlgfileproperty.h"
 #include "filemanager.h"
 #include "filemetadata.h"
@@ -258,7 +257,8 @@ class ProbeMainWindow : public MainWindow
 public:
     ProbeMainWindow() : MainWindow(nullptr) {}
     using MainWindow::choosePlugin;
-    using MainWindow::arbitrateContestedExtension;
+    using RouteDecision = MainWindow::RouteDecision;
+    using MainWindow::decideRoute;
 };
 
 // 树形列表测试：直接加载归档（loadArchiveFile 为 protected）
@@ -271,6 +271,7 @@ public:
     using MainWindow::filePropertyData;
     using MainWindow::folderPropertyData;
     using MainWindow::renderEntryThumbnail;
+    using MainWindow::isThumbnailImageName;
 };
 
 static void checkExtensionMapping()
@@ -284,7 +285,8 @@ static void checkExtensionMapping()
         { "vtt",  "PluginText" },    { "srt",  "PluginText" },
         { "jpg",  "PluginPicture" }, { "png",  "PluginPicture" },
         { "svg",  "PluginPicture" }, { "webp", "PluginPicture" },
-        { "tiff", "PluginPicture" },
+        { "tiff", "PluginPicture" }, { "tif", "PluginPicture" },
+        { "jpe",  "PluginPicture" }, { "jfif", "PluginPicture" },
         { "mp4",  "PluginMedia" },   { "mp3",  "PluginMedia" },
         { "m2ts", "PluginMedia" },
         { "pdf",  "PluginPdf" },
@@ -298,11 +300,6 @@ static void checkExtensionMapping()
     for (const Case &c : kCases)
     {
         const QString ext = QString::fromLatin1(c.ext);
-        if (!DlgPluginMap::mappingFor(ext).isEmpty())
-        {
-            note(QStringLiteral("W1: user mapping exists for .%1, skipped").arg(ext));
-            continue;
-        }
         const QString path = mw.choosePlugin(ext);
         const QString actual = QFileInfo(path).fileName();
         if (c.dll == nullptr)
@@ -318,11 +315,8 @@ static void checkExtensionMapping()
     }
 
     // W1b: ".ts" 是唯一跨插件重名的后缀（MPEG-TS 视频 vs TypeScript 文本）：
-    //      注册表把它记为"有歧义"，静态优先级给文本，真视频交给内容仲裁。
+    //      静态优先级给文本，真视频由内容识别改投媒体插件。
     PluginManager *pm1 = PluginManager::getInstance();
-    report(pm1->isExtensionContested(QStringLiteral("ts"))
-               && !pm1->isExtensionContested(QStringLiteral(".txt")),
-           QStringLiteral("W1c: '.ts' flagged contested, '.txt' not"));
 
     QByteArray tsHead;
     for (int i = 0; i < 6; ++i)
@@ -332,21 +326,23 @@ static void checkExtensionMapping()
         tsHead += QByteArray(184, '\x00');
     }
     const QString sTextDll = pm1->pluginForExtension(QStringLiteral("ts"));
-    QString sReason;
-    const QString sArbitrated = ProbeMainWindow::arbitrateContestedExtension(
-        QStringLiteral("movie.ts"), tsHead, sTextDll, &sReason);
+    const ProbeMainWindow::RouteDecision tsVideo =
+        ProbeMainWindow::decideRoute(QStringLiteral("movie.ts"), tsHead, sTextDll);
     report(QFileInfo(sTextDll).fileName().compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0
-               && QFileInfo(sArbitrated).fileName().compare(QStringLiteral("PluginMedia.dll"),
+               && QFileInfo(tsVideo.pluginPath).fileName().compare(QStringLiteral("PluginMedia.dll"),
                                                           Qt::CaseInsensitive) == 0
-               && !sReason.isEmpty(),
-           QStringLiteral("W1d: contested .ts arbitrated by content -> %1 (%2)")
-               .arg(QFileInfo(sArbitrated).fileName(), sReason));
+               && tsVideo.fromContent && !tsVideo.basis.isEmpty(),
+           QStringLiteral("W1d: content-first .ts video -> %1 (%2)")
+               .arg(QFileInfo(tsVideo.pluginPath).fileName(), tsVideo.basis));
 
-    const QString sKept = ProbeMainWindow::arbitrateContestedExtension(
-        QStringLiteral("code.ts"),
-        QStringLiteral("import { a } from './b';\nexport const c = a + 1;\n").toUtf8(),
-        sTextDll);
-    report(sKept.isEmpty(),
+    const ProbeMainWindow::RouteDecision tsSource =
+        ProbeMainWindow::decideRoute(
+            QStringLiteral("code.ts"),
+            QStringLiteral("import { a } from './b';\nexport const c = a + 1;\n").toUtf8(),
+            sTextDll);
+    report(QFileInfo(tsSource.pluginPath).fileName().compare(QStringLiteral("PluginText.dll"),
+                                                             Qt::CaseInsensitive) == 0
+               && !tsSource.fromContent,
            QStringLiteral("W1e: TypeScript source keeps its extension routing (no override)"));
 
     // W1b: 有插件加载失败时，启动阶段应给出用户可见提示（状态栏），而不是只进日志
@@ -777,12 +773,13 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
 
     // ---- W4: 原硬编码表共 90 项，全部由插件 JSON 接管 ----
     // 90 项声明里有 1 个跨插件重名（".ts" = MPEG-TS 视频 vs TypeScript 文本），
-    // 因此真实插件唯一路由数是 111（zzz 为 W1 假插件 sidecar），冲突按 extensionPriority 决出。
-    // 112 里混有 W1 扫描用的 ZZBroken sidecar 假后缀 zzz；扣除后再核对
-    // 真实 8 个插件 JSON 的 111 个唯一后缀，避免断言依赖假插件状态。
+    // 因此真实插件唯一路由数是 114（zzz 为 W1 假插件 sidecar），冲突按 extensionPriority 决出。
+    // 114 里混有 W1 扫描用的 ZZBroken sidecar 假后缀 zzz；扣除后再核对
+    // 真实 8 个插件 JSON 的 114 个唯一后缀（2026-11-20 图片插件补了 tif/jpe/jfif），
+    // 避免断言依赖假插件状态。
     const int nRegistered = pm->registeredExtensionCount();
     const int nFake = pm->pluginForExtension(QStringLiteral("zzz")).isEmpty() ? 0 : 1;
-    report(nRegistered - nFake == 111,
+    report(nRegistered - nFake == 114,
            QStringLiteral("W4: %1 real unique extensions (fake zzz excluded; raw=%2)")
                .arg(nRegistered - nFake).arg(nRegistered));
     report(QFileInfo(pm->pluginForExtension(QStringLiteral("ts"))).fileName()
@@ -794,6 +791,18 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
     report(!sWord.isEmpty()
                && pm->pluginForExtension(QStringLiteral(".DOCX")) == sWord,
            QStringLiteral("W5: case-insensitive and leading-dot tolerant"));
+
+    // ---- W15: 插件类别（UI 角标/缩略图据此归类，主程序不再维护第二份后缀表） ----
+    report(pm->categoryForExtension(QStringLiteral("docx")) == QStringLiteral("document")
+               && pm->categoryForExtension(QStringLiteral("xlsx")) == QStringLiteral("sheet")
+               && pm->categoryForExtension(QStringLiteral("pptx")) == QStringLiteral("slides")
+               && pm->categoryForExtension(QStringLiteral("pdf")) == QStringLiteral("pdf")
+               && pm->categoryForExtension(QStringLiteral("png")) == QStringLiteral("image")
+               && pm->categoryForExtension(QStringLiteral("mp4")) == QStringLiteral("media")
+               && pm->categoryForExtension(QStringLiteral("epub")) == QStringLiteral("book")
+               && pm->categoryForExtension(QStringLiteral("txt")) == QStringLiteral("text")
+               && pm->categoryForExtension(QStringLiteral("qzx")).isEmpty(),
+           QStringLiteral("W15: plugin categories (document/sheet/slides/pdf/image/media/book/text)"));
 
     // ---- W6: 每个插件的 sidecar 都声明了 apiVersion == PLUGIN_API_VERSION ----
     int nBadVersion = 0;
@@ -813,20 +822,61 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
            QStringLiteral("W6: %1 sidecar(s), all apiVersion=%2 (bad=%3)")
                .arg(nSidecars).arg(PLUGIN_API_VERSION).arg(nBadVersion));
 
-    // ---- W7: 用户映射优先，且能解析逻辑名 -> 真实路径 ----
+    // ---- W7: 内容优先 —— 后缀写错时按文件头改路由；弱格式（zip/xml）不抢后缀 ----
     ProbeMainWindow mw;
-    DlgPluginMap::removeMapping(QStringLiteral("qzx"));
-    DlgPluginMap::setMapping(QStringLiteral("qzx"), QStringLiteral("PluginText"));
-    const QString sMapped = mw.choosePlugin(QStringLiteral("qzx"));
-    DlgPluginMap::setMapping(QStringLiteral("qzx"), QStringLiteral("builtin://hex"));
-    const QString sBuiltin = mw.choosePlugin(QStringLiteral("qzx"));
-    DlgPluginMap::setMapping(QStringLiteral("qzx"), QStringLiteral("none"));
-    const QString sNone = mw.choosePlugin(QStringLiteral("qzx"));
-    DlgPluginMap::removeMapping(QStringLiteral("qzx"));
-    report(QFileInfo(sMapped).fileName().compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0
-               && sBuiltin == QStringLiteral("builtin://hex") && sNone.isEmpty(),
-           QStringLiteral("W7: user mapping wins (text='%1' builtin='%2' none='%3')")
-               .arg(QFileInfo(sMapped).fileName(), sBuiltin, sNone));
+
+    // PDF 被改名 .docx：必须交给 PDF 插件，而不是让 Word 插件去解析
+    const ProbeMainWindow::RouteDecision pdfAsDocx =
+        ProbeMainWindow::decideRoute(QStringLiteral("report.docx"),
+                                     QByteArray("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n", 15),
+                                     sWord);
+    report(QFileInfo(pdfAsDocx.pluginPath).fileName().compare(QStringLiteral("PluginPdf.dll"),
+                                                              Qt::CaseInsensitive) == 0
+               && pdfAsDocx.fromContent && pdfAsDocx.contentOverride,
+           QStringLiteral("W7a: .docx whose content is PDF -> %1 (%2)")
+               .arg(QFileInfo(pdfAsDocx.pluginPath).fileName(), pdfAsDocx.basis));
+
+    // 修补过/超大 docx 在 256 KB 内没有 word/document.xml：内容只是"ZIP 容器"，
+    // 不能因此把后缀声明（Word）挤掉
+    const ProbeMainWindow::RouteDecision brokenDocx =
+        ProbeMainWindow::decideRoute(QStringLiteral("broken.docx"),
+                                     QByteArray("PK\x03\x04", 4) + QByteArray(64, '\0'), sWord);
+    report(brokenDocx.pluginPath == sWord && !brokenDocx.fromContent
+               && brokenDocx.basis.contains(QStringLiteral("docx")),
+           QStringLiteral("W7b: generic ZIP keeps the declared .docx route"));
+
+    // SVG 以 <?xml 开头，但内容是图片：不能被"XML 文档"抢走
+    const QString sPicture = pm->pluginForExtension(QStringLiteral("svg"));
+    const ProbeMainWindow::RouteDecision svgXml =
+        ProbeMainWindow::decideRoute(QStringLiteral("icon.svg"),
+            QByteArray("<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            sPicture);
+    report(svgXml.pluginPath == sPicture,
+           QStringLiteral("W7c: SVG with XML prolog stays on the picture plugin"));
+
+    // 没有后缀、内容也识别不出来：没有插件，调用方走「以文本查看」对话框
+    const ProbeMainWindow::RouteDecision unknown =
+        ProbeMainWindow::decideRoute(QStringLiteral("mystery"), QByteArray("hello"), QString());
+    report(unknown.pluginPath.isEmpty(),
+           QStringLiteral("W7d: unknown content without extension -> no plugin"));
+
+    // 旧版 [PluginMap] 配置里的键必须彻底失效（功能已删除）
+    {
+        QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                     QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
+        st.beginGroup(QStringLiteral("PluginMap"));
+        st.setValue(QStringLiteral("qzx"), QStringLiteral("PluginText"));
+        st.endGroup();
+        st.sync();
+    }
+    const bool bIgnored = mw.choosePlugin(QStringLiteral("qzx")).isEmpty();
+    {
+        QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                     QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
+        st.remove(QStringLiteral("PluginMap"));
+        st.sync();
+    }
+    report(bIgnored, QStringLiteral("W7e: legacy PluginMap entry no longer routes .qzx"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1622,40 @@ static void verifyFormatResolver()
     const auto d12 = FormatResolver::detect(QStringLiteral("cam.m2ts"), m2ts);
     report(d12.formatId == QLatin1String("mpegts"),
            QStringLiteral("F9: 192-byte M2TS detected (%1)").arg(d12.formatId));
+
+    // Z10: SVG / FB2 也是 XML —— 不能被"XML 文档"判走（改名后的文件尤其常见），
+    //      但 HTML 里内联的 <svg> 仍应归 HTML。
+    const auto d13 = FormatResolver::detect(QStringLiteral("icon"),
+        QByteArray("<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>"));
+    const auto d14 = FormatResolver::detect(QStringLiteral("book"),
+        QByteArray("<?xml version=\"1.0\"?><FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\"/>"));
+    const auto d15 = FormatResolver::detect(QStringLiteral("page.html"),
+        QByteArray("<!doctype html><html><body><svg></svg></body></html>"));
+    report(d13.formatId == QLatin1String("svg") && d13.pluginExt == QLatin1String("svg")
+               && d14.formatId == QLatin1String("fb2") && d14.pluginExt == QLatin1String("fb2")
+               && d15.formatId == QLatin1String("html"),
+           QStringLiteral("F10: SVG/FB2 not mistaken for generic XML; inline SVG stays HTML"));
+
+    // Z11: TIFF 魔数（II*\0 / MM\0*）—— .tif 以前连内容识别都没有
+    const auto d16 = FormatResolver::detect(QStringLiteral("scan.dat"),
+                                            QByteArray("II*\0rest", 8));
+    report(d16.formatId == QLatin1String("tiff") && d16.pluginExt == QLatin1String("tiff")
+               && d16.fromContent,
+           QStringLiteral("F11: TIFF content detected -> %1").arg(d16.pluginExt));
+}
+
+// 缩略图/角标这类 UI 归类：必须来自插件元数据，而不是主程序里第二份手工后缀表
+// （旧表漏了 tga/icns/wbmp，用户能打开却不显示缩略图）。
+static void verifyUiTypeHelpers()
+{
+    report(ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.png"))
+               && ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.tga"))
+               && ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.icns"))
+               && ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.wbmp"))
+               && ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.jfif"))
+               && !ProbeTreeWindow::isThumbnailImageName(QStringLiteral("a.txt"))
+               && !ProbeTreeWindow::isThumbnailImageName(QStringLiteral("noext")),
+           QStringLiteral("U1: thumbnail suffixes follow plugin category/Qt decoder list"));
 }
 
 static void verifyInstances(PluginInterface *tmpl, const QString &work){
@@ -1611,6 +1695,8 @@ class IntegrationWindow : public MainWindow
 public:
     IntegrationWindow() : MainWindow(nullptr) {}
     using MainWindow::choosePlugin;    // protected -> public
+    using MainWindow::pluginStatusText;
+    using MainWindow::supportedFormatsText;
 };
 
 // ---------------------------------------------------------------------------
@@ -2242,8 +2328,8 @@ static void verifyMergeDialog()
                QStringLiteral("H18: archive filter lists both *.fwda and *.dat (%1)").arg(sFilter));
     }
 
-    // H19: 文件列表右键菜单——文件行 = 打开 / 打开新标签页 / 属性；目录行 = 属性；
-    //      同时校验「属性」数据源（名称/类型/位置/大小/CRC/归档格式）
+    // H19: 文件列表右键菜单——文件行 = 打开 / 打开新标签页 / 以文本查看 / 以十六进制查看 / 属性；
+    //      目录行 = 属性；同时校验「属性」数据源（名称/类型/位置/大小/CRC/归档格式）
     bool bContextMenuOk = false;
     bool bFileDataOk = false;
     bool bFolderDataOk = false;
@@ -2299,6 +2385,8 @@ static void verifyMergeDialog()
         }
         bContextMenuOk = (fileActs == QStringList{ QStringLiteral("打开"),
                                                    QStringLiteral("打开新标签页"),
+                                                   QStringLiteral("以文本查看"),
+                                                   QStringLiteral("以十六进制查看"),
                                                    QStringLiteral("属性") })
                          && (dirActs == QStringList{ QStringLiteral("属性") });
 
@@ -3250,23 +3338,28 @@ static void verifyAppIntegration(const QString &work, const QString &scratchDir)
     tabs.removeTab(0);
     delete own;
 
-    // A8: 「插件设置 → 插件诊断」动作确实被创建（A2 的用户入口）
-    bool bDiagAction = false;
-    for (QAction *a : mw.findChildren<QAction *>())
-        if (a->text().contains(QStringLiteral("插件诊断"))) { bDiagAction = true; break; }
-    report(bDiagAction, QStringLiteral("A8: menu action 插件诊断 exists"));
-
-    // A9: C5 的两个入口（插件管理 / 重新加载插件）也已挂到菜单上
+    // A8: 插件相关的四个入口已合并成一个「插件设置」对话框
     QStringList sActions;
     for (QAction *a : mw.findChildren<QAction *>())
         sActions << a->text();
-    report(sActions.contains(QStringLiteral("插件管理"))
-               && sActions.contains(QStringLiteral("重新加载插件")),
-           QStringLiteral("A9: menu actions 插件管理 / 重新加载插件 exist"));
+    report(sActions.contains(QStringLiteral("插件设置…")),
+           QStringLiteral("A8: single menu action 插件设置 exists"));
 
-    // A10: 「支持的格式」入口（用户遇到不支持的格式时最直接的求助入口）
-    report(sActions.contains(QStringLiteral("支持的格式…")),
-           QStringLiteral("A10: menu action 支持的格式 exists"));
+    // A9: 旧的分散入口不能再长回来（诊断/管理/重载/格式各自一个菜单项）
+    report(!sActions.contains(QStringLiteral("插件诊断"))
+               && !sActions.contains(QStringLiteral("插件管理"))
+               && !sActions.contains(QStringLiteral("重新加载插件"))
+               && !sActions.contains(QStringLiteral("支持的格式…")),
+           QStringLiteral("A9: legacy plugin-menu entries removed"));
+
+    // A10: 合并后两个只读页签有内容（状态页有插件/部署信息，格式页有插件后缀）
+    const QString sStatusText = mw.pluginStatusText();
+    const QString sFormatsText = mw.supportedFormatsText();
+    report(sStatusText.contains(QStringLiteral("已加载插件"))
+               && sStatusText.contains(QStringLiteral("部署自检"))
+               && sFormatsText.contains(QStringLiteral("PluginWord"))
+               && sFormatsText.contains(QStringLiteral(".docx")),
+           QStringLiteral("A10: plugin settings text pages populated"));
 
     // A11: 插件拒绝打开时的说明文案（接口 v6）。
     // 用户报过的问题：WAV 打不开时界面只说「插件无法显示该文件」，而日志里其实是
@@ -3704,8 +3797,8 @@ int main(int argc, char **argv)
         if (QString::fromLocal8Bit(argv[i]) == QLatin1String("--d6-child"))
             return runBrokenRetryChild();
 
-    // 测试必须与用户真实配置隔离：插件映射（QSettings PluginMap）与插件启停
-    // （PluginEnabled）都会读写 ini，若用默认路径，一次测试就会改动用户设置。
+    // 测试必须与用户真实配置隔离：插件启停（QSettings PluginEnabled）与界面状态
+    // 都会读写 ini，若用默认路径，一次测试就会改动用户设置。
     // 这里把 UserScope 的 ini 目录指到临时目录（必须在任何 QSettings 构造之前调用）。
     //
     // 受限环境下 QTemporaryDir 的子目录可能不可写（任务沙箱/只读配置），
@@ -3814,13 +3907,14 @@ int main(int argc, char **argv)
             chineseEntry = fi.sFilePath;
     }
 
-    char *buf = nullptr;
-    qint64 len = 0;
-    fm.QGetFileContent(basicEntry, &buf, len);
+    // 只用产品路径同一套读取接口（entryContent）；旧的 char** 接口已删除，
+    // 避免"主程序一套校验、测试另一套"的语义漂移。
+    const QByteArray basicData = fm.entryContent(basicEntry);
     const qint64 expectLen = QFileInfo(work + QStringLiteral("/basic.docx")).size();
-    report(buf != nullptr && len == expectLen,
-           QStringLiteral("W12: read back %1 bytes (file %2)").arg(len).arg(expectLen));
-    if (!buf) return 1;
+    report(!basicData.isEmpty() && basicData.size() == expectLen,
+           QStringLiteral("W12: read back %1 bytes (file %2)")
+               .arg(basicData.size()).arg(expectLen));
+    if (basicData.isEmpty()) return 1;
 
     // ---------- W5/W6: 真实插件 DLL ----------
     // 必须从 <exe>/plugins 加载（与 PluginManager、V 组同一路径），
@@ -3842,25 +3936,22 @@ int main(int argc, char **argv)
     {
         PluginInterface *own = tmpl->createInstance();
         own->setSourceName(QStringLiteral("basic.docx"));
-        own->sendFileData(buf, len);
+        QByteArray data = basicData;              // sendFileData 需要可写缓冲区
+        own->sendFileData(data.data(), data.size());
         verifyBasicDoc(own->getPluginWidget());
         verifyZoom(own->getPluginWidget());
         delete own;
     }
-    delete[] buf;
-    buf = nullptr;
 
     // ---------- C ----------
     {
-        char *cbuf = nullptr;
-        qint64 clen = 0;
-        fm.QGetFileContent(chineseEntry, &cbuf, clen);
+        const QByteArray chineseData = fm.entryContent(chineseEntry);
         PluginInterface *own = tmpl->createInstance();
         own->setSourceName(QStringLiteral("chinese.docx"));
-        own->sendFileData(cbuf, clen);
+        QByteArray data = chineseData;
+        own->sendFileData(data.data(), data.size());
         verifyChineseDoc(own->getPluginWidget());
         delete own;
-        delete[] cbuf;
     }
 
     // ---------- N / M ----------
@@ -3883,6 +3974,7 @@ int main(int argc, char **argv)
 
     // ---------- Z: 格式识别（后缀不可靠时的兜底） ----------
     verifyFormatResolver();
+    verifyUiTypeHelpers();
 
     // ---------- S: 截图（可选，--shots <dir>） ----------
     if (shotsDir.isEmpty())

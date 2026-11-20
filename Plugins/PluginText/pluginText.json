@@ -4,6 +4,7 @@
     "Author" : "lujiajing",
     "Date":"2023-07-09",
     "apiVersion":7,
+    "category":"text",
     "extensionPriority":10,
     "extensions":[
         "txt", "log", "md", "markdown", "csv", "ini", "cfg", "conf",

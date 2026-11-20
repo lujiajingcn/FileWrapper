@@ -51,7 +51,6 @@
     <property name="title">
      <string>插件设置</string>
     </property>
-    <addaction name="actionPluginMap"/>
    </widget>
    <widget class="QMenu" name="menu_3">
     <property name="title">
@@ -116,11 +115,6 @@
   <action name="actionAbout">
    <property name="text">
     <string>关于文件封装器</string>
-   </property>
-  </action>
-  <action name="actionPluginMap">
-   <property name="text">
-    <string>映射插件</string>
    </property>
   </action>
   <action name="actionUnloadFile">

@@ -4,6 +4,7 @@
     "Author" : "lujiajing",
     "Date":"2026-11-17",
     "apiVersion":7,
+    "category":"slides",
     "extensions":["pptx", "odp"],
     "Dependency":"Qt6Xml.dll（见 FileWrapper/deploy/plugin-deps.manifest）",
     "Description":"演示文稿预览插件：按页显示 .pptx（OOXML PresentationML）与 .odp（OpenDocument Presentation）的标题、正文与图片（静态内容，不含动画/切换/版式还原）。"

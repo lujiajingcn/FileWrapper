@@ -4,6 +4,7 @@
     "Author": "lujiajing",
     "Date": "2026-11-17",
     "apiVersion": 7,
+    "category": "document",
     "extensions": [
         "docx",
         "docm",

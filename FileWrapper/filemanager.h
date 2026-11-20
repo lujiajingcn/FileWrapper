@@ -38,10 +38,9 @@ public:
     // 对头部与条目区重复解析两遍（P1-9）。调用方必须保证该结果来自同一文件。
     bool QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPreParsed = nullptr);
     void unLoadMergedFile();
-    void QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen);
 
     // C2：直接读出条目内容（不经过 new char[] + delete[] 的中转）。
-    // 校验语义与 QGetFileContent 一致（大小、完整性、v2 内容 CRC）；失败时 psErr 给原因。
+    // 校验语义：大小、完整性、v2 内容 CRC；失败时 psErr 给原因。
     QByteArray entryContent(const QString &sFilePath, QString *psErr = nullptr);
 
     // 只读取条目开头至多 nMaxBytes 字节（格式嗅探用；不会为了"看文件头"把整块载入内存）

@@ -4,6 +4,7 @@
     "Author" : "lujiajing",
     "Date":"2026-08-21",
     "apiVersion":7,
+    "category":"book",
     "extensions":[
         "epub", "fb2", "mobi", "azw", "azw3", "prc"
     ],

@@ -636,10 +636,10 @@ bool FileManager::parseFile(const QString &sPath, FwArc::Meta &meta, QString &sE
     return parseFromDevice(f, meta, sErr);
 }
 
-// P1-1：每个操作使用自己的 QFile。以前 entryHead()/entryContent()/QGetFileContent()
-// 都复用 m_qFile，而 streamCopy() 又在循环里 processEvents()；重入时第二次 seek
-// 会把外层复制游标改到别的条目位置，v1 归档没有内容 CRC，错误字节会被静默写进
-// 新归档。独占句柄后，共享游标不再是正确性依赖。
+// P1-1：每个操作使用自己的 QFile。以前 entryHead()/entryContent() 都复用 m_qFile，
+// 而 streamCopy() 又在循环里 processEvents()；重入时第二次 seek 会把外层复制游标
+// 改到别的条目位置，v1 归档没有内容 CRC，错误字节会被静默写进新归档。
+// 独占句柄后，共享游标不再是正确性依赖。
 bool FileManager::openEntrySource(const QString &sFilePath, const FILEINFO &fi,
                                   QFile &localFile, qint64 &srcPos, QString &sErr) const
 {
@@ -2547,8 +2547,7 @@ QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QS
 }
 
 // C2：直接读出条目内容到 QByteArray，省掉"new char[] -> 插件再复制一份"的中转。
-// 与 QGetFileContent() 的校验语义保持一致（大小、完整性、v2 内容 CRC）；
-// 两者共用同一套归档/待保存文件解析逻辑，改动时请同步。
+// 校验语义：大小、完整性、v2 内容 CRC；读取失败时 psErr 给原因。
 QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
 {
     if (psErr) psErr->clear();
@@ -2628,90 +2627,6 @@ QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
 
     if (psErr) psErr->clear();
     return out;
-}
-
-void FileManager::QGetFileContent(QString sFilePath, char **szBuf, qint64 &nFileLen)
-{
-    *szBuf = nullptr;
-    nFileLen = 0;
-
-    auto it = m_mapFileInfos.find(sFilePath);
-    if (it == m_mapFileInfos.end())
-    {
-        setError(tr("归档内未找到文件：%1").arg(sFilePath));
-        return;
-    }
-    const FILEINFO fi = it.value();
-    if (fi.nFileLen < 0) { setError(tr("文件大小异常：%1").arg(sFilePath)); return; }
-    if (fi.nFileLen == 0)
-    {
-        // 0 字节文件是合法情况，不视为读取失败（P3-2）
-        m_sLastError.clear();
-        return;
-    }
-
-    QFile localSrc;
-    qint64 srcPos = 0;
-    QString sOpenErr;
-    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
-    {
-        setError(sOpenErr);
-        return;
-    }
-    if (!FwArc::fitsInQsizetype(quint64(fi.nFileLen)))
-    {
-        setError(tr("文件过大，超出当前平台可一次性读取的范围：%1").arg(sFilePath));
-        return;
-    }
-
-    // std::nothrow：畸形头部或超大文件不再让进程因 bad_alloc 终止（P1-1）
-    char *pBuf = new (std::nothrow) char[qsizetype(fi.nFileLen)];
-    if (!pBuf)
-    {
-        setError(tr("内存不足，无法一次性读取 %1（%2）。请改用导出或分割功能。")
-                 .arg(fi.sFileName, FwArc::formatSize(fi.nFileLen)));
-        return;
-    }
-
-    // 分块读取，避免一次 read 超大长度
-    if (!localSrc.seek(srcPos))
-    {
-        delete[] pBuf;
-        setError(tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString()));
-        return;
-    }
-    qint64 done = 0;
-    bool bOk = true;
-    while (done < fi.nFileLen)
-    {
-        const qint64 n = qMin<qint64>(fi.nFileLen - done, MAXBUFFERSIZE);
-        const qint64 got = localSrc.read(pBuf + done, n);
-        if (got <= 0) { bOk = false; break; }
-        done += got;
-    }
-    if (!bOk || done != fi.nFileLen)
-    {
-        delete[] pBuf;
-        setError(tr("读取文件内容不完整：%1（期望 %2 B，实际 %3 B）")
-                 .arg(sFilePath).arg(fi.nFileLen).arg(done));
-        return;
-    }
-
-    if (m_mapContentCrc.contains(sFilePath))
-    {
-        FwArc::Crc32 c;
-        c.update(pBuf, fi.nFileLen);
-        if (c.value() != m_mapContentCrc.value(sFilePath))
-        {
-            delete[] pBuf;
-            setError(tr("内容校验失败（CRC32 不匹配）：%1\n该文件可能已损坏。").arg(sFilePath));
-            return;
-        }
-    }
-
-    *szBuf = pBuf;
-    nFileLen = fi.nFileLen;
-    m_sLastError.clear();
 }
 
 void FileManager::outputFile(QString sFilePath, QString sOutputDir)

@@ -10,7 +10,6 @@
 #include <QFileDialog>
 #include "dlgmergefile.h"
 #include "dlgsplitfile.h"
-#include "dlgpluginmap.h"
 #include "dlgfileproperty.h"
 #include "builtinviewer.h"
 #include "pluginmanager.h"
@@ -26,6 +25,7 @@
 #include <QDialogButtonBox>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QProgressBar>
 #include <QMenu>
@@ -506,47 +506,56 @@ static QIcon makeDockTitleIcon(bool bClose)
 }
 
 // 按后缀把文件归到 9 类，返回对应角标（未知类型给灰色问号）
+// 标签页/列表的类型角标：类别来自插件元数据 JSON 的 "category"（image/media/document…），
+// 主程序只维护"类别 -> 字母/颜色"这一张表。
+// 以前这里是按后缀硬编码的 9 组规则（90 多个后缀），插件新增格式时角标会掉成 "?"；
+// 现在某个后缀归哪个类别由插件自己声明，新增后缀/新插件不需要改这里。
 QIcon MainWindow::tabIconForFile(const QString &sFileName)
 {
-    struct BadgeRule
+    struct BadgeStyle
     {
-        const char *szLetters;      // 后缀列表，逗号分隔
-        const char *szBadgeLetter;  // 角标上的字母
-        const char *szColor;        // 角标底色
+        const char *szLetter;
+        const char *szColor;
     };
-    static const BadgeRule kRules[] = {
-        {"pdf",                                             "P", "#E5484D"},
-        {"doc,docx,odt,rtf,dot,dotx,docm,wps",              "W", "#2B6CB0"},
-        {"xls,xlsx,ods,csv,xlsm,et",                        "X", "#1F8A54"},
-        {"ppt,pptx,odp,dps",                                "S", "#D97706"},
-        {"jpg,jpeg,png,gif,bmp,webp,tif,tiff,ico,svg,xpm",  "I", "#7C3AED"},
-        {"mp4,mkv,avi,mov,wmv,flv,webm,mp3,wav,flac,aac,"
-         "ogg,m4a,wma,m2ts,ts,mpg,mpeg,3gp,rm,rmvb",        "M", "#0E9AA7"},
-        {"epub,mobi,azw,azw3,fb2,lit,prc,pdb",              "B", "#B45309"},
-        {"txt,log,md,ini,cfg,json,xml,yaml,yml,cpp,h,cs,"
-         "py,js,ts,java,sql,sh,bat,ps1,html,htm,css",       "T", "#4B5563"},
-        {"zip,rar,7z,gz,tar,bz2",                           "Z", "#6D28D9"},
+    static const QHash<QString, BadgeStyle> kStyles = {
+        { QStringLiteral("document"), { "W", "#2B6CB0" } },
+        { QStringLiteral("sheet"),    { "X", "#1F8A54" } },
+        { QStringLiteral("slides"),   { "S", "#D97706" } },
+        { QStringLiteral("pdf"),      { "P", "#E5484D" } },
+        { QStringLiteral("image"),    { "I", "#7C3AED" } },
+        { QStringLiteral("media"),    { "M", "#0E9AA7" } },
+        { QStringLiteral("book"),     { "B", "#B45309" } },
+        { QStringLiteral("text"),     { "T", "#4B5563" } },
+        { QStringLiteral("archive"),  { "Z", "#6D28D9" } },
     };
-    static QHash<QString, QIcon> s_mapIcons;
-    if (s_mapIcons.isEmpty())
-    {
-        for (const BadgeRule &rule : kRules)
-        {
-            const QIcon icon = makeTypeBadge(QString::fromLatin1(rule.szBadgeLetter),
-                                             QColor(QString::fromLatin1(rule.szColor)));
-            const QStringList listExts = QString::fromLatin1(rule.szLetters).split(',');
-            for (const QString &sExt : listExts)
-                s_mapIcons.insert(sExt.trimmed(), icon);
-        }
-    }
 
     const QString sExt = QFileInfo(sFileName).suffix().toLower();
-    const auto it = s_mapIcons.constFind(sExt);
-    if (it != s_mapIcons.constEnd())
-        return it.value();
+    QString sCategory = PluginManager::getInstance()->categoryForExtension(sExt);
+    if (sCategory.isEmpty())
+    {
+        // 没有插件认领的压缩包仍给 Z 角标（只是展示类型，不代表本程序能打开）
+        const QString sId = FormatResolver::byExtension(sExt).formatId;
+        if (sId == QStringLiteral("zip") || sId == QStringLiteral("rar")
+            || sId == QStringLiteral("7z") || sId == QStringLiteral("tar")
+            || sId == QStringLiteral("gz"))
+            sCategory = QStringLiteral("archive");
+    }
 
-    static const QIcon s_iconUnknown = makeTypeBadge(QStringLiteral("?"), QColor(QStringLiteral("#94A3B8")));
-    return s_iconUnknown;
+    static QHash<QString, QIcon> s_mapIcons;   // 类别 -> 已生成的角标（按类别缓存）
+    const auto styleIt = kStyles.constFind(sCategory);
+    if (styleIt == kStyles.constEnd())
+    {
+        static const QIcon s_iconUnknown =
+                makeTypeBadge(QStringLiteral("?"), QColor(QStringLiteral("#94A3B8")));
+        return s_iconUnknown;
+    }
+
+    auto it = s_mapIcons.constFind(sCategory);
+    if (it == s_mapIcons.constEnd())
+        it = s_mapIcons.insert(sCategory,
+                               makeTypeBadge(QString::fromLatin1(styleIt->szLetter),
+                                             QColor(QString::fromLatin1(styleIt->szColor))));
+    return it.value();
 }
 
 // 「缩略图显示」工具按钮图标：2×2 圆角块（左上角用品牌青色强调），
@@ -620,6 +629,7 @@ MainWindow::MainWindow(QWidget *parent) :
     initWidgetFilePath();
     initWidgetFileContent();
     restoreUiState();
+    purgeLegacyPluginMapSettings();
 
     // 所有停靠窗创建完之后统一处理标题栏按钮（新增停靠窗时在这里能一并覆盖）
     polishDockTitleButtons();
@@ -655,33 +665,14 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(m_acVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
     ui->menu->addAction(m_acVerify);
 
-    // 「插件诊断」加入插件设置菜单：插件加载失败时用户能自己看到原因与缺哪个依赖
-    QAction *actPluginDiag = new QAction(QStringLiteral("插件诊断"), ui->menu_2);
-    actPluginDiag->setToolTip(QStringLiteral("查看已加载插件、加载失败原因与缺失的运行依赖"));
-    actPluginDiag->setIcon(FwIcons::get(QStringLiteral("diagnose")));
-    connect(actPluginDiag, &QAction::triggered, this,
-            &MainWindow::onActionPluginDiagnosticsTriggered);
-    ui->menu_2->addAction(actPluginDiag);
-
-    // 「插件管理」勾选启用/禁用、「重新加载插件」让修改生效（C5）
-    QAction *actPluginMgr = new QAction(QStringLiteral("插件管理"), ui->menu_2);
-    actPluginMgr->setToolTip(QStringLiteral("勾选启用/禁用插件；禁用的插件不加载，也不接手它的文件后缀"));
-    actPluginMgr->setIcon(FwIcons::get(QStringLiteral("manage")));
-    connect(actPluginMgr, &QAction::triggered, this, &MainWindow::onActionPluginManagerTriggered);
-    ui->menu_2->addAction(actPluginMgr);
-
-    QAction *actReloadPlugins = new QAction(QStringLiteral("重新加载插件"), ui->menu_2);
-    actReloadPlugins->setToolTip(QStringLiteral("重新扫描 plugins/ 目录（会先关闭所有标签页）"));
-    actReloadPlugins->setIcon(FwIcons::get(QStringLiteral("reload")));
-    connect(actReloadPlugins, &QAction::triggered, this, &MainWindow::onActionReloadPluginsTriggered);
-    ui->menu_2->addAction(actReloadPlugins);
-
-    // 「支持的格式」：告诉用户能打开什么、遇到不支持的格式该怎么办（比"插件映射"更直接）
-    QAction *actFormats = new QAction(QStringLiteral("支持的格式…"), ui->menu_2);
-    actFormats->setToolTip(QStringLiteral("查看已安装插件能打开哪些格式，以及常见不支持格式的处理建议"));
-    actFormats->setIcon(FwIcons::get(QStringLiteral("formats")));
-    connect(actFormats, &QAction::triggered, this, &MainWindow::onActionSupportedFormatsTriggered);
-    ui->menu_2->addAction(actFormats);
+    // 插件设置（合并入口）：插件状态/依赖、支持的格式、启用禁用、重新加载都在一个
+    // 对话框里。以前是四个菜单项，信息互相重叠，启停后还要再点一次「重新加载」。
+    QAction *actPluginSettings = new QAction(QStringLiteral("插件设置…"), ui->menu_2);
+    actPluginSettings->setToolTip(QStringLiteral("插件状态与依赖、支持的格式、启用/禁用、重新加载"));
+    actPluginSettings->setIcon(FwIcons::get(QStringLiteral("manage")));
+    connect(actPluginSettings, &QAction::triggered, this,
+            &MainWindow::onActionPluginSettingsTriggered);
+    ui->menu_2->addAction(actPluginSettings);
 
     // 所有动作创建完毕后统一进入初始状态（启动时未加载归档）
     syncActionStates();
@@ -690,7 +681,7 @@ MainWindow::MainWindow(QWidget *parent) :
     const int nFailedAtStartup = PluginManager::getInstance()->failures().size();
     if (nFailedAtStartup > 0)
         ui->statusBar->showMessage(
-            QStringLiteral("有 %1 个插件加载失败，见「插件设置 → 插件诊断」查看原因")
+            QStringLiteral("有 %1 个插件加载失败，见「插件设置」查看原因")
                 .arg(nFailedAtStartup), 20000);
 
     // 清理上一次会话遗留的临时抽取文件。只删 24 小时以前的陈旧文件，
@@ -974,7 +965,6 @@ void MainWindow::initWidgetFilePath()
     ui->actionUnloadFile->setIcon(FwIcons::get(QStringLiteral("unload")));
     ui->actionMergeFile->setIcon(FwIcons::get(QStringLiteral("merge")));
     ui->actionSplitFile->setIcon(FwIcons::get(QStringLiteral("split")));
-    ui->actionPluginMap->setIcon(FwIcons::get(QStringLiteral("plugin")));
     ui->actionAbout->setIcon(FwIcons::get(QStringLiteral("about")));
     m_acViewTree->setIcon(FwIcons::get(QStringLiteral("view_tree")));
     m_acViewFlat->setIcon(FwIcons::get(QStringLiteral("view_flat")));
@@ -1194,111 +1184,81 @@ void MainWindow::closeAllTabs()
     newEmptyTab();
 }
 
-// 根据文件后缀选择插件，并为标签页准备插件实例：
-// 三级路由：用户自定义映射 -> 插件自描述的 extensions -> 内置兜底；
+// 为标签页准备插件实例：路由结论来自 routeForFile()（内容优先 + 插件声明兜底），
 // 实例一律由 createInstance() 独占创建（B2：不再回退到共享实例）。
-bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
+bool MainWindow::resolvePlugin(const FILEINFO &info, const RouteDecision &route,
+                               QString &sPluginPath,
                                PluginInterface* &pInterface, bool &bOwned)
 {
     sPluginPath.clear();
     pInterface = nullptr;
     bOwned = false;
 
-    const QString sExt = QFileInfo(info.sFilePath).suffix();
-    sPluginPath = choosePlugin(sExt);
+    sPluginPath = route.pluginPath;
 
-    // 后缀被多个插件同时声明时（目前只有 ".ts"：MPEG-TS 视频 vs TypeScript 文本），
-    // extensionPriority 只保住"TypeScript 源码不会被当视频播"；反过来的真视频会被
-    // 灌进文本视图，显示一堆乱码且没有任何提示。这类歧义后缀按文件内容再判一次。
-    // 用户在「插件映射」里显式指定的后缀不参与仲裁（那是"我说了算"）。
-    if (!sPluginPath.isEmpty() && DlgPluginMap::mappingFor(sExt).isEmpty()
-        && PluginManager::getInstance()->isExtensionContested(sExt))
+    // 内容与后缀不一致时告诉用户"凭什么这么开"：自动判断必须可解释，
+    // 否则用户会以为打开方式是随机的。
+    if (!sPluginPath.isEmpty() && route.contentOverride)
     {
-        QString sReason;
-        const QByteArray head = m_fileManager->entryHead(info.sFilePath, 256 * 1024);
-        const QString sByContent = arbitrateContestedExtension(info.sFileName, head, sPluginPath, &sReason);
-        if (!sByContent.isEmpty())
-        {
-            statusBar()->showMessage(
-                QStringLiteral("后缀「.%1」可能是两类文件，按内容判断为「%2」，已改用对应插件打开。")
-                    .arg(sExt, sReason), 12000);
-            sPluginPath = sByContent;
-        }
+        const QString sExt = QFileInfo(info.sFilePath).suffix();
+        statusBar()->showMessage(
+            sExt.isEmpty()
+                ? QStringLiteral("后缀无法判断，按文件内容识别为「%1」（%2），已用对应插件打开。")
+                      .arg(route.formatName, route.basis)
+                : QStringLiteral("按文件内容判断为「%1」（%2），与后缀不一致，已改用对应插件打开。")
+                      .arg(route.formatName, route.basis),
+            12000);
     }
 
     if (sPluginPath.isEmpty())
     {
-        // 扩展名不可靠（下载改名、无后缀、.dat/.bin）时，先按**文件内容**识别真实格式：
-        // 这是对普通用户最有用的兜底 —— 不需要知道该选哪个插件。
-        const QByteArray head = m_fileManager->entryHead(info.sFilePath, 256 * 1024);
-        const FormatResolver::Detection det = FormatResolver::detect(info.sFileName, head);
+        // 仍无法处理：告诉用户"这是什么 + 该怎么办"，而不是丢一个空白页。
+        // route.detection 是路由时已经算好的识别结果，这里不必再读一遍文件头。
+        const FormatResolver::Detection &det = route.detection;
+        const QString sExt = QFileInfo(info.sFilePath).suffix();
 
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("无法打开该文件"));
+        box.setIcon(QMessageBox::Information);
+
+        const QString sType = sExt.isEmpty() ? QStringLiteral("(无扩展名)")
+                                             : QStringLiteral(".") + sExt;
+        box.setText(QStringLiteral("「%1」的格式无法直接显示：%2")
+                        .arg(info.sFileName, sType));
+
+        QStringList infoLines;
+        if (!det.displayName.isEmpty())
+            infoLines << QStringLiteral("识别结果：%1").arg(det.displayName);
+        if (!det.detail.isEmpty())
+            infoLines << QStringLiteral("判断依据：%1").arg(det.detail);
+        if (!det.advice.isEmpty())
+            infoLines << QStringLiteral("\n建议：%1").arg(det.advice);
         if (!det.pluginExt.isEmpty())
+            infoLines << QStringLiteral("\n识别为「%1」，但对应插件当前不可用（可能未部署或被禁用）。"
+                                        "可在「插件设置」里检查。")
+                             .arg(det.pluginExt);
+        infoLines << QStringLiteral("\n本程序支持：docx/odt/rtf、xlsx/ods、pptx/odp、pdf、"
+                                    "epub/fb2/mobi、文本/代码、图片、音视频。");
+        box.setInformativeText(infoLines.join(QStringLiteral("\n")));
+
+        QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::AcceptRole);
+        QPushButton *bHex    = box.addButton(QStringLiteral("以十六进制查看"), QMessageBox::AcceptRole);
+        QPushButton *bList   = box.addButton(QStringLiteral("查看支持的格式…"), QMessageBox::ActionRole);
+        QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+        // 默认按钮用「取消」：避免回车误触发"以文本查看"把二进制内容灌进文本视图
+        box.setDefaultButton(bCancel);
+        box.exec();
+
+        QAbstractButton *clicked = box.clickedButton();
+        Q_UNUSED(bCancel);   // 只是用于布局/默认按钮，点击判断不需要它
+        if (clicked == bList)
         {
-            const QString sByContent =
-                PluginManager::getInstance()->pluginForExtension(det.pluginExt);
-            if (!sByContent.isEmpty())
-            {
-                sPluginPath = sByContent;
-                statusBar()->showMessage(
-                    QStringLiteral("扩展名无法识别，但文件内容判断为「%1」，已用对应插件打开。")
-                        .arg(det.displayName), 12000);
-            }
+            showPluginSettings(1);
+            return false;
         }
-
-        if (sPluginPath.isEmpty())
-        {
-            // 仍无法处理：告诉用户"这是什么 + 该怎么办"，而不是只让他去猜该映射哪个插件。
-            QMessageBox box(this);
-            box.setWindowTitle(QStringLiteral("无法打开该文件"));
-            box.setIcon(QMessageBox::Information);
-
-            const QString sType = sExt.isEmpty() ? QStringLiteral("(无扩展名)")
-                                                 : QStringLiteral(".") + sExt;
-            box.setText(QStringLiteral("「%1」的格式无法直接显示：%2")
-                            .arg(info.sFileName, sType));
-
-            QStringList infoLines;
-            if (!det.displayName.isEmpty())
-                infoLines << QStringLiteral("识别结果：%1").arg(det.displayName);
-            if (!det.detail.isEmpty())
-                infoLines << QStringLiteral("判断依据：%1").arg(det.detail);
-            if (!det.advice.isEmpty())
-                infoLines << QStringLiteral("\n建议：%1").arg(det.advice);
-            if (!det.pluginExt.isEmpty())
-                infoLines << QStringLiteral("\n识别为「%1」，但对应插件当前不可用（可能未部署或被禁用）。"
-                                            "可在「插件设置 → 插件诊断 / 插件管理」里检查。")
-                                 .arg(det.pluginExt);
-            infoLines << QStringLiteral("\n本程序支持：docx/odt/rtf、xlsx/ods、pptx/odp、pdf、"
-                                        "epub/fb2/mobi、文本/代码、图片、音视频。");
-            box.setInformativeText(infoLines.join(QStringLiteral("\n")));
-
-            QPushButton *bText   = box.addButton(QStringLiteral("以文本查看"), QMessageBox::AcceptRole);
-            QPushButton *bHex    = box.addButton(QStringLiteral("以十六进制查看"), QMessageBox::AcceptRole);
-            QPushButton *bList   = box.addButton(QStringLiteral("查看支持的格式…"), QMessageBox::ActionRole);
-            QPushButton *bMap    = box.addButton(QStringLiteral("设置插件映射…"), QMessageBox::ActionRole);
-            QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
-            // 默认按钮用「取消」：避免回车误触发"以文本查看"把二进制内容灌进文本视图
-            box.setDefaultButton(bCancel);
-            box.exec();
-
-            QAbstractButton *clicked = box.clickedButton();
-            Q_UNUSED(bCancel);   // 只是用于布局/默认按钮，点击判断不需要它
-            if (clicked == bList)
-            {
-                showSupportedFormats();
-                return false;
-            }
-            if (clicked == bMap)
-            {
-                DlgPluginMap dlg(this);
-                dlg.exec();
-                return false;
-            }
-            if (clicked == bText)      sPluginPath = QStringLiteral("builtin://text");
-            else if (clicked == bHex)  sPluginPath = QStringLiteral("builtin://hex");
-            else return false;
-        }
+        if (clicked == bText)      sPluginPath = QStringLiteral("builtin://text");
+        else if (clicked == bHex)  sPluginPath = QStringLiteral("builtin://hex");
+        else return false;
     }
 
     if (sPluginPath.startsWith(QStringLiteral("builtin://")))
@@ -1388,7 +1348,7 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
                         .arg(PluginDiagnostics::pluginDisplayName(sPluginPath),
                              sFileName.isEmpty() ? QStringLiteral("该文件") : sFileName));
         box.setInformativeText(QStringLiteral(
-            "可以在「插件设置 → 插件管理」里勾选启用，再点「重新加载插件」。"));
+            "可以在「插件设置」里勾选启用并保存（会提示重新加载）。"));
         QPushButton *bText = box.addButton(QStringLiteral("以文本查看"), QMessageBox::ActionRole);
         QPushButton *bCancel = box.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
         box.setDefaultButton(bCancel);
@@ -1465,9 +1425,11 @@ PluginInterface *MainWindow::promptPluginUnavailable(const QString &sPluginPath,
     }
 }
 
-// 「插件设置 → 支持的格式」：一屏告诉用户"本程序能打开什么、常见不支持格式该怎么办"
-// 也解释了插件映射什么时候才用得上（只在明确知道该选哪个插件时）。
-void MainWindow::showSupportedFormats()
+// ================= 插件设置（状态 / 格式 / 启停 / 重载 合并入口） =================
+
+// 「插件设置 → 支持的格式」页的正文：能打开什么、常见不支持格式该怎么办。
+// 独立成函数：测试可以直接断言内容，不必弹模态框。
+QString MainWindow::supportedFormatsText() const
 {
     PluginManager *pMgr = PluginManager::getInstance();
 
@@ -1490,163 +1452,22 @@ void MainWindow::showSupportedFormats()
     }
 
     lines << QString();
-    lines << QStringLiteral("后缀不认识的文件会先按**文件内容**自动识别；仍无法显示时，可以：");
-    lines << QStringLiteral("  · 以文本查看 / 以十六进制查看（不会改动文件）");
+    lines << QStringLiteral("打开方式由程序自动判断：优先按文件内容识别真实格式，"
+                            "内容判断不出来时按插件声明的后缀；两者都不匹配才会提示。");
+    lines << QStringLiteral("仍无法显示时，可以：");
+    lines << QStringLiteral("  · 右键文件选择「以文本查看 / 以十六进制查看」（不会改动文件）");
     lines << QStringLiteral("  · 把它转换成受支持的格式（最省事）");
-    lines << QStringLiteral("  · 设置插件映射：只有明确知道该用哪个插件时才需要");
 
     lines << QString();
     lines << QStringLiteral("常见但本程序暂不支持的格式：");
     for (const auto &pair : FormatResolver::knownUnsupported())
         lines << QStringLiteral("  · %1：%2").arg(pair.first, pair.second);
 
-    QMessageBox box(this);
-    box.setWindowTitle(QStringLiteral("支持的格式"));
-    box.setIcon(QMessageBox::Information);
-    box.setText(QStringLiteral("本程序能直接显示的格式"));
-    box.setInformativeText(lines.join(QStringLiteral("\n")));
-    box.setStandardButtons(QMessageBox::Ok);
-    box.exec();
+    return lines.join(QLatin1Char('\n'));
 }
 
-void MainWindow::onActionSupportedFormatsTriggered()
-{
-    showSupportedFormats();
-}
-
-void MainWindow::onActionPluginDiagnosticsTriggered()
-{
-    showPluginDiagnostics();
-}
-
-// ================= C5: 插件管理 / 重新加载 =================
-
-void MainWindow::onActionPluginManagerTriggered()
-{
-    showPluginManagerDialog();
-}
-
-void MainWindow::onActionReloadPluginsTriggered()
-{
-    reloadAllPlugins();
-}
-
-void MainWindow::showPluginManagerDialog()
-{
-    PluginManager *pMgr = PluginManager::getInstance();
-    const QStringList listIds = pMgr->knownPluginIds();
-    if (listIds.isEmpty())
-    {
-        QMessageBox::information(this, QStringLiteral("插件管理"),
-                                 QStringLiteral("没有发现任何插件（plugins/ 目录为空或不可读）。"));
-        return;
-    }
-
-    QDialog dlg(this);
-    dlg.setWindowTitle(QStringLiteral("插件管理"));
-    dlg.resize(460, 380);
-    auto *pLayout = new QVBoxLayout(&dlg);
-    auto *pTip = new QLabel(QStringLiteral(
-        "勾选 = 启用。被禁用的插件不会加载，也不会接手它声明过的文件后缀；"
-        "保存后需要「重新加载插件」才会生效。"), &dlg);
-    pTip->setWordWrap(true);
-    pLayout->addWidget(pTip);
-
-    auto *pList = new QListWidget(&dlg);
-    for (const QString &sId : listIds)
-    {
-        auto *pItem = new QListWidgetItem(sId, pList);
-        pItem->setFlags(pItem->flags() | Qt::ItemIsUserCheckable);
-        pItem->setCheckState(PluginManager::isPluginEnabled(sId) ? Qt::Checked : Qt::Unchecked);
-        if (!PluginManager::isPluginEnabled(sId))
-            pItem->setToolTip(QStringLiteral("当前被禁用"));
-    }
-    pLayout->addWidget(pList, 1);
-
-    auto *pButtons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-    pLayout->addWidget(pButtons);
-    connect(pButtons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-    connect(pButtons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-
-    if (dlg.exec() != QDialog::Accepted)
-        return;
-
-    bool bChanged = false;
-    for (int i = 0; i < pList->count(); ++i)
-    {
-        QListWidgetItem *pItem = pList->item(i);
-        const bool bWant = (pItem->checkState() == Qt::Checked);
-        if (bWant != PluginManager::isPluginEnabled(pItem->text()))
-        {
-            PluginManager::setPluginEnabled(pItem->text(), bWant);
-            bChanged = true;
-        }
-    }
-    if (!bChanged)
-        return;
-
-    if (QMessageBox::question(this, QStringLiteral("插件管理"),
-                              QStringLiteral("设置已保存。现在重新加载插件让它生效吗？\n"
-                                             "（重新加载会关闭所有标签页）"),
-                              QMessageBox::Yes | QMessageBox::No,
-                              QMessageBox::Yes) == QMessageBox::Yes)
-        reloadAllPlugins();
-}
-
-void MainWindow::reloadAllPlugins()
-{
-    // 重新加载会卸载 DLL：必须先释放所有标签页里的插件实例，否则对象虚表悬空。
-    // 只在确实有"打开过文件"的标签页时才需要确认（空标签页没有插件实例）。
-    bool bAnyFileTab = false;
-    for (const TabDoc &doc : m_vTabDocs)
-        if (doc.hasFile) { bAnyFileTab = true; break; }
-
-    if (bAnyFileTab)
-    {
-        if (QMessageBox::question(this, QStringLiteral("重新加载插件"),
-                                  QStringLiteral("重新加载需要先关闭所有标签页（插件实例必须先释放）。\n是否继续？"),
-                                  QMessageBox::Yes | QMessageBox::No,
-                                  QMessageBox::No) != QMessageBox::Yes)
-            return;
-    }
-
-    if (m_pCurrentInterface != nullptr)
-    {
-        ensureInstanceStopped(m_pCurrentInterface);
-        m_pCurrentInterface = nullptr;
-    }
-    closeAllTabs();                        // 销毁标签页持有的插件实例
-    pollStopUnsafeInstances();             // 后台线程可能已自行退出，先复查一次
-    if (!m_vtDeferredInstances.isEmpty() || !m_setStopUnsafe.isEmpty())
-    {
-        // P0-3：仍有实例停播未确认 —— 卸载 DLL 会让后台线程执行已卸载代码
-        QMessageBox::warning(this, QStringLiteral("重新加载插件"),
-            QStringLiteral("有插件的后台播放未能确认停止，为避免访问已卸载的代码，\n"
-                           "本次不重新加载插件。程序会每秒自动复查，也可稍后重试。"));
-        return;
-    }
-    m_setWarnedPlugins.clear();
-    m_setBuiltinTextPlugins.clear();
-    m_setPluginWidgets.clear();
-
-    PluginManager *pMgr = PluginManager::getInstance();
-    pMgr->reloadPlugins();
-
-    // 重新收集插件 widget 指针（清理标签页时据此避免误删）
-    for (PluginInterface *pIface : pMgr->getAllInterfaces())
-        m_setPluginWidgets.insert(pIface->getPluginWidget());
-
-    QString sMsg = QStringLiteral("插件已重新加载：%1 个可用").arg(pMgr->getAllInterfaces().size());
-    if (!pMgr->disabledPluginIds().isEmpty())
-        sMsg += QStringLiteral("，%1 个被禁用").arg(pMgr->disabledPluginIds().size());
-    const int nFailed = pMgr->failures().size();
-    if (nFailed > 0)
-        sMsg += QStringLiteral("，%1 个加载失败（见「插件诊断」）").arg(nFailed);
-    statusBar()->showMessage(sMsg, 15000);
-}
-
-// 「插件设置 → 插件诊断」：一屏看清「已加载什么、谁没加载、缺哪些依赖」
-void MainWindow::showPluginDiagnostics()
+// 「插件设置 → 状态与依赖」页的正文：已加载什么、谁没加载、缺哪些依赖、谁被禁用。
+QString MainWindow::pluginStatusText() const
 {
     PluginManager *pMgr = PluginManager::getInstance();
     const QString sAppDir = QCoreApplication::applicationDirPath();
@@ -1705,24 +1526,178 @@ void MainWindow::showPluginDiagnostics()
                       : QStringLiteral("  · %1 —— %2").arg(m.path, m.hint));
     }
 
-    QMessageBox box(this);
-    box.setWindowTitle(QStringLiteral("插件诊断"));
-    box.setIcon(listFailures.isEmpty() && listMissing.isEmpty()
-                ? QMessageBox::Information : QMessageBox::Warning);
-    box.setText(QStringLiteral("插件运行环境诊断"));
-    box.setInformativeText(lines.join(QLatin1Char('\n')));
-    box.exec();
+    return lines.join(QLatin1Char('\n'));
+}
+
+void MainWindow::onActionPluginSettingsTriggered()
+{
+    showPluginSettings();
+}
+
+// 一个对话框装下原先四个入口：状态与依赖 / 支持的格式 / 启用禁用 + 重新加载。
+// 以前「插件诊断 / 插件管理 / 支持的格式 / 重新加载插件」各占一个菜单项，内容互相
+// 重叠；启停改完还得再点一次重载。现在保存后自动接上重载（重载本身会提示关标签页）。
+void MainWindow::showPluginSettings(int nInitialTab)
+{
+    PluginManager *pMgr = PluginManager::getInstance();
+    const QStringList listIds = pMgr->knownPluginIds();
+    if (listIds.isEmpty())
+    {
+        QMessageBox::information(this, QStringLiteral("插件设置"),
+                                 QStringLiteral("没有发现任何插件（plugins/ 目录为空或不可读）。"));
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("插件设置"));
+    dlg.resize(720, 560);
+
+    auto *pLayout = new QVBoxLayout(&dlg);
+    auto *pTabs = new QTabWidget(&dlg);
+
+    auto *pStatus = new QPlainTextEdit(pluginStatusText(), pTabs);
+    pStatus->setReadOnly(true);
+    pTabs->addTab(pStatus, QStringLiteral("状态与依赖"));
+
+    auto *pFormats = new QPlainTextEdit(supportedFormatsText(), pTabs);
+    pFormats->setReadOnly(true);
+    pTabs->addTab(pFormats, QStringLiteral("支持的格式"));
+
+    auto *pTogglePage = new QWidget(pTabs);
+    auto *pToggleLayout = new QVBoxLayout(pTogglePage);
+    auto *pTip = new QLabel(QStringLiteral(
+        "勾选 = 启用。被禁用的插件不会加载，也不会接手它声明过的文件后缀。\n"
+        "「保存」会应用勾选并重新加载（重新加载会关闭所有标签页）；"
+        "只是新放了 DLL 的话，点「重新加载插件」即可。"), pTogglePage);
+    pTip->setWordWrap(true);
+    pToggleLayout->addWidget(pTip);
+
+    auto *pList = new QListWidget(pTogglePage);
+    for (const QString &sId : listIds)
+    {
+        auto *pItem = new QListWidgetItem(sId, pList);
+        pItem->setFlags(pItem->flags() | Qt::ItemIsUserCheckable);
+        pItem->setCheckState(PluginManager::isPluginEnabled(sId) ? Qt::Checked : Qt::Unchecked);
+        if (!PluginManager::isPluginEnabled(sId))
+            pItem->setToolTip(QStringLiteral("当前被禁用"));
+    }
+    pToggleLayout->addWidget(pList, 1);
+    pTabs->addTab(pTogglePage, QStringLiteral("启用 / 禁用"));
+    pTabs->setCurrentIndex(qBound(0, nInitialTab, pTabs->count() - 1));
+
+    pLayout->addWidget(pTabs, 1);
+
+    auto *pButtons = new QDialogButtonBox(&dlg);
+    QPushButton *pReload = pButtons->addButton(QStringLiteral("重新加载插件…"),
+                                               QDialogButtonBox::ActionRole);
+    QPushButton *pSave   = pButtons->addButton(QStringLiteral("保存"),
+                                               QDialogButtonBox::AcceptRole);
+    QPushButton *pClose  = pButtons->addButton(QStringLiteral("关闭"),
+                                               QDialogButtonBox::RejectRole);
+    pLayout->addWidget(pButtons);
+    connect(pSave, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(pClose, &QPushButton::clicked, &dlg, &QDialog::reject);
+    // 自定义结果码 2：只重扫插件目录，不改启停
+    connect(pReload, &QPushButton::clicked, &dlg, [&dlg]() { dlg.done(2); });
+
+    const int nResult = dlg.exec();
+    if (nResult == 2)
+    {
+        reloadAllPlugins();
+        return;
+    }
+    if (nResult != QDialog::Accepted)
+        return;
+
+    bool bChanged = false;
+    for (int i = 0; i < pList->count(); ++i)
+    {
+        QListWidgetItem *pItem = pList->item(i);
+        const bool bWant = (pItem->checkState() == Qt::Checked);
+        if (bWant != PluginManager::isPluginEnabled(pItem->text()))
+        {
+            PluginManager::setPluginEnabled(pItem->text(), bWant);
+            bChanged = true;
+        }
+    }
+
+    if (bChanged)
+        reloadAllPlugins();   // 内部会先确认"关闭所有标签页"
+    else
+        statusBar()->showMessage(
+            QStringLiteral("插件设置已保存（启停没有变化，无需重新加载）"), 5000);
+}
+
+void MainWindow::reloadAllPlugins()
+{
+    // 重新加载会卸载 DLL：必须先释放所有标签页里的插件实例，否则对象虚表悬空。
+    // 只在确实有"打开过文件"的标签页时才需要确认（空标签页没有插件实例）。
+    bool bAnyFileTab = false;
+    for (const TabDoc &doc : m_vTabDocs)
+        if (doc.hasFile) { bAnyFileTab = true; break; }
+
+    if (bAnyFileTab)
+    {
+        if (QMessageBox::question(this, QStringLiteral("重新加载插件"),
+                                  QStringLiteral("重新加载需要先关闭所有标签页（插件实例必须先释放）。\n是否继续？"),
+                                  QMessageBox::Yes | QMessageBox::No,
+                                  QMessageBox::No) != QMessageBox::Yes)
+            return;
+    }
+
+    if (m_pCurrentInterface != nullptr)
+    {
+        ensureInstanceStopped(m_pCurrentInterface);
+        m_pCurrentInterface = nullptr;
+    }
+    closeAllTabs();                        // 销毁标签页持有的插件实例
+    pollStopUnsafeInstances();             // 后台线程可能已自行退出，先复查一次
+    if (!m_vtDeferredInstances.isEmpty() || !m_setStopUnsafe.isEmpty())
+    {
+        // P0-3：仍有实例停播未确认 —— 卸载 DLL 会让后台线程执行已卸载代码
+        QMessageBox::warning(this, QStringLiteral("重新加载插件"),
+            QStringLiteral("有插件的后台播放未能确认停止，为避免访问已卸载的代码，\n"
+                           "本次不重新加载插件。程序会每秒自动复查，也可稍后重试。"));
+        return;
+    }
+    m_setWarnedPlugins.clear();
+    m_setBuiltinTextPlugins.clear();
+    m_setPluginWidgets.clear();
+
+    PluginManager *pMgr = PluginManager::getInstance();
+    pMgr->reloadPlugins();
+
+    // 重新收集插件 widget 指针（清理标签页时据此避免误删）
+    for (PluginInterface *pIface : pMgr->getAllInterfaces())
+        m_setPluginWidgets.insert(pIface->getPluginWidget());
+
+    QString sMsg = QStringLiteral("插件已重新加载：%1 个可用").arg(pMgr->getAllInterfaces().size());
+    if (!pMgr->disabledPluginIds().isEmpty())
+        sMsg += QStringLiteral("，%1 个被禁用").arg(pMgr->disabledPluginIds().size());
+    const int nFailed = pMgr->failures().size();
+    if (nFailed > 0)
+        sMsg += QStringLiteral("，%1 个加载失败（见「插件设置」）").arg(nFailed);
+    statusBar()->showMessage(sMsg, 15000);
 }
 
 // 新建标签页并打开选中的记录项文件（该页独占一个插件实例）
 void MainWindow::openFileInNewTab(const FILEINFO &info)
 {
+    const RouteDecision route = routeForFile(info);
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
     bool bOwned = false;
-    if (!resolvePlugin(info, sPluginPath, pInterface, bOwned))
+    if (!resolvePlugin(info, route, sPluginPath, pInterface, bOwned))
         return;
 
+    addFileTab(info, sPluginPath, pInterface, bOwned);
+}
+
+// 新建标签页并挂上已经创建好的实例：正常打开与「强制内置查看器」共用，
+// 避免两处各写一遍 TabDoc 装配（字段漏一个就是标签页空白）。
+void MainWindow::addFileTab(const FILEINFO &info, const QString &sPluginPath,
+                            PluginInterface *pInterface, bool bOwned)
+{
     TabDoc doc;
     doc.hasFile = true;
     doc.info = info;
@@ -1735,6 +1710,20 @@ void MainWindow::openFileInNewTab(const FILEINFO &info)
     int newIdx = ui->tabWidget->addTab(new QWidget(), tabIconForFile(info.sFileName),
                                        info.sFileName);
     ui->tabWidget->setCurrentIndex(newIdx); // 触发 currentChanged -> activateTab
+}
+
+// 右键「以文本查看 / 以十六进制查看」：跳过自动路由，强制用内置查看器打开这一个文件。
+// 这是原「插件映射」唯一值得保留的能力（看未识别的二进制、排查插件解析问题），
+// 但只对当前文件生效、不写配置 —— 不会像映射那样永久改掉某个后缀的打开方式。
+void MainWindow::openFileWithBuiltinViewer(const FILEINFO &info, bool bHex)
+{
+    auto *pViewer = new BuiltinViewer(bHex ? BuiltinViewer::HexMode : BuiltinViewer::TextMode);
+    addFileTab(info,
+               bHex ? QStringLiteral("builtin://hex") : QStringLiteral("builtin://text"),
+               pViewer, true);
+    statusBar()->showMessage(
+        bHex ? QStringLiteral("已用内置十六进制查看器打开「%1」").arg(info.sFileName)
+             : QStringLiteral("已用内置文本查看器打开「%1」").arg(info.sFileName), 5000);
 }
 
 // 在当前激活的标签页打开文件（无激活标签页时退化为新建）
@@ -1758,16 +1747,14 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     }
 
     // 该页已持有同一插件的独占实例：直接复用，仅替换文件并重新渲染。
-    // 先用扩展名做一次轻量判断，避免"创建临时实例再删掉"的浪费
-    //（媒体插件构造还会起解码线程，虽小但完全没必要）。
-    // 但歧义后缀（.ts）不能只看扩展名复用：同一个文本页接下来可能要被换成视频，
-    // 必须走 resolvePlugin 的内容仲裁。
-    const QString sExtQuick = QFileInfo(info.sFilePath).suffix();
-    const QString sByExtQuick = choosePlugin(sExtQuick);
+    // 路由结论先算一次（内容优先），避免"创建临时实例再删掉"的浪费
+    //（媒体插件构造还会起解码线程，虽小但完全没必要）；同时也自动覆盖了
+    //  ".ts" 这类后缀歧义：同一页可能从文本换成视频，结论不同就不会复用。
+    const RouteDecision route = routeForFile(info);
+    const QString &sQuick = route.pluginPath;
     if (doc.hasFile && doc.ownsInterface && doc.interface != nullptr
-        && !sByExtQuick.isEmpty() && !sByExtQuick.startsWith(QStringLiteral("builtin://"))
-        && !PluginManager::getInstance()->isExtensionContested(sExtQuick)
-        && doc.pluginPath == sByExtQuick)
+        && !sQuick.isEmpty() && !sQuick.startsWith(QStringLiteral("builtin://"))
+        && doc.pluginPath == sQuick)
     {
         m_vTabDocs[cur].info = info;
         m_vTabDocs[cur].needsRender = true;
@@ -1780,7 +1767,7 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     QString sPluginPath;
     PluginInterface *pInterface = nullptr;
     bool bOwned = false;
-    if (!resolvePlugin(info, sPluginPath, pInterface, bOwned))
+    if (!resolvePlugin(info, route, sPluginPath, pInterface, bOwned))
         return;
 
     // 该页已持有同一插件的独占实例：直接复用，仅替换文件并重新渲染
@@ -2730,7 +2717,7 @@ void MainWindow::showFileListContextMenu(QAbstractItemView *pView, const QPoint 
 }
 
 // 构造文件列表右键菜单（不 exec，便于单元测试检查菜单项）：
-//   文件：打开 / 打开新标签页 / ─── / 属性
+//   文件：打开 / 打开新标签页 / ─── / 以文本查看 / 以十六进制查看 / ─── / 属性
 //   目录：属性（目录不能"打开"，双击只做展开/收起）
 QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
 {
@@ -2762,6 +2749,19 @@ QMenu *MainWindow::buildFileListContextMenu(const QModelIndex &index)
         QAction *pOpenNew = pMenu->addAction(tr("打开新标签页"));
         connect(pOpenNew, &QAction::triggered, this, [this, info]() {
             openFileInNewTab(info);
+        });
+        pMenu->addSeparator();
+
+        // 不合格式也想要"看一眼内容"时的兜底：只作用于这一个文件，
+        // 不改变后缀路由（原「插件映射」的手工兜底由它取代）。
+        QAction *pText = pMenu->addAction(tr("以文本查看"));
+        connect(pText, &QAction::triggered, this, [this, info]() {
+            openFileWithBuiltinViewer(info, false);
+        });
+
+        QAction *pHex = pMenu->addAction(tr("以十六进制查看"));
+        connect(pHex, &QAction::triggered, this, [this, info]() {
+            openFileWithBuiltinViewer(info, true);
         });
         pMenu->addSeparator();
     }
@@ -3198,9 +3198,6 @@ void MainWindow::loadArchiveFile(const QString &sFileName)
         return;
     }
 
-    QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
-    Q_UNUSED(vtFileInfos);
-
     m_hModelFilePath->setHeaderData(0, Qt::Horizontal, tr("文件路径"));
     updateWindowTitle();
     m_tvFilePath->header()->setVisible(true);
@@ -3268,9 +3265,7 @@ void MainWindow::on_actionMergeFile_triggered()
             if(fileinfo.isDir())
             {
                 QStringList arrFiles;
-                QStringList ext;
-                ext << "*";
-                FindFile(sFilePath, ext, arrFiles, true);
+                FindFile(sFilePath, arrFiles, true);
                 foreach(QString sSubFilePath, arrFiles)
                 {
                     vtFilesPaths.push_back(sSubFilePath);
@@ -3337,7 +3332,7 @@ void MainWindow::on_actionMergeFile_triggered()
     }
 }
 
-bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringList& arrFiles, bool bSubDir)
+bool MainWindow::FindFile(const QString sDir, QStringList& arrFiles, bool bSubDir)
 {
     QDir dir(sDir);
     if (!dir.exists())
@@ -3378,8 +3373,6 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
             }
             if (!fi.isDir())
             {
-                if (!CheckFileExt(fi.fileName(), arrFileExts))
-                    continue;
                 arrFiles << d.absoluteFilePath(fi.fileName());
                 continue;
             }
@@ -3394,67 +3387,74 @@ bool MainWindow::FindFile(const QString sDir, QStringList& arrFileExts, QStringL
     return true;
 }
 
-bool MainWindow::CheckFileExt(QString sFileName, QStringList& arrFileExts)
-{
-    if (arrFileExts.contains("*") == true)
-        return true;
-
-    QFileInfo fi(sFileName);
-    QString sFileExt = fi.completeSuffix().toUpper();
-    if(arrFileExts.indexOf(sFileExt) >= 0)
-        return true;
-
-    return false;
-}
-
 QString MainWindow::choosePlugin(QString sFileExt)
 {
-    PluginManager *pMgr = PluginManager::getInstance();
-
-    // 1) 用户自定义「后缀 → 插件」映射优先（P2-2）。
-    //    映射表里存的是插件逻辑名（DLL 基名），这里反查真实路径 —— 不再手工拼
-    //    "plugins/<name>.dll"：那样在非 Windows 平台是错的，改插件文件名也会静默失效。
-    const QString sMapped = DlgPluginMap::mappingFor(sFileExt);
-    if (!sMapped.isEmpty())
-    {
-        if (sMapped.startsWith(QStringLiteral("builtin://"))) return sMapped;
-        if (sMapped.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0) return QString();
-        return pMgr->pluginPathForId(sMapped);
-    }
-
-    // 2) 插件自描述：各插件元数据 JSON 里的 "extensions"（C1）。
-    //    这里以前有 6 张表、90 个后缀写死，新增格式必须改主程序并重编；
-    //    现在后缀由插件自己声明，加格式只改插件，主程序不用动。
-    const QString sDeclared = pMgr->pluginForExtension(sFileExt);
-    if (!sDeclared.isEmpty()) return sDeclared;
-
-    // 3) 没有插件认领该后缀：返回空，由调用方弹「未找到插件」对话框
-    //    （可临时用内置文本 / 十六进制查看，或去「插件映射」里指定）。
-    return QString();
+    // 后缀层：完全由插件元数据 JSON 里的 "extensions" 决定（C1）。
+    // 这里以前还有「用户映射」优先级和 6 张写死表：映射会按后缀永久覆盖自动判断，
+    // 已删除；"内容优先"的完整路由见 decideRoute()。
+    return PluginManager::getInstance()->pluginForExtension(sFileExt);
 }
 
-QString MainWindow::arbitrateContestedExtension(const QString &sFileName, const QByteArray &head,
-                                                const QString &sChosenPath, QString *psReason)
+// 打开一个文件时的完整路由：读文件头，交给纯函数 decideRoute() 得结论。
+MainWindow::RouteDecision MainWindow::routeForFile(const FILEINFO &info)
 {
-    if (psReason) psReason->clear();
-    if (sChosenPath.isEmpty() || sChosenPath.startsWith(QStringLiteral("builtin://")))
-        return QString();
-    if (head.isEmpty())
-        return QString();
+    const QString sByExt = choosePlugin(QFileInfo(info.sFilePath).suffix());
+    // 只读 256 KB 文件头：OOXML/ODF 的关键标志都在开头，不必解析整个 ZIP。
+    // 归档内条目与新增条目都走 entryHead；读不到时 head 为空，decideRoute 自然退回后缀。
+    const QByteArray head = m_fileManager->entryHead(info.sFilePath, 256 * 1024);
+    return decideRoute(info.sFileName, head, sByExt);
+}
 
-    const FormatResolver::Detection det = FormatResolver::detect(sFileName, head);
-    // 只有"内容明确给出的结论"才有资格推翻后缀优先级：byExtension 的结论是循环论证
-    if (!det.fromContent || det.pluginExt.isEmpty())
-        return QString();
+// 自动路由的纯函数部分（不碰文件系统，便于单测）：
+//   1) 内容识别的结论能落到一个已安装插件时，以内容为准 —— 后缀被改过、没有后缀、
+//      下载成 .dat/.bin 的文件都能开对；
+//   2) 内容判断不出来，或只是 zip/ole2/xml 这类"容器/通用"格式时，按插件声明的后缀；
+//   3) 两者都没有 = 没有插件能处理，由调用方弹「无法打开」对话框。
+// 为什么排除这些弱格式：svg/fb2 以 <?xml 开头、修补过的 docx 头里没有
+// word/document.xml —— 它们会被通用容器结论误抢，此时后缀声明更可靠。
+// 例外：后缀层也没有结论时（无后缀的 .dat），弱格式结论仍是唯一线索，照用。
+MainWindow::RouteDecision MainWindow::decideRoute(const QString &sFileName,
+                                                  const QByteArray &head,
+                                                  const QString &sByExtPath)
+{
+    RouteDecision d;
+    d.detection = FormatResolver::detect(sFileName, head);
 
-    const QString sByContent = PluginManager::getInstance()->pluginForExtension(det.pluginExt);
-    if (sByContent.isEmpty() || sByContent == sChosenPath)
-        return QString();
+    const QString &sId = d.detection.formatId;
+    const bool bWeakFormat = (sId == QStringLiteral("zip") || sId == QStringLiteral("ole2")
+                              || sId == QStringLiteral("xml"));
 
-    if (psReason) *psReason = det.displayName;
-    qDebug() << "[Plugin] 歧义后缀按内容仲裁:" << sFileName << "->" << det.formatId
-             << "(" << det.detail << ")";
-    return sByContent;
+    // 只有"内容明确给出的结论"才有资格推翻后缀：byExtension 的结论是循环论证。
+    const bool bContentUsable = d.detection.fromContent && !d.detection.pluginExt.isEmpty()
+                                && (!bWeakFormat || sByExtPath.isEmpty());
+
+    if (bContentUsable)
+    {
+        const QString sByContent =
+            PluginManager::getInstance()->pluginForExtension(d.detection.pluginExt);
+        if (!sByContent.isEmpty())
+        {
+            d.pluginPath = sByContent;
+            d.formatName = d.detection.displayName;
+            d.basis = d.detection.detail;
+            d.fromContent = true;
+            d.contentOverride = (sByExtPath.isEmpty() || sByExtPath != sByContent);
+            // 只记录"内容推翻了后缀"的少数情况：正常后缀命中不刷日志
+            if (d.contentOverride)
+                qDebug() << "[Plugin] 内容优先路由:" << sFileName << "->" << d.detection.formatId
+                         << "(" << d.detection.detail << ")";
+            return d;
+        }
+    }
+
+    if (!sByExtPath.isEmpty())
+    {
+        d.pluginPath = sByExtPath;
+        const QString sExt = QFileInfo(sFileName).suffix().toLower();
+        d.basis = sExt.isEmpty() ? QStringLiteral("按插件声明的后缀")
+                                 : QStringLiteral("按扩展名 .%1").arg(sExt);
+    }
+    return d;
 }
 
 void MainWindow::on_actionSplitFile_triggered()
@@ -3714,16 +3714,27 @@ void MainWindow::populateFilePathThumbnails(bool bShowPath)
 }
 
 // 归档里的条目能不能尝试解码成缩略图（按后缀先筛，避免对每个二进制文件都读一遍）
+// 能否出缩略图：以 Qt 实际支持的图片格式为准（运行期由部署的 imageformats 插件决定），
+// 不再维护第二份后缀表 —— 旧表和「图片插件声明的后缀」「实际部署的解码器」长期不一致
+// （.tga/.icns/.wbmp 能打开却没有缩略图，.tif 有缩略图又打不开）。
 bool MainWindow::isThumbnailImageName(const QString &sFileName)
 {
-    static const QSet<QString> kImageSuffixes = {
-        QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("jpe"),
-        QStringLiteral("jfif"), QStringLiteral("png"), QStringLiteral("gif"),
-        QStringLiteral("bmp"), QStringLiteral("webp"), QStringLiteral("tif"),
-        QStringLiteral("tiff"), QStringLiteral("ico"), QStringLiteral("svg"),
-        QStringLiteral("xpm"),
-    };
-    return kImageSuffixes.contains(QFileInfo(sFileName).suffix().toLower());
+    static const QSet<QString> kDecodableSuffixes = [] {
+        QSet<QString> set;
+        for (const QByteArray &fmt : QImageReader::supportedImageFormats())
+            set.insert(QString::fromLatin1(fmt).toLower());
+        return set;
+    }();
+
+    const QString sExt = QFileInfo(sFileName).suffix().toLower();
+    if (sExt.isEmpty())
+        return false;
+    if (kDecodableSuffixes.contains(sExt))
+        return true;
+
+    // 别名后缀（.jpe/.jfif 等）不一定和 Qt 的格式名同名：插件把它归为图片时也尝试解码，
+    // 解码失败会自然落回类型角标（renderEntryThumbnail 已有空图兜底）。
+    return PluginManager::getInstance()->categoryForExtension(sExt) == QStringLiteral("image");
 }
 
 // 纯解码 + 合成，可在任意线程调用（只操作 QImage/QBuffer/QImageReader，不碰 QPixmap）。
@@ -4355,7 +4366,6 @@ void MainWindow::syncActionStates()
     ui->actionUnloadFile->setEnabled(bLoaded && !bBusy);
     ui->actionMergeFile->setEnabled(!bBusy);
     ui->actionSplitFile->setEnabled(!bBusy);
-    ui->actionPluginMap->setEnabled(!bBusy);
     if (m_acVerify != nullptr) m_acVerify->setEnabled(bLoaded && !bBusy);
 
     // 标题里的“*”跟随未保存状态（所有状态刷新都会走到这里）
@@ -4371,7 +4381,6 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
     ui->actionUnloadFile->setEnabled(bEnabled);
     ui->actionMergeFile->setEnabled(bEnabled);
     ui->actionSplitFile->setEnabled(bEnabled);
-    ui->actionPluginMap->setEnabled(bEnabled);
     if (bEnabled)
         updateViewActionState();
     else
@@ -4973,6 +4982,21 @@ void MainWindow::restoreUiState()
     updateViewActionState();
 }
 
+// 旧版本把「后缀 -> 插件」映射持久化在 QSettings 的 [PluginMap] 组里。
+// 自动路由（内容优先 + 插件声明）已经取代它，运行时不再读取；但残留键会让
+// 用户/排查者误以为它还在生效，所以启动时删一次（之后每次启动都是 no-op）。
+// 只删这一个组：同文件里的 [MainWindow] 与 [PluginEnabled] 仍在使用。
+void MainWindow::purgeLegacyPluginMapSettings()
+{
+    QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                 QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
+    if (!st.childGroups().contains(QStringLiteral("PluginMap"), Qt::CaseSensitive))
+        return;
+    st.remove(QStringLiteral("PluginMap"));
+    st.sync();
+    qInfo() << "[Settings] 已清理废弃的「插件映射」配置（[PluginMap]）";
+}
+
 void MainWindow::saveUiState()
 {
     QSettings st(QSettings::IniFormat, QSettings::UserScope,
@@ -5001,12 +5025,6 @@ void MainWindow::on_actionAbout_triggered()
         .arg(PluginManager::getInstance()->getAllInterfaces().size())
         .arg(QString::fromLatin1(qVersion())));
     dlgAbout.exec();
-}
-
-void MainWindow::on_actionPluginMap_triggered()
-{
-    DlgPluginMap dlg(this);
-    dlg.exec();
 }
 
 void MainWindow::on_actionUnloadFile_triggered()

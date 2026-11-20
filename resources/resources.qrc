@@ -101,13 +101,6 @@
   <file alias="ok_40.png">icons/ok_40.png</file>
   <file alias="ok_48.png">icons/ok_48.png</file>
   <file alias="ok_64.png">icons/ok_64.png</file>
-  <file alias="plugin.png">icons/plugin.png</file>
-  <file alias="plugin_20.png">icons/plugin_20.png</file>
-  <file alias="plugin_24.png">icons/plugin_24.png</file>
-  <file alias="plugin_32.png">icons/plugin_32.png</file>
-  <file alias="plugin_40.png">icons/plugin_40.png</file>
-  <file alias="plugin_48.png">icons/plugin_48.png</file>
-  <file alias="plugin_64.png">icons/plugin_64.png</file>
   <file alias="reload.png">icons/reload.png</file>
   <file alias="reload_20.png">icons/reload_20.png</file>
   <file alias="reload_24.png">icons/reload_24.png</file>

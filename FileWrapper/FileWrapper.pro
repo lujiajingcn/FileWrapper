@@ -27,46 +27,9 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 CONFIG += c++17
 
-SOURCES += \
-        builtinviewer.cpp \
-        dlgabout.cpp \
-        dlgfileproperty.cpp \
-        dlgmergefile.cpp \
-        dlgoutputfile.cpp \
-        dlgpluginmap.cpp \
-        dlgsplitfile.cpp \
-        filemanager.cpp \
-        filemetadata.cpp \
-        formatresolver.cpp \
-        main.cpp \
-        mainwindow.cpp \
-        pluginmanager.cpp \
-        plugindiag.cpp
-
-HEADERS += \
-        icons.h \
-        archiveformat.h \
-        builtinviewer.h \
-        dlgabout.h \
-        dlgfileproperty.h \
-        dlgmergefile.h \
-        dlgoutputfile.h \
-        dlgpluginmap.h \
-        dlgsplitfile.h \
-        filemanager.h \
-        filemetadata.h \
-        formatresolver.h \
-        mainwindow.h \
-        $$_PRO_FILE_PWD_/../include/plugininterface.h \
-        pluginmanager.h \
-        plugindiag.h
-
-FORMS += \
-        dlgabout.ui \
-        dlgmergefile.ui \
-        dlgoutputfile.ui \
-        dlgsplitfile.ui \
-        mainwindow.ui
+# 核心源文件清单与 tests/plugin_tests.pro 共用（见 core.pri），main.cpp 只属于主程序
+include(core.pri)
+SOURCES += main.cpp
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

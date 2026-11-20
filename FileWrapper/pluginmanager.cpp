@@ -22,7 +22,7 @@ QString pluginIdFromPath(const QString &sPath)
     return sId;
 }
 
-// 与「插件映射」共用同一个配置文件：%APPDATA%\FileWrapper\FileWrapper.ini
+// 插件启停状态保存在 %APPDATA%\FileWrapper\FileWrapper.ini 的 [PluginEnabled] 组
 QSettings pluginSettings()
 {
     return QSettings(QSettings::IniFormat, QSettings::UserScope,
@@ -87,6 +87,7 @@ void PluginManager::parseMetaJson(const QJsonObject &pluginJson, const QString &
     meta->displayName  = QFileInfo(sPluginPath).fileName();
     meta->declaredName = pluginJson.value(QStringLiteral("Name")).toString();
     meta->apiVersion   = pluginJson.value(QStringLiteral("apiVersion")).toInt();
+    meta->category     = pluginJson.value(QStringLiteral("category")).toString().trimmed().toLower();
     meta->extensionPriority = pluginJson.value(QStringLiteral("extensionPriority")).toInt();
 
     meta->extensions.clear();
@@ -229,7 +230,6 @@ void PluginManager::registerExtensions(const PluginMeta &meta)
         //
         // 同一对插件会被登记两次：先是 sidecar 扫描（8 个 JSON 全读完才开始加载 DLL），
         // 之后该 DLL 加载时又用内嵌元数据登记一遍。两次结论相同，只打一次警告。
-        m_setContestedExt.insert(sExt);
         const QString sOwner = it.value();
         const QString sPairKey = sExt + QLatin1Char('|')
                 + (sOwner < meta.path ? sOwner + QLatin1Char('|') + meta.path
@@ -372,7 +372,6 @@ void PluginManager::loadAllPlugins()
     m_listDisabled.clear();
     m_mapPluginMeta.clear();
     m_mapExtToPath.clear();
-    m_setContestedExt.clear();
     m_setConflictLogged.clear();
 
     QDir pluginsDir(qApp->applicationDirPath());
@@ -454,17 +453,20 @@ QString PluginManager::pluginForExtension(const QString &sExt) const
     return m_mapExtToPath.value(sKey);
 }
 
-bool PluginManager::isExtensionContested(const QString &sExt) const
+// 插件类别：JSON "category"（未声明时为空，UI 自行兜底）
+QString PluginManager::categoryForExtension(const QString &sExt) const
 {
-    QString sKey = sExt.trimmed().toLower();
-    while (sKey.startsWith(QLatin1Char('.'))) sKey.remove(0, 1);
-    return m_setContestedExt.contains(sKey);
+    const QString sPath = pluginForExtension(sExt);
+    if (sPath.isEmpty())
+        return QString();
+    const auto it = m_mapPluginMeta.constFind(sPath);
+    return it == m_mapPluginMeta.constEnd() ? QString() : it.value().category;
 }
 
 QString PluginManager::pluginPathForId(const QString &sId) const
 {
     QString sKey = sId.trimmed();
-    // 允许用户/映射表里带扩展名
+    // 容忍带库扩展名的调用（插件设置/测试里常直接写 xxx.dll）
     static const QStringList kLibSuffixes = {
         QStringLiteral(".dll"), QStringLiteral(".so"),
         QStringLiteral(".dylib"), QStringLiteral(".a")

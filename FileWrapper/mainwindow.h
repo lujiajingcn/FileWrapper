@@ -5,6 +5,7 @@
 #include <QStandardItemModel>
 #include "filemanager.h"
 #include "plugininterface.h"
+#include "formatresolver.h"    // RouteDecision 内嵌 Detection
 #include "dlgfileproperty.h"   // 「属性」数据收集的返回值类型
 #include <QTreeView>
 #include <QListView>
@@ -127,6 +128,19 @@ public:
     // 需要能被测试直接断言。
     static QString pluginFailureText(const QString &sFileName, const QString &sWhy);
 
+    // 自动路由的结论（内容优先、插件声明兜底）。
+    // 打成独立结构：调用方（新标签页 / 当前标签页 / 测试）拿到的都是同一份判断，
+    // 不必各自再读一次文件头，也便于把"凭什么这么开"显示给用户。
+    struct RouteDecision
+    {
+        QString pluginPath;                  // 选中的插件路径；空 = 没有插件能处理
+        QString basis;                       // 判断依据（"文件头 %PDF-" / "按扩展名 .pdf"）
+        QString formatName;                  // 识别到的格式名（可能为空）
+        bool    fromContent = false;         // true = 结论来自文件内容
+        bool    contentOverride = false;     // true = 内容结论与后缀不同，确实改用了别的插件
+        FormatResolver::Detection detection; // 完整识别结果（打不开时用于提示）
+    };
+
 protected:
     void initWidgetFilePath();
     void initWidgetFileContent();
@@ -154,11 +168,7 @@ private slots:
     void onActionVerifyArchiveTriggered();
     void onFileManagerWarning(const QString &sMsg);
     void on_actionAbout_triggered();
-    void on_actionPluginMap_triggered();
-    void onActionPluginDiagnosticsTriggered();
-    void onActionPluginManagerTriggered();
-    void onActionReloadPluginsTriggered();
-    void onActionSupportedFormatsTriggered();
+    void onActionPluginSettingsTriggered();
     void on_actionUnloadFile_triggered();
 
     void onTabCloseRequested(int index);
@@ -170,16 +180,15 @@ private slots:
     void onActionNewTabTriggered();
 
 protected:
-    bool FindFile(const QString sDir, QStringList& arrFileExts, QStringList& arrFiles, bool bSubDir);
-    bool CheckFileExt(QString sFileName, QStringList& arrFileExts);
+    bool FindFile(const QString sDir, QStringList& arrFiles, bool bSubDir);
     QString choosePlugin(QString sFileExt);
-    // 后缀被多个插件同时声明时（目前只有 ".ts"：MPEG-TS 视频 vs TypeScript 文本），
-    // extensionPriority 只能决定"默认给谁"，分不清**单个文件**到底是什么。
-    // 这里按文件头再判一次：内容明确指向另一个插件时返回那个插件路径并给出理由，
-    // 否则返回空（维持后缀优先级的结果）。静态、只吃字节，便于单测。
-    static QString arbitrateContestedExtension(const QString &sFileName, const QByteArray &head,
-                                               const QString &sChosenPath,
-                                               QString *psReason = nullptr);
+    // 打开一个文件时的完整路由：读文件头 -> 内容优先；内容落不到已安装插件时用后缀层。
+    // FILEINFO 里没有文件头，所以由它负责读（归档内条目 / 新增条目都走 entryHead）。
+    RouteDecision routeForFile(const FILEINFO &info);
+    // 上面的纯函数部分：只吃"文件名 + 文件头 + 后缀层结论"，不碰文件系统。
+    // 静态是为了单测能直接构造各种文件头（真实归档里造不出"后缀与内容不符"的样本）。
+    static RouteDecision decideRoute(const QString &sFileName, const QByteArray &head,
+                                     const QString &sByExtPath);
     // 事件过滤器：接管文件列表的鼠标双击（绕开 QAbstractItemView 对首次双击的丢弃）
     bool eventFilter(QObject *obj, QEvent *event) override;
     void populateFilePathView(bool bShowPath);
@@ -228,7 +237,8 @@ protected:
     // 把归档里的图片条目解码成缩略图（不是图片/读不出来时返回空 QPixmap）。
     // 与界面展示分离：测试派生类可以直接验证解码结果，不必等后台逐张生成。
     QPixmap renderEntryThumbnail(const FILEINFO &info) const;
-    // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 属性；目录行 = 属性。
+    // 文件列表右键菜单：文件行 = 打开 / 打开新标签页 / 以文本查看 / 以十六进制查看 / 属性；
+    // 目录行 = 属性。
     // 返回的菜单归调用方 delete；返回 nullptr 表示该行没有可用操作。
     // （protected 是为了让测试派生类能检查菜单项，不弹出真实的模态菜单。）
     QMenu *buildFileListContextMenu(const QModelIndex &index);
@@ -236,12 +246,18 @@ protected:
     // 与 show 分离，测试派生类可以直接校验数值而不进入模态对话框。
     DlgFileProperty::Data filePropertyData(const FILEINFO &info) const;
     DlgFileProperty::Data folderPropertyData(const QModelIndex &index) const;
+    // 「插件设置」两个只读页签的正文（测试可直接断言内容，不必弹模态框）。
+    QString pluginStatusText() const;
+    QString supportedFormatsText() const;
 private:
     // 文件列表筛选（按路径/文件名，大小写不敏感）
     bool matchesFilter(const FILEINFO &info) const;
     static QString typeLabel(const QString &sFileName);
     void saveUiState();
     void restoreUiState();
+    // 一次性清理旧版本「插件映射」（QSettings [PluginMap] 组）：自动路由已取代它。
+    // 键本身不会再被读取，但留在 ini 里会让人误以为仍然生效。
+    void purgeLegacyPluginMapSettings();
     // 文件列表双击的统一处理（目录 -> 展开/收起，文件 -> 打开）
     void handleFileListDoubleClick(const QModelIndex &index);
     // 「属性」对话框的数据收集：文件按 FILEINFO，文件夹按当前列表子树汇总
@@ -397,6 +413,13 @@ private:
 
     void openFileInNewTab(const FILEINFO& info);
     void openFileInCurrentTab(const FILEINFO& info);
+    // 右键「以文本查看 / 以十六进制查看」：绕过自动路由，只影响这一个标签页。
+    // 这是原先「插件映射」唯一值得保留的能力 —— 映射会永久改掉某个后缀的所有文件，
+    // 而这里只对当前文件生效，且不落盘。
+    void openFileWithBuiltinViewer(const FILEINFO& info, bool bHex);
+    // 新建标签页并挂上已创建好的插件实例（新开文件 / 强制内置查看器共用）
+    void addFileTab(const FILEINFO& info, const QString& sPluginPath,
+                    PluginInterface* pInterface, bool bOwned);
     void activateTab(int index);
     void renderFile(const FILEINFO& info, PluginInterface* iface);
     void destroyTabAt(int index);
@@ -413,19 +436,18 @@ private:
     void pollStopUnsafeInstances();
     void closeAllTabs();
     void newEmptyTab();
-    bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);
+    bool resolvePlugin(const FILEINFO &info, const RouteDecision &route,
+                       QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);
 
     // 插件不可用时的提示与兜底：显示可读原因 + 部署自检结果，允许「重试加载」或
     // 「以文本查看」。返回可用模板实例；nullptr 表示用户放弃（此时 *pbUseBuiltinText
     // 为 true 表示应改用内置文本查看器）。
     PluginInterface *promptPluginUnavailable(const QString &sPluginPath, const QString &sFileName,
                                              bool *pbUseBuiltinText);
-    // 「插件设置 → 插件诊断」：列出已加载插件、加载失败原因与缺失的部署依赖
-    void showPluginDiagnostics();
-    // 「插件设置 → 支持的格式」：已安装插件覆盖的后缀 + 常见不支持格式的建议
-    void showSupportedFormats();
-    // 「插件设置 → 插件管理」：勾选启用/禁用插件（C5）
-    void showPluginManagerDialog();
+    // 「插件设置」：一个对话框收纳原先「插件诊断 / 插件管理 / 重新加载插件 / 支持的格式」
+    // 四个入口的信息与操作（它们本来就在重复列同一批插件）。
+    // nInitialTab：0=状态与依赖，1=支持的格式，2=启用/禁用。
+    void showPluginSettings(int nInitialTab = 0);
     // 释放所有标签页后让 PluginManager 重新扫描 plugins/（C5）
     void reloadAllPlugins();
 
