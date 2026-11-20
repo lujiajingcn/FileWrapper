@@ -631,7 +631,11 @@ MainWindow::MainWindow(QWidget *parent) :
 
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
     m_acVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
-    m_acVerify->setToolTip(QStringLiteral("逐条目检查内容区 CRC32，检测归档是否被篡改或损坏"));
+    // 只说「损坏」不说「篡改」：CRC32 不是签名，改过内容再重算 CRC 一样能通过，
+    // 写成防篡改会给用户虚假的安全感。
+    m_acVerify->setToolTip(QStringLiteral(
+        "逐条目重算内容区 CRC32，检测归档内容是否损坏或与头部记录不一致"
+        "（CRC32 只能发现损坏，无法防伪造）"));
     m_acVerify->setIcon(FwIcons::get(QStringLiteral("diagnose")));
     connect(m_acVerify, &QAction::triggered, this, &MainWindow::onActionVerifyArchiveTriggered);
     ui->menu->addAction(m_acVerify);

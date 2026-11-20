@@ -2682,11 +2682,22 @@ bool FileManager::verifyArchive(QString *psReport)
     int nBad = 0;
     QStringList badList;
 
+    // 报告里的条目标识一律用「归档内路径」（displayPath，与应用内「属性」显示的一致）：
+    // 只写文件名时，归档里两个同名 report.docx 会让用户无法判断是哪一条。
+    const auto entryPathOf = [](const FwArc::Entry &e) {
+        return e.displayPath.isEmpty() ? e.relPath : e.displayPath;
+    };
+
     for (int i = 0; i < m_meta.entries.size(); ++i)
     {
         if (m_bCancelRequested) break;
         const FwArc::Entry &e = m_meta.entries.at(i);
-        if (!f.seek(qint64(e.contentPos))) { ++nBad; badList << tr("第 %1 条（定位失败）").arg(i + 1); continue; }
+        if (!f.seek(qint64(e.contentPos)))
+        {
+            ++nBad;
+            badList << tr("第 %1 条（定位失败）：%2").arg(i + 1).arg(entryPathOf(e));
+            continue;
+        }
         FwArc::Crc32 c;
         qint64 done = 0;
         while (done < qint64(e.size))
@@ -2707,7 +2718,7 @@ bool FileManager::verifyArchive(QString *psReport)
         if (done != qint64(e.size) || c.value() != e.contentCrc)
         {
             ++nBad;
-            badList << tr("第 %1 条 %2").arg(i + 1).arg(QFileInfo(e.displayPath).fileName());
+            badList << tr("第 %1 条：%2").arg(i + 1).arg(entryPathOf(e));
         }
     }
     f.close();
@@ -2717,8 +2728,17 @@ bool FileManager::verifyArchive(QString *psReport)
     else if (nBad == 0)
         report = tr("校验通过：%1 个文件的内容 CRC32 全部匹配。").arg(m_meta.entries.size());
     else
-        report = tr("校验失败：%1 / %2 个文件内容不一致。\n损坏条目：%3")
-                 .arg(nBad).arg(m_meta.entries.size()).arg(badList.join(QStringLiteral("、")));
+    {
+        // 路径较长：逐条独立成行；条数过多时只列前 kMaxBadListed 条并注明剩余数量，
+        // 避免几百行的报告把消息框撑到屏幕外（数量本身仍如实给出）。
+        const int kMaxBadListed = 20;
+        QString sDetail = badList.mid(0, kMaxBadListed).join(QStringLiteral("\n"));
+        if (nBad > kMaxBadListed)
+            sDetail += tr("\n…（其余 %1 条未列出）").arg(nBad - kMaxBadListed);
+        report = tr("校验失败：%1 / %2 个条目的内容校验未通过（CRC32 不匹配或读取失败）。\n\n"
+                    "损坏条目：\n%3")
+                     .arg(nBad).arg(m_meta.entries.size()).arg(sDetail);
+    }
     if (psReport) *psReport = report;
     if (nBad) setError(report);
     return (!m_bCancelRequested && nBad == 0);
