@@ -6,6 +6,7 @@
 #include <QMap>
 #include <QObject>
 #include <QPluginLoader>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 
@@ -70,6 +71,11 @@ public:
     // 返回声明了该后缀的插件路径（大小写不敏感）。**即使该插件加载失败也会返回**，
     // 以便调用方走「插件不可用」诊断，而不是假装"没有插件"。
     QString pluginForExtension(const QString &sExt) const;
+
+    // 该后缀是否被**多个**插件声明过（目前只有 ".ts"：MPEG-TS 视频 vs TypeScript 文本）。
+    // 冲突按 extensionPriority 裁决只够区分"哪种后端默认赢"，分不清**单个文件**到底是什么；
+    // 调用方（MainWindow::resolvePlugin）据此对歧义后缀改用文件内容仲裁。
+    bool isExtensionContested(const QString &sExt) const;
 
     // 逻辑名（DLL 基名 / JSON "Name"，大小写不敏感）-> DLL 绝对路径
     QString pluginPathForId(const QString &sId) const;
@@ -136,6 +142,11 @@ private:
     QMap<QString, QPluginLoader*>   m_mapPluginLoaders;     // path -> loader
     QMap<QString, PluginMeta>       m_mapPluginMeta;        // path -> 元数据
     QMap<QString, QString>          m_mapExtToPath;         // 小写后缀 -> path
+    QSet<QString>                   m_setContestedExt;      // 被 >1 个插件声明过的后缀
+    // 已打印过的冲突裁决（"后缀|两个插件路径按字典序拼起来"）。sidecar 阶段先裁一次，
+    // 之后插件 DLL 用内嵌元数据再登记同一批后缀时会得出同样结论；不去重的话
+    // 一个 .ts 冲突会在每次启动刷两条警告（2026-11-20 用户日志里实际看到的）。
+    QSet<QString>                   m_setConflictLogged;
     QList<Failure>                  m_listFailures;
     QStringList                     m_listDisabled;        // 本次扫描中被禁用的插件逻辑名
 

@@ -1206,6 +1206,26 @@ bool MainWindow::resolvePlugin(const FILEINFO &info, QString &sPluginPath,
 
     const QString sExt = QFileInfo(info.sFilePath).suffix();
     sPluginPath = choosePlugin(sExt);
+
+    // 后缀被多个插件同时声明时（目前只有 ".ts"：MPEG-TS 视频 vs TypeScript 文本），
+    // extensionPriority 只保住"TypeScript 源码不会被当视频播"；反过来的真视频会被
+    // 灌进文本视图，显示一堆乱码且没有任何提示。这类歧义后缀按文件内容再判一次。
+    // 用户在「插件映射」里显式指定的后缀不参与仲裁（那是"我说了算"）。
+    if (!sPluginPath.isEmpty() && DlgPluginMap::mappingFor(sExt).isEmpty()
+        && PluginManager::getInstance()->isExtensionContested(sExt))
+    {
+        QString sReason;
+        const QByteArray head = m_fileManager->entryHead(info.sFilePath, 256 * 1024);
+        const QString sByContent = arbitrateContestedExtension(info.sFileName, head, sPluginPath, &sReason);
+        if (!sByContent.isEmpty())
+        {
+            statusBar()->showMessage(
+                QStringLiteral("后缀「.%1」可能是两类文件，按内容判断为「%2」，已改用对应插件打开。")
+                    .arg(sExt, sReason), 12000);
+            sPluginPath = sByContent;
+        }
+    }
+
     if (sPluginPath.isEmpty())
     {
         // 扩展名不可靠（下载改名、无后缀、.dat/.bin）时，先按**文件内容**识别真实格式：
@@ -1740,10 +1760,13 @@ void MainWindow::openFileInCurrentTab(const FILEINFO &info)
     // 该页已持有同一插件的独占实例：直接复用，仅替换文件并重新渲染。
     // 先用扩展名做一次轻量判断，避免"创建临时实例再删掉"的浪费
     //（媒体插件构造还会起解码线程，虽小但完全没必要）。
+    // 但歧义后缀（.ts）不能只看扩展名复用：同一个文本页接下来可能要被换成视频，
+    // 必须走 resolvePlugin 的内容仲裁。
     const QString sExtQuick = QFileInfo(info.sFilePath).suffix();
     const QString sByExtQuick = choosePlugin(sExtQuick);
     if (doc.hasFile && doc.ownsInterface && doc.interface != nullptr
         && !sByExtQuick.isEmpty() && !sByExtQuick.startsWith(QStringLiteral("builtin://"))
+        && !PluginManager::getInstance()->isExtensionContested(sExtQuick)
         && doc.pluginPath == sByExtQuick)
     {
         m_vTabDocs[cur].info = info;
@@ -3408,6 +3431,30 @@ QString MainWindow::choosePlugin(QString sFileExt)
     // 3) 没有插件认领该后缀：返回空，由调用方弹「未找到插件」对话框
     //    （可临时用内置文本 / 十六进制查看，或去「插件映射」里指定）。
     return QString();
+}
+
+QString MainWindow::arbitrateContestedExtension(const QString &sFileName, const QByteArray &head,
+                                                const QString &sChosenPath, QString *psReason)
+{
+    if (psReason) psReason->clear();
+    if (sChosenPath.isEmpty() || sChosenPath.startsWith(QStringLiteral("builtin://")))
+        return QString();
+    if (head.isEmpty())
+        return QString();
+
+    const FormatResolver::Detection det = FormatResolver::detect(sFileName, head);
+    // 只有"内容明确给出的结论"才有资格推翻后缀优先级：byExtension 的结论是循环论证
+    if (!det.fromContent || det.pluginExt.isEmpty())
+        return QString();
+
+    const QString sByContent = PluginManager::getInstance()->pluginForExtension(det.pluginExt);
+    if (sByContent.isEmpty() || sByContent == sChosenPath)
+        return QString();
+
+    if (psReason) *psReason = det.displayName;
+    qDebug() << "[Plugin] 歧义后缀按内容仲裁:" << sFileName << "->" << det.formatId
+             << "(" << det.detail << ")";
+    return sByContent;
 }
 
 void MainWindow::on_actionSplitFile_triggered()

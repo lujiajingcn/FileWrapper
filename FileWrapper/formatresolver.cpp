@@ -42,6 +42,45 @@ QString extOf(const QString &fileName)
     return QFileInfo(fileName).suffix().toLower();
 }
 
+// MPEG-TS 没有统一魔数：靠 188 字节定长包里每包首字节 0x47 同步字节判断。
+// M2TS 是 192 字节（包前多 4 字节到达时间戳），带 FEC 的变体是 204 字节。
+//
+// 'G' == 0x47，纯文本里非常常见，所以只看"每 188 字节一个 G"不够 —— 还要看包头的
+// 合法位：transport_error_indicator 必须为 0，adaptation_field_control 不能是保留值 00。
+// 两条件一起用，普通源码/文本（行首 G、注释里的 G）不会被误判成视频。
+bool tsSyncAt(const QByteArray &d, qsizetype pos)
+{
+    if (pos < 0 || pos + 4 > d.size()) return false;
+    if (static_cast<quint8>(d.at(pos)) != 0x47) return false;
+    const quint8 b1 = static_cast<quint8>(d.at(pos + 1));
+    const quint8 b3 = static_cast<quint8>(d.at(pos + 3));
+    if ((b1 & 0x80) != 0) return false;       // transport_error_indicator = 1：不是有效包头
+    if ((b3 & 0x30) == 0) return false;       // adaptation_field_control = 00：保留值
+    return true;
+}
+
+// 返回识别出的包长（188/192/204），0 = 不是 MPEG-TS。
+int mpegTsStride(const QByteArray &d)
+{
+    static const struct { int nStride; int nSyncOffset; } kVariants[] = {
+        { 188, 0 },     // 原生 MPEG-TS（.ts）
+        { 192, 4 },     // M2TS / AVCHD（.m2ts）
+        { 204, 0 },     // 带 RS(204,188) FEC 的 TS
+    };
+    for (const auto &v : kVariants)
+    {
+        // 至少连续 4 个包边界同步：单个 0x47 在任意二进制里都有 1/256 的概率出现。
+        if (d.size() < v.nSyncOffset + v.nStride * 3 + 4)
+            continue;
+        bool bAllSync = true;
+        for (int i = 0; i < 4 && bAllSync; ++i)
+            bAllSync = tsSyncAt(d, v.nSyncOffset + qsizetype(i) * v.nStride);
+        if (bAllSync)
+            return v.nStride;
+    }
+    return 0;
+}
+
 } // namespace
 
 namespace FormatResolver
@@ -316,6 +355,15 @@ Detection byContent(const QByteArray &head)
         return make(QStringLiteral("mp4"), QStringLiteral("MP4/MOV 视频"), QStringLiteral("mp4"),
                     QString(), QStringLiteral("ftyp brand 为 %1").arg(QString::fromLatin1(major)), true);
     }
+
+    // MPEG-TS：pluginExt 故意给 "m2ts" 而不是 "ts"。
+    // 后缀 ".ts" 在插件注册表里归 PluginText（TypeScript 源码的优先级更高），
+    // 返回 "ts" 会被路由回文本插件，视频又被灌成乱码；"m2ts" 由 PluginMedia 声明，
+    // 两者是同一个解码后端，只是绕开了后缀歧义。
+    if (const int nTsStride = mpegTsStride(head))
+        return make(QStringLiteral("mpegts"), QStringLiteral("MPEG-TS 视频（.ts/.m2ts）"),
+                    QStringLiteral("m2ts"), QString(),
+                    QStringLiteral("每 %1 字节出现 0x47 同步字节，且包头合法").arg(nTsStride), true);
 
     // 压缩包
     if (hasPrefix(head, "7z\xBC\xAF\x27\x1C", 6))

@@ -258,6 +258,7 @@ class ProbeMainWindow : public MainWindow
 public:
     ProbeMainWindow() : MainWindow(nullptr) {}
     using MainWindow::choosePlugin;
+    using MainWindow::arbitrateContestedExtension;
 };
 
 // 树形列表测试：直接加载归档（loadArchiveFile 为 protected）
@@ -315,6 +316,38 @@ static void checkExtensionMapping()
                    QStringLiteral("W1: .%1 -> %2 (got %3)").arg(ext, expect, actual));
         }
     }
+
+    // W1b: ".ts" 是唯一跨插件重名的后缀（MPEG-TS 视频 vs TypeScript 文本）：
+    //      注册表把它记为"有歧义"，静态优先级给文本，真视频交给内容仲裁。
+    PluginManager *pm1 = PluginManager::getInstance();
+    report(pm1->isExtensionContested(QStringLiteral("ts"))
+               && !pm1->isExtensionContested(QStringLiteral(".txt")),
+           QStringLiteral("W1c: '.ts' flagged contested, '.txt' not"));
+
+    QByteArray tsHead;
+    for (int i = 0; i < 6; ++i)
+    {
+        tsHead += char(0x47);
+        tsHead += QByteArray("\x00\x00\x10", 3);
+        tsHead += QByteArray(184, '\x00');
+    }
+    const QString sTextDll = pm1->pluginForExtension(QStringLiteral("ts"));
+    QString sReason;
+    const QString sArbitrated = ProbeMainWindow::arbitrateContestedExtension(
+        QStringLiteral("movie.ts"), tsHead, sTextDll, &sReason);
+    report(QFileInfo(sTextDll).fileName().compare(QStringLiteral("PluginText.dll"), Qt::CaseInsensitive) == 0
+               && QFileInfo(sArbitrated).fileName().compare(QStringLiteral("PluginMedia.dll"),
+                                                          Qt::CaseInsensitive) == 0
+               && !sReason.isEmpty(),
+           QStringLiteral("W1d: contested .ts arbitrated by content -> %1 (%2)")
+               .arg(QFileInfo(sArbitrated).fileName(), sReason));
+
+    const QString sKept = ProbeMainWindow::arbitrateContestedExtension(
+        QStringLiteral("code.ts"),
+        QStringLiteral("import { a } from './b';\nexport const c = a + 1;\n").toUtf8(),
+        sTextDll);
+    report(sKept.isEmpty(),
+           QStringLiteral("W1e: TypeScript source keeps its extension routing (no override)"));
 
     // W1b: 有插件加载失败时，启动阶段应给出用户可见提示（状态栏），而不是只进日志
     if (QStatusBar *sb = mw.findChild<QStatusBar *>())
@@ -1505,6 +1538,40 @@ static void verifyFormatResolver()
     report(!unsupported.isEmpty() && bDocAdvice,
            QStringLiteral("F6: unsupported-format advice list built (%1 entries)")
                .arg(unsupported.size()));
+
+    // Z7: MPEG-TS 没有魔数：188 字节定长包、每包首字节 0x47。
+    //     pluginExt 必须是 "m2ts" 而不是 "ts" —— 注册表里 "ts" 归 PluginText，
+    //     返回 "ts" 会让内容识别结果又转回文本插件。
+    QByteArray tsHead;
+    for (int i = 0; i < 6; ++i)
+    {
+        tsHead += char(0x47);                       // sync byte
+        tsHead += QByteArray("\x00\x00\x10", 3);    // PID=0, adaptation_field_control=01
+        tsHead += QByteArray(184, '\x00');          // 184 字节载荷
+    }
+    const auto d10 = FormatResolver::detect(QStringLiteral("movie.ts"), tsHead);
+    report(d10.formatId == QLatin1String("mpegts") && d10.pluginExt == QLatin1String("m2ts")
+               && d10.fromContent,
+           QStringLiteral("F7: content detects MPEG-TS -> %1").arg(d10.pluginExt));
+
+    // Z8: 同一后缀下的 TypeScript 源码不能被当成视频（'G' 就是 0x47，纯文本里很常见）
+    const auto d11 = FormatResolver::detect(QStringLiteral("code.ts"),
+        QStringLiteral("import { a } from './b';\nexport const c = a + 1;\n").toUtf8());
+    report(d11.formatId != QLatin1String("mpegts"),
+           QStringLiteral("F8: TypeScript source not mistaken for MPEG-TS (%1)").arg(d11.formatId));
+
+    // Z9: M2TS 变体（192 字节包：4 字节到达时间戳 + 188 字节 TS 包）也要认得
+    QByteArray m2ts;
+    for (int i = 0; i < 6; ++i)
+    {
+        m2ts += QByteArray("\x00\x00\x00\x00", 4);  // 192 字节包前的到达时间戳
+        m2ts += char(0x47);
+        m2ts += QByteArray("\x00\x00\x10", 3);
+        m2ts += QByteArray(184, '\x00');
+    }
+    const auto d12 = FormatResolver::detect(QStringLiteral("cam.m2ts"), m2ts);
+    report(d12.formatId == QLatin1String("mpegts"),
+           QStringLiteral("F9: 192-byte M2TS detected (%1)").arg(d12.formatId));
 }
 
 static void verifyInstances(PluginInterface *tmpl, const QString &work){

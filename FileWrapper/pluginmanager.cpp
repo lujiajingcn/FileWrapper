@@ -226,18 +226,37 @@ void PluginManager::registerExtensions(const PluginMeta &meta)
         // 后缀冲突：按 extensionPriority 决出，大者优先；相同优先级保留先注册的。
         // 目前唯一已知冲突是 ".ts"（MPEG-TS 视频 vs TypeScript 文本），
         // 历史行为是文本优先 —— PluginText 在 JSON 里声明 extensionPriority=10。
-        const int nExisting = m_mapPluginMeta.value(it.value()).extensionPriority;
+        //
+        // 同一对插件会被登记两次：先是 sidecar 扫描（8 个 JSON 全读完才开始加载 DLL），
+        // 之后该 DLL 加载时又用内嵌元数据登记一遍。两次结论相同，只打一次警告。
+        m_setContestedExt.insert(sExt);
+        const QString sOwner = it.value();
+        const QString sPairKey = sExt + QLatin1Char('|')
+                + (sOwner < meta.path ? sOwner + QLatin1Char('|') + meta.path
+                                      : meta.path + QLatin1Char('|') + sOwner);
+        const bool bFirstReport = !m_setConflictLogged.contains(sPairKey);
+        m_setConflictLogged.insert(sPairKey);
+
+        const int nExisting = m_mapPluginMeta.value(sOwner).extensionPriority;
         if (meta.extensionPriority > nExisting)
         {
-            qWarning() << "[Plugin] 后缀" << sExt << "被多个插件声明，按 extensionPriority"
-                       << "改由" << meta.path << "处理（原:" << it.value()
-                       << "priority" << nExisting << "->" << meta.extensionPriority << "）";
+            if (bFirstReport)
+                qWarning() << "[Plugin] 后缀" << sExt << "被多个插件声明，按 extensionPriority"
+                           << "改由" << meta.path << "处理（原:" << sOwner
+                           << "priority" << nExisting << "->" << meta.extensionPriority << "）";
+            else
+                qDebug() << "[Plugin] 后缀" << sExt << "已归" << meta.path
+                         << "（内嵌元数据重复登记，不再重复告警）";
             it.value() = meta.path;
         }
         else
         {
-            qWarning() << "[Plugin] 后缀" << sExt << "被多个插件声明，保留" << it.value()
-                       << "(priority" << nExisting << ")，忽略" << meta.path;
+            if (bFirstReport)
+                qWarning() << "[Plugin] 后缀" << sExt << "被多个插件声明，保留" << sOwner
+                           << "(priority" << nExisting << ")，忽略" << meta.path;
+            else
+                qDebug() << "[Plugin] 后缀" << sExt << "已归" << sOwner
+                         << "（内嵌元数据重复登记，不再重复告警）";
         }
     }
 }
@@ -353,6 +372,8 @@ void PluginManager::loadAllPlugins()
     m_listDisabled.clear();
     m_mapPluginMeta.clear();
     m_mapExtToPath.clear();
+    m_setContestedExt.clear();
+    m_setConflictLogged.clear();
 
     QDir pluginsDir(qApp->applicationDirPath());
     if (!pluginsDir.cd(QStringLiteral("plugins")))
@@ -431,6 +452,13 @@ QString PluginManager::pluginForExtension(const QString &sExt) const
     QString sKey = sExt.trimmed().toLower();
     while (sKey.startsWith(QLatin1Char('.'))) sKey.remove(0, 1);
     return m_mapExtToPath.value(sKey);
+}
+
+bool PluginManager::isExtensionContested(const QString &sExt) const
+{
+    QString sKey = sExt.trimmed().toLower();
+    while (sKey.startsWith(QLatin1Char('.'))) sKey.remove(0, 1);
+    return m_setContestedExt.contains(sKey);
 }
 
 QString PluginManager::pluginPathForId(const QString &sId) const

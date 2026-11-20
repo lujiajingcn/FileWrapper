@@ -173,6 +173,13 @@ protected:
     bool FindFile(const QString sDir, QStringList& arrFileExts, QStringList& arrFiles, bool bSubDir);
     bool CheckFileExt(QString sFileName, QStringList& arrFileExts);
     QString choosePlugin(QString sFileExt);
+    // 后缀被多个插件同时声明时（目前只有 ".ts"：MPEG-TS 视频 vs TypeScript 文本），
+    // extensionPriority 只能决定"默认给谁"，分不清**单个文件**到底是什么。
+    // 这里按文件头再判一次：内容明确指向另一个插件时返回那个插件路径并给出理由，
+    // 否则返回空（维持后缀优先级的结果）。静态、只吃字节，便于单测。
+    static QString arbitrateContestedExtension(const QString &sFileName, const QByteArray &head,
+                                               const QString &sChosenPath,
+                                               QString *psReason = nullptr);
     // 事件过滤器：接管文件列表的鼠标双击（绕开 QAbstractItemView 对首次双击的丢弃）
     bool eventFilter(QObject *obj, QEvent *event) override;
     void populateFilePathView(bool bShowPath);
