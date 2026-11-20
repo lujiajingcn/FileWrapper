@@ -17,11 +17,70 @@
 #include <QMimeData>
 #include <QResizeEvent>
 #include <QUrl>
+#include <QThreadPool>
+#include <QRunnable>
+#include <QPointer>
+#include <QCoreApplication>
 #include "archiveformat.h"
 
 #include <algorithm>
 #include <functional>
+#include <utility>
 #include "icons.h"
+
+namespace {
+
+// 一轮摘要统计：目录遍历放在工作线程，算完再投递回 GUI 线程改 label。
+// 以前 updateSummary() 在 UI 线程里同步递归，添加大文件夹时列表要等扫描结束
+// 才会重绘，表现就是「添加文件夹后待合并列表更新很慢」。
+class MergeSummaryTask : public QRunnable
+{
+public:
+    using Done = std::function<void(const DlgMergeFile::MergeSummary &, quint64)>;
+
+    MergeSummaryTask(QStringList paths, QSharedPointer<QAtomicInt> abort, quint64 nGeneration,
+                     Done done)
+        : m_paths(std::move(paths)), m_abort(std::move(abort)),
+          m_nGeneration(nGeneration), m_done(std::move(done))
+    {
+        setAutoDelete(true);
+    }
+
+    void run() override
+    {
+        DlgMergeFile::MergeSummary summary;
+        try
+        {
+            summary = DlgMergeFile::computeMergeSummary(m_paths, m_abort.data());
+        }
+        catch (...)
+        {
+            return;   // 后台线程不能让异常逃逸，否则 std::terminate
+        }
+
+        // 已作废（又加了路径 / 对话框已关闭）就别再投递，结果也没人用
+        if (!m_abort || m_abort->loadAcquire() != 0 || !m_done)
+            return;
+
+        QCoreApplication *pApp = QCoreApplication::instance();
+        if (pApp == nullptr)
+            return;   // 应用正在退出
+
+        const Done done = m_done;
+        const quint64 nGeneration = m_nGeneration;
+        QMetaObject::invokeMethod(pApp, [done, summary, nGeneration]() {
+            done(summary, nGeneration);
+        }, Qt::QueuedConnection);
+    }
+
+private:
+    QStringList m_paths;
+    QSharedPointer<QAtomicInt> m_abort;
+    quint64 m_nGeneration = 0;
+    Done m_done;
+};
+
+} // namespace
 
 DlgMergeFile::DlgMergeFile(QWidget *parent) :
     QDialog(parent),
@@ -37,8 +96,8 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     ui->btnDelete->setIcon(FwIcons::get(QStringLiteral("delete")));
     ui->btnAddDir->setIcon(FwIcons::get(QStringLiteral("add_dir")));
     ui->btnMergedFilePath->setIcon(FwIcons::get(QStringLiteral("browse")));
-    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
-    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
+    // 确定/取消不加图标：确定是默认按钮（部分对话框为实心蓝底），固定深色图标
+    // 会与底色混在一起；文字按钮在三个对话框里更一致。
 
     // 只有「确定」是默认按钮。
     //
@@ -106,6 +165,24 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     connect(ui->leMergedFilePath, &QLineEdit::textChanged, this,
             [this](const QString &) { updateButtonStates(); updateResolvedPath(); });
 
+    // 摘要统计的异步管线：大目录扫描放到工作线程，避免添加文件夹时卡住界面。
+    m_summaryPool = new QThreadPool(this);
+    m_summaryPool->setMaxThreadCount(1);      // 统计串行，多轮扫描不互相抢 I/O
+
+    m_summaryDebounce = new QTimer(this);
+    m_summaryDebounce->setSingleShot(true);
+    m_summaryDebounce->setInterval(120);      // 连续拖入多项时只统计最后一次
+    connect(m_summaryDebounce, &QTimer::timeout, this, &DlgMergeFile::startSummaryScan);
+
+    // 小目录几十毫秒就统计完，不要闪一下「正在统计…」；超过 150ms 才给这个提示。
+    m_summarySlowHint = new QTimer(this);
+    m_summarySlowHint->setSingleShot(true);
+    m_summarySlowHint->setInterval(150);
+    connect(m_summarySlowHint, &QTimer::timeout, this, [this]() {
+        if (m_bSummaryRunning)
+            ui->labelSummary->setText(tr("正在统计…"));
+    });
+
     updateSummary();
     updateButtonStates();
     updateResolvedPath();
@@ -117,6 +194,13 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
 
 DlgMergeFile::~DlgMergeFile()
 {
+    // 先作废再等：扫描线程每 1024 个文件检查一次 aborted，很快就能退出，
+    // 关对话框不会被「正在统计一个大目录」拖住。
+    if (m_summaryAbort)
+        m_summaryAbort->storeRelease(1);
+    if (m_summaryPool != nullptr)
+        m_summaryPool->waitForDone(300);
+
     delete ui;
 }
 
@@ -138,10 +222,9 @@ QString DlgMergeFile::getMergedFilePath()
 
 // 没有扩展名就补 .fwda（归档的专属后缀，与文件头魔数 FWDA 同名）。
 // 用户可能只打了 "a"，落盘成无后缀文件后：
-//   - 程序自己的「加载文件」对话框默认只看 *.fwda / *.dat，找不到它；
+//   - 程序自己的「加载文件」对话框默认只看 *.fwda，找不到它；
 //   - 任何按后缀关联的文件管理器都打不开它。
-// 已有扩展名的（包括 "v1.2" 这种用点分隔的版本号、以及老的 .dat）一律不动，
-// 避免改坏用户意图。
+// 已有扩展名的（包括 "v1.2" 这种用点分隔的版本号）一律不动，避免改坏用户意图。
 QString DlgMergeFile::ensureArchiveSuffix(const QString &sPath)
 {
     const QFileInfo fi(sPath);
@@ -185,7 +268,7 @@ void DlgMergeFile::updateDropHint()
     m_lblDropHint->raise();
 }
 
-// 摘要：输入项数、展开后的文件数/总大小、其中多少个是已合并的 .dat
+// 摘要：输入项数、展开后的文件数/总大小、其中多少个是已合并归档
 void DlgMergeFile::updateButtonStates()
 {
     const bool bHasRows = (m_hModelFilePath->rowCount() > 0);
@@ -341,51 +424,125 @@ QString DlgMergeFile::outputPathProblem(const QString &sPath) const
     return QString();
 }
 
+// 输入列表变化后重新统计摘要。
+// 这里只做三件事：作废旧的一轮、起防抖定时器、让结果回来时再填 label；
+// 真正的目录遍历在 MergeSummaryTask 里（工作线程），不再阻塞「添加文件夹」。
 void DlgMergeFile::updateSummary()
 {
-    int nInputs = 0, nFiles = 0, nArchives = 0;
-    qint64 nBytes = 0;
-    const int nCap = 200000;   // 超大目录防止统计本身卡住界面
-    for (int i = 0; i < m_hModelFilePath->rowCount(); ++i)
+    if (m_summaryAbort)
+        m_summaryAbort->storeRelease(1);        // 上一轮结果不再采用
+    m_summaryAbort = QSharedPointer<QAtomicInt>::create(0);
+    ++m_summaryGeneration;
+    m_bSummaryRunning = false;
+    if (m_summarySlowHint)
+        m_summarySlowHint->stop();
+
+    if (m_hModelFilePath->rowCount() <= 0)
     {
-        const QString sPath = m_hModelFilePath->item(i, 0)->text();
-        const QFileInfo fi(sPath);
-        ++nInputs;
-        if (fi.isDir())
-        {
-            QDirIterator it(sPath, QDir::Files, QDirIterator::Subdirectories);
-            while (it.hasNext() && nFiles < nCap)
-            {
-                it.next();
-                ++nFiles;
-                nBytes += it.fileInfo().size();
-            }
-        }
-        else if (fi.isFile())
-        {
-            ++nFiles;
-            nBytes += fi.size();
-            // 只用于"其中 N 个是已合并归档"的摘要提示：新旧后缀都算
-            if (FwArc::hasArchiveSuffix(sPath))
-                ++nArchives;
-        }
+        ui->labelSummary->clear();
+        if (m_summaryDebounce)
+            m_summaryDebounce->stop();
+        return;
     }
+    if (m_summaryDebounce)
+        m_summaryDebounce->start();
+}
+
+void DlgMergeFile::startSummaryScan()
+{
+    QStringList paths;
+    const int nRows = m_hModelFilePath->rowCount();
+    paths.reserve(nRows);
+    for (int i = 0; i < nRows; ++i)
+    {
+        const QStandardItem *pItem = m_hModelFilePath->item(i, 0);
+        if (pItem != nullptr)
+            paths << pItem->text();
+    }
+    if (paths.isEmpty())
+    {
+        ui->labelSummary->clear();
+        return;
+    }
+
+    const quint64 nGeneration = m_summaryGeneration;
+    m_bSummaryRunning = true;
+    m_summarySlowHint->start();
+    m_summaryPool->start(new MergeSummaryTask(
+        paths, m_summaryAbort, nGeneration,
+        [guard = QPointer<DlgMergeFile>(this)](const DlgMergeFile::MergeSummary &summary,
+                                              quint64 nGen) {
+            if (guard != nullptr)
+                guard->applySummary(summary, nGen);
+        }));
+}
+
+void DlgMergeFile::applySummary(const MergeSummary &summary, quint64 nGeneration)
+{
+    if (nGeneration != m_summaryGeneration)
+        return;                                  // 期间输入又变了：这一轮作废
+    m_bSummaryRunning = false;
+    m_summarySlowHint->stop();
 
     // 摘要单独一行（标题下面），不要拼进「待合并的文件路径」里：
     // 统计文字会随添加的目录变化，拼在标题里会不断改标题宽度、把右侧文件树挤得左右跳。
     QString sSummary;
-    if (nInputs > 0)
+    if (summary.nInputs > 0)
     {
         sSummary = tr("%1 个输入，约 %2 个文件，%3%4")
-                       .arg(nInputs)
-                       .arg(nFiles >= nCap ? QStringLiteral(">") + QString::number(nCap)
-                                           : QString::number(nFiles))
-                       .arg(FwArc::formatSize(nBytes))
-                       .arg(nArchives > 0
-                                ? tr("（其中 %1 个已合并归档）").arg(nArchives)
+                       .arg(summary.nInputs)
+                       .arg(summary.bCapped
+                                ? QStringLiteral(">") + QString::number(kSummaryFileCap)
+                                : QString::number(summary.nFiles))
+                       .arg(FwArc::formatSize(summary.nBytes))
+                       .arg(summary.nArchives > 0
+                                ? tr("（其中 %1 个已合并归档）").arg(summary.nArchives)
                                 : QString());
     }
     ui->labelSummary->setText(sSummary);
+}
+
+// 纯计算，不碰界面：工作线程里跑
+// （测试也直接调用它，不用起事件循环去等异步结果）。
+DlgMergeFile::MergeSummary DlgMergeFile::computeMergeSummary(const QStringList &paths,
+                                                            QAtomicInt *pAbort)
+{
+    MergeSummary summary;
+    for (const QString &sPath : paths)
+    {
+        if (pAbort != nullptr && pAbort->loadAcquire() != 0)
+            return summary;
+        const QFileInfo fi(sPath);
+        ++summary.nInputs;
+        if (fi.isDir())
+        {
+            QDirIterator it(sPath, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext())
+            {
+                if (summary.nFiles >= kSummaryFileCap)
+                {
+                    summary.bCapped = true;   // 超大目录：后面的不再数
+                    break;
+                }
+                it.next();
+                ++summary.nFiles;
+                summary.nBytes += it.fileInfo().size();
+                // 大目录也可能要走几秒，定期看有没有被取消
+                if ((summary.nFiles & 0x3FF) == 0 && pAbort != nullptr
+                    && pAbort->loadAcquire() != 0)
+                    return summary;
+            }
+        }
+        else if (fi.isFile())
+        {
+            ++summary.nFiles;
+            summary.nBytes += fi.size();
+            // 只用于"其中 N 个是已合并归档"的摘要提示
+            if (FwArc::hasArchiveSuffix(sPath))
+                ++summary.nArchives;
+        }
+    }
+    return summary;
 }
 
 void DlgMergeFile::addDroppedUrls(const QList<QUrl> &urls)
@@ -525,7 +682,7 @@ void DlgMergeFile::on_btnOk_clicked()
 
     // 没有扩展名（例如只填了 "a"）：补 .fwda 前必须问一次。
     // 静默改名会让「保存对话框里看到的名字」和「磁盘上的名字」对不上，
-    // 但直接落成无后缀文件，程序自己的 *.fwda / *.dat 过滤器又找不到它。
+    // 但直接落成无后缀文件，程序自己的 *.fwda 过滤器又找不到它。
     if (QFileInfo(sOutput).suffix().isEmpty())
     {
         QMessageBox box(QMessageBox::Question, tr("合并文件"),
