@@ -2119,15 +2119,32 @@ static void verifyMergeDialog()
     report(bOutputDialog,
            QStringLiteral("H15: output dialog clears stale dir on old-path and returns selected dir"));
 
-    // H16: 输出路径实时解析——填相对路径 "a" 后，提示条必须给出真正会写到的绝对路径
+    // H16: 输出路径实时解析 + 长路径随窗口宽度换行
     {
         auto *pEdit = dlg.findChild<QLineEdit *>(QStringLiteral("leMergedFilePath"));
         auto *pHint = dlg.findChild<QLabel *>(QStringLiteral("labelResolvedPath"));
+        bool bResponsive = false;
+        if (pEdit && pHint)
+        {
+            // 用一条没有空格的长路径验证：窗口变窄时 label 必须增高，不能裁掉末行。
+            pEdit->setText(QStringLiteral(
+                "E:/study_lujiajing/WorkSpace_FileWrapper/FileWrapper/build/"
+                "Desktop_Qt_6_9_3_MinGW_64_bit_Debug/FileWrapper/debug/merged-output"));
+            dlg.resize(860, 470);
+            dlg.show();
+            for (int i = 0; i < 5; ++i) QApplication::processEvents();
+            const int nWideHeight = pHint->height();
+            dlg.resize(360, 470);
+            for (int i = 0; i < 5; ++i) QApplication::processEvents();
+            const int nNarrowHeight = pHint->height();
+            bResponsive = nWideHeight > 0 && nNarrowHeight > nWideHeight
+                          && pHint->height() == pHint->heightForWidth(pHint->width());
+        }
         const QString sExpect = QDir::cleanPath(QFileInfo(QStringLiteral("a")).absoluteFilePath());
         if (pEdit) pEdit->setText(QStringLiteral("a"));
         const QString sHint = pHint ? pHint->text() : QString();
-        report(pEdit != nullptr && pHint != nullptr && sHint.contains(sExpect),
-               QStringLiteral("H16: relative output path resolved before merging (%1)")
+        report(pEdit != nullptr && pHint != nullptr && bResponsive && sHint.contains(sExpect),
+               QStringLiteral("H16: relative path resolved and long path wraps on resize (%1)")
                    .arg(QString(sHint).replace(QLatin1Char('\n'), QStringLiteral(" | "))));
     }
 

@@ -8,6 +8,7 @@
 
 class QEvent;
 class QLabel;
+class QResizeEvent;
 
 namespace Ui {
 class DlgMergeFile;
@@ -45,6 +46,8 @@ protected:
     bool duplicatCheck(QString sFilePath);
     // 支持把文件/文件夹直接拖进列表
     bool eventFilter(QObject *obj, QEvent *ev) override;
+    // 窗口宽度变化后按当前宽度重算路径提示条的最小高度，避免长路径末行被裁掉。
+    void resizeEvent(QResizeEvent *pEvent) override;
 
 private:
     void addPathItem(const QString &sPath, bool bUpdateSummary = true);
@@ -53,6 +56,7 @@ private:
     // 把输出路径解析成绝对路径并实时显示在输入框下方：
     // 相对路径（比如只填 "a"）到底写到哪，必须输入完就能看到，而不是合并完去猜。
     void updateResolvedPath();
+    void adjustResolvedPathHeight();
     // 输出路径的硬性错误（目录 / 以分隔符结尾 / 与输入冲突）；空串表示可用。
     // 实时提示和「确定」校验共用这一份规则，避免两处判断漂移。
     QString outputPathProblem(const QString &sPath) const;
@@ -62,6 +66,8 @@ private:
 
     QStandardItemModel      *m_hModelFilePath;
     QLabel                  *m_lblDropHint = nullptr;
+    bool                     m_bAdjustingPathHeight = false;   // 防止 setMinimumHeight 递归
+    bool                     m_bPathHeightPending = false;     // 合并一次 resize 的延迟重算
     Ui::DlgMergeFile *ui;
 };
 

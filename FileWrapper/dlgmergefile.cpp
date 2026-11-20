@@ -10,10 +10,12 @@
 #include <QItemSelectionModel>
 #include <QScreen>
 #include <QDir>
+#include <QTimer>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
 #include <QMimeData>
+#include <QResizeEvent>
 #include <QUrl>
 #include "archiveformat.h"
 
@@ -26,6 +28,11 @@ DlgMergeFile::DlgMergeFile(QWidget *parent) :
     ui(new Ui::DlgMergeFile)
 {
     ui->setupUi(this);
+
+    // 路径提示条会随窗口宽度换行；高度不能依赖 QLabel 的 sizeHint（它是按旧宽度
+    // 算的），否则把窗口缩窄后最后一行会被裁掉。resizeEvent 里按当前宽度重算。
+    ui->labelResolvedPath->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Minimum);
+
     ui->btnAddFile->setIcon(FwIcons::get(QStringLiteral("add")));
     ui->btnDelete->setIcon(FwIcons::get(QStringLiteral("delete")));
     ui->btnAddDir->setIcon(FwIcons::get(QStringLiteral("add_dir")));
@@ -193,6 +200,45 @@ void DlgMergeFile::updateButtonStates()
 // 这类硬性错误。以前只有点「确定」或合并结束才暴露，用户填了 "a" 之后
 // 文件落在进程当前目录（从 IDE 启动时就是 build/.../debug），提示里又只有文件数，
 // 于是"合并完了但找不到文件"。
+void DlgMergeFile::resizeEvent(QResizeEvent *pEvent)
+{
+    QDialog::resizeEvent(pEvent);
+    // resizeEvent 到达时子控件布局可能还没按新宽度算完，必须等这一轮布局结束
+    // 再读 label->width()；否则会把旧宽度对应的高度锁进 minimumHeight。
+    if (!m_bPathHeightPending)
+    {
+        m_bPathHeightPending = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_bPathHeightPending = false;
+            adjustResolvedPathHeight();
+        });
+    }
+}
+
+void DlgMergeFile::adjustResolvedPathHeight()
+{
+    if (m_bAdjustingPathHeight || ui->labelResolvedPath == nullptr)
+        return;
+    const int nWidth = ui->labelResolvedPath->width();
+    if (nWidth <= 0)
+        return;
+
+    // QLabel::heightForWidth() 会被当前 minimumHeight 反向影响（设成 182 后它
+    // 仍返回 182，窗口变宽也降不下来）。所以先清零最小高度，再按当前宽度算。
+    m_bAdjustingPathHeight = true;
+    ui->labelResolvedPath->setMinimumHeight(0);
+    ui->labelResolvedPath->setMaximumHeight(QWIDGETSIZE_MAX);
+    const int nHeight = ui->labelResolvedPath->heightForWidth(nWidth);
+    if (nHeight >= 0)
+    {
+        // 同时锁定最大高度：只设 minimum 时布局会把多余高度继续塞给 label，
+        // 窗口拉宽后文字虽变回一行、label 却仍占着窄窗口时的高度。
+        ui->labelResolvedPath->setMinimumHeight(nHeight);
+        ui->labelResolvedPath->setMaximumHeight(nHeight);
+    }
+    m_bAdjustingPathHeight = false;
+}
+
 void DlgMergeFile::updateResolvedPath()
 {
     if (ui->labelResolvedPath == nullptr)
@@ -203,6 +249,7 @@ void DlgMergeFile::updateResolvedPath()
     {
         ui->labelResolvedPath->clear();
         ui->labelResolvedPath->setToolTip(QString());
+        adjustResolvedPathHeight();
         return;
     }
 
@@ -236,6 +283,7 @@ void DlgMergeFile::updateResolvedPath()
         bUnusable ? QStringLiteral("QLabel#labelResolvedPath { color: #C0392B; }")
                   : QStringLiteral("QLabel#labelResolvedPath { color: #6B7280; }"));
     ui->labelResolvedPath->setText(sHint);
+    adjustResolvedPathHeight();
     // 路径很长时提示条会折行；tooltip 给出不折行的完整内容
     ui->labelResolvedPath->setToolTip(sProblem.isEmpty()
         ? QDir::cleanPath(QFileInfo(sText).absoluteFilePath())
