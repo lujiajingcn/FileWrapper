@@ -2,62 +2,40 @@
 #define ARCHIVEFORMAT_H
 
 // ============================================================
-// FileWrapper 归档格式公共定义（v1–v3 兼容读取 / v4 写入）
+// FileWrapper 归档格式公共定义
 //
-// 全局头 24 字节（v1 / v2 / v3 完全相同，小端）:
+// 只有一种格式（当前版本 4）。FileWrapper 尚未正式发布，没有任何存量归档，
+// 因此不保留旧版本（v1–v3）的读取/升级分支：版本号不等于 CURRENT_VERSION
+// 的归档一律明确拒绝，而不是悄悄接受后再保存出语义不同的文件。
+//
+// 全局头 24 字节（小端）:
 //   [0..3]   Magic "FWDA"
-//   [4..7]   Version  uint32  1 = 旧格式, 2 = 增强格式, 3 = 当前格式
+//   [4..7]   Version  uint32  当前固定为 4
 //   [8..11]  HeaderSize uint32 全局头 + 头部元数据区 + 条目头的总大小
 //   [12..15] FileCount  uint32
 //   [16..19] HeaderChecksum uint32  CRC32
 //   [20..23] Reserved   uint32 (0)
 //
-// v1 头部区（HeaderSize - 24 字节）:
-//   重复 FileCount 次:
-//     PathLength u32 / FileSize u64 / ContentPos u64 / Path u8[PathLength]
-//
-// v2 头部区:
+// 头部区:
 //   [24..27] RootLength u32
 //   [28..]   Root u8[RootLength] (UTF-8, 合并时所有输入的公共父目录, 仅供显示)
-//   重复 FileCount 次:
-//     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32 / Path u8[PathLength]
-//   v2 的 Path 是相对 Root 的**相对路径**；v1 的 Path 是原始路径（可能是绝对路径）。
-//   v2 快速删除采用「墓碑」：把该条目路径区的首字节改为 NUL，PathLength 与
-//   槽位大小保持不变（后续条目才能继续按原 PathLength 对齐），解析时整条跳过。
-//   头部 CRC 随之重算；内容区留待下一次完整重写时回收。
-//   FileCount 记录物理槽位数（含墓碑），因此可能大于实际可见条目数。
-//
-// v3 头部区（可读取；不再写入）:
-//   [24..27] RootLength u32
-//   [28..]   Root u8[RootLength] (UTF-8)
-//   重复 FileCount 次:
-//     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
-//     CreatedMs u64 / ModifiedMs u64 / AccessedMs u64 / Attributes u32
-//     Path u8[PathLength]
-//   三个时间都是 UTC 毫秒（1970-01-01 起），0 表示「未知/未记录」；
-//   Attributes 存 FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h），
-//   用于导出/分割时把源文件的只读/隐藏/系统/存档属性写回磁盘。
-//   v3 不再使用墓碑（原地改头部）；删除与新增统一走完整重写。
-//
-// v4 头部区（当前写入格式，v1–v3 仍可读取）:
-//   [24..27] RootLength u32
-//   [28..]   Root u8[RootLength] (UTF-8)
 //   重复 FileCount 次:
 //     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
 //     CreatedMs u64 / ModifiedMs u64 / AccessedMs u64 / Attributes u32
 //     TagCount u32
 //     Path u8[PathLength]
 //     TagCount 个标记: TagLen u32 / Tag u8[TagLen] (UTF-8)
+//   Path 是相对 Root 的路径；跨盘/无公共根时 Root 为空、盘符作为首段存储。
+//   三个时间都是 UTC 毫秒（1970-01-01 起），0 表示「未知/未记录」；
+//   Attributes 存 FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h），
+//   用于导出/分割时把源文件的只读/隐藏/系统/存档属性写回磁盘。
 //   标记是条目级的自定义分类（例如「合同」「重要」）。写入前统一归一化：
 //   去首尾空白、内部连续空白折叠为一个空格、大小写不敏感去重；最多 MAX_TAGS 个，
 //   单个最多 MAX_TAG_CHARS 个字符且不超过 MAX_TAG_LEN 字节（UTF-8）。
-//   旧版本读到 v4 会明确报「不支持的归档版本」并拒绝打开 —— 这是刻意的：
-//   宁可拒绝，也不接受后再保存把标记静默丢掉。
 //
 // 校验说明:
 //   HeaderChecksum 覆盖 全局头[0..15] + 全局头[20..23] + 整个头部区。
-//   v2/v3 每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
-//   v1 没有内容校验字段，读取时跳过内容校验，保持对 1.dat 等旧归档的兼容。
+//   每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
 // ============================================================
 
 #include <QtGlobal>
@@ -78,39 +56,26 @@ namespace FwArc {
 // 归档的专属后缀：与文件头魔数 "FWDA" 同名，避免 .dat 这种通配后缀带来的混淆。
 // 识别归档始终靠魔数（见 parseFromDevice），后缀只影响对话框过滤与人的判断。
 static const char *const FILE_SUFFIX = ".fwda";
-static const char *const LEGACY_SUFFIX = ".dat";   // v2 之前/早期版本用的后缀
 
 // 「加载 / 另存为 / 拆分」三个对话框共用的文件过滤器。
-// 新后缀在前，旧的 .dat 继续列出：老归档不用改名也仍然能在对话框里看到，
-// 否则会出现「另存成了 .fwda，但加载框只认 *.dat，找不到文件」。
 inline QString fileDialogFilter()
 {
     return QCoreApplication::translate(
-        "FwArc", "FileWrapper 归档 (*.fwda *.dat);;All Files (*.*)");
+        "FwArc", "FileWrapper 归档 (*.fwda);;All Files (*.*)");
 }
 
 // 文件名是否看起来是归档（只看后缀，用于界面提示；
 // 真正判定归档用的是文件头魔数）
 inline bool hasArchiveSuffix(const QString &sPath)
 {
-    const QString sLower = sPath.toLower();
-    return sLower.endsWith(QLatin1String(FILE_SUFFIX))
-           || sLower.endsWith(QLatin1String(LEGACY_SUFFIX));
+    return sPath.toLower().endsWith(QLatin1String(FILE_SUFFIX));
 }
 
 static const char MAGIC[4] = {'F', 'W', 'D', 'A'};
-static const quint32 VERSION_V1       = 1;
-static const quint32 VERSION_V2       = 2;
-static const quint32 VERSION_V3       = 3;
-static const quint32 VERSION_V4       = 4;   // 条目级标记
-static const quint32 CURRENT_VERSION  = VERSION_V4;
+static const quint32 CURRENT_VERSION  = 4;   // 条目级标记 + 内容 CRC + 文件系统元数据
 static const quint32 GLOBAL_HDR       = 24;
-static const quint32 ENTRY_FIXED_V1   = 20;
-static const quint32 ENTRY_FIXED_V2   = 24;
-// v3：v2 的固定字段 + 3 个 u64 时间 + 1 个 u32 属性
-static const quint32 ENTRY_FIXED_V3   = 52;
-// v4：v3 的固定字段 + TagCount u32（标记正文在路径之后，变长）
-static const quint32 ENTRY_FIXED_V4   = 56;
+// 条目固定字段：PathLength/FileSize/ContentPos/ContentCrc32/三个时间/属性/TagCount
+static const quint32 ENTRY_FIXED      = 56;
 static const quint32 MAX_FILES        = 1000000;
 static const quint32 MAX_PATH_LEN     = 32768;
 static const quint32 MAX_ROOT_LEN     = 32768;
@@ -123,24 +88,6 @@ static const quint64 MAX_CONTENT_LEN  = (1ULL << 62);
 // 时间戳合理上界（UTC 毫秒）：9999-12-31 23:59:59.999。
 // 超出视为未知，避免伪造的 u64 在 QDateTime 转换/显示时变成无意义的值。
 static const quint64 MAX_TIMESTAMP_MS = 253402300799999ULL;
-
-// 条目固定字段长度（按版本）。v1/v2 没有文件系统元数据。
-inline quint32 entryFixedSize(quint32 version)
-{
-    switch (version)
-    {
-    case VERSION_V1: return ENTRY_FIXED_V1;
-    case VERSION_V2: return ENTRY_FIXED_V2;
-    case VERSION_V3: return ENTRY_FIXED_V3;
-    case VERSION_V4: return ENTRY_FIXED_V4;
-    default:         return 0;
-    }
-}
-
-// v2 起每条都有内容 CRC；v3 起每条都有文件系统元数据；v4 起每条可带标记。
-inline bool versionHasContentCrc(quint32 version) { return version >= VERSION_V2; }
-inline bool versionHasFsMetadata(quint32 version) { return version >= VERSION_V3; }
-inline bool versionHasTags(quint32 version)       { return version >= VERSION_V4; }
 
 // 把任意时间值收敛到「可显示」的范围：0 或 [1, MAX_TIMESTAMP_MS]。
 inline quint64 sanitizeTimestamp(quint64 ms)
@@ -155,14 +102,12 @@ struct Entry
     quint64 size          = 0;
     quint64 contentPos    = 0;
     quint32 contentCrc    = 0;
-    bool    hasContentCrc = false;
-    // v3 文件系统元数据（v1/v2 条目 hasFsMetadata=false、其余为 0）
-    bool    hasFsMetadata = false;
+    // 文件系统元数据（时间 UTC 毫秒 + DOS 属性），全 0 表示源文件没有记录。
     quint64 createdMs     = 0;
     quint64 modifiedMs    = 0;
     quint64 accessedMs    = 0;
     quint32 attributes    = 0;
-    // v4 条目级标记（v1–v3 条目为空）
+    // 条目级标记（已归一化）
     QStringList tags;
 };
 
@@ -479,7 +424,7 @@ inline QString formatSize(qint64 bytes)
 }
 
 // ============================================================
-// 条目标记（v4）
+// 条目标记
 //
 // 归一化规则由 UI 输入、写入端、解析端共用同一份，避免「界面能输入、
 // 写进归档时才报错」：
@@ -551,7 +496,7 @@ inline QStringList normalizeTags(const QStringList &tags, QString *psErr = nullp
     return out;
 }
 
-// 一条记录的标记区字节数（不含 v4 固定字段里的 TagCount）。
+// 一条记录的标记区字节数（不含固定字段里的 TagCount）。
 inline quint64 tagPayloadBytes(const QStringList &tags)
 {
     quint64 n = 0;

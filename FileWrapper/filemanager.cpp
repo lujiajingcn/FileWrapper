@@ -354,7 +354,7 @@ QString FileManager::archivePath() const
 bool FileManager::isDirty() const { return m_bDirty; }
 bool FileManager::needsSave() const
 {
-    return isArchiveLoaded() && (m_bDirty || m_meta.version == FwArc::VERSION_V1);
+    return isArchiveLoaded() && m_bDirty;
 }
 FwArc::Meta FileManager::archiveMeta() const { return m_meta; }
 QVector<FILEINFO> FileManager::getFileInfos() { return m_vtFileInfos; }
@@ -397,19 +397,18 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
     const quint32 fileCount = FwArc::readU32(gh + 12);
     const quint32 storedCrc = FwArc::readU32(gh + 16);
 
-    if (version != FwArc::VERSION_V1 && version != FwArc::VERSION_V2
-        && version != FwArc::VERSION_V3 && version != FwArc::VERSION_V4)
-        return fail(QStringLiteral("不支持的归档版本: %1").arg(version));
+    if (version != FwArc::CURRENT_VERSION)
+        return fail(QStringLiteral("不支持的归档版本: %1（当前只支持 %2）")
+                        .arg(version).arg(FwArc::CURRENT_VERSION));
     if (fileCount == 0 || fileCount > FwArc::MAX_FILES)
         return fail(QStringLiteral("文件数量异常: %1").arg(fileCount));
     if (hdrSize < FwArc::GLOBAL_HDR || quint64(hdrSize) > fileSize
         || quint64(hdrSize) > FwArc::MAX_HDR_SIZE)
         return fail(QStringLiteral("头部大小异常: %1").arg(hdrSize));
 
-    const quint32 entryFixed = FwArc::entryFixedSize(version);
+    const quint32 entryFixed = FwArc::ENTRY_FIXED;
     const quint64 entriesRegion = quint64(hdrSize) - FwArc::GLOBAL_HDR;
-    const quint64 metaPrefix = FwArc::versionHasContentCrc(version) ? 4 : 0;
-    if (entryFixed == 0 || entriesRegion < metaPrefix + quint64(entryFixed) * fileCount)
+    if (entriesRegion < 4 + quint64(entryFixed) * fileCount)
         return fail(QStringLiteral("头部大小与文件数量不匹配"));
 
     // —— 头部 CRC：分块计算，不一次性分配头部大小的内存（P3-2）——
@@ -439,23 +438,20 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
     if (!f.seek(FwArc::GLOBAL_HDR)) return fail(QStringLiteral("定位条目区失败"));
     qint64 cursor = FwArc::GLOBAL_HDR;
 
-    if (FwArc::versionHasContentCrc(version))
-    {
-        char rl[4];
-        if (f.read(rl, 4) != 4) return fail(QStringLiteral("读取原始根长度失败"));
-        const quint32 rootLen = FwArc::readU32(rl);
-        if (rootLen > FwArc::MAX_ROOT_LEN)
-            return fail(QStringLiteral("原始根长度异常: %1").arg(rootLen));
-        if (cursor + 4 + rootLen > hdrSize)
-            return fail(QStringLiteral("原始根越界"));
-        QByteArray rb(qsizetype(rootLen), Qt::Uninitialized);
-        if (rootLen && f.read(rb.data(), rootLen) != rootLen)
-            return fail(QStringLiteral("读取原始根失败"));
-        if (!FwArc::isValidUtf8(rb))
-            return fail(QStringLiteral("原始根不是合法 UTF-8"));
-        meta.root = QString::fromUtf8(rb);
-        cursor += 4 + rootLen;
-    }
+    char rl[4];
+    if (f.read(rl, 4) != 4) return fail(QStringLiteral("读取原始根长度失败"));
+    const quint32 rootLen = FwArc::readU32(rl);
+    if (rootLen > FwArc::MAX_ROOT_LEN)
+        return fail(QStringLiteral("原始根长度异常: %1").arg(rootLen));
+    if (cursor + 4 + rootLen > hdrSize)
+        return fail(QStringLiteral("原始根越界"));
+    QByteArray rb(qsizetype(rootLen), Qt::Uninitialized);
+    if (rootLen && f.read(rb.data(), rootLen) != rootLen)
+        return fail(QStringLiteral("读取原始根失败"));
+    if (!FwArc::isValidUtf8(rb))
+        return fail(QStringLiteral("原始根不是合法 UTF-8"));
+    meta.root = QString::fromUtf8(rb);
+    cursor += 4 + rootLen;
 
     meta.entries.reserve(int(fileCount));
     for (quint32 i = 0; i < fileCount; ++i)
@@ -466,147 +462,98 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         char plBuf[4];
         if (f.read(plBuf, 4) != 4) return fail(QStringLiteral("第 %1 条路径长度读取失败").arg(i));
         const quint32 pathLen = FwArc::readU32(plBuf);
-        if (pathLen > FwArc::MAX_PATH_LEN)
+        if (pathLen == 0 || pathLen > FwArc::MAX_PATH_LEN)
             return fail(QStringLiteral("第 %1 条路径长度异常: %2").arg(i).arg(pathLen));
-        // v2 允许墓碑条目（快速删除留下的空槽）。判定：路径区首字节为 NUL，
-        // PathLength 保持原值，槽位大小不变，后续条目才能正确对齐。
-        // PathLength=0 作为旧写法的墓碑一并兼容。v1/v3 不允许空路径。
-        if (pathLen == 0 && version != FwArc::VERSION_V2)
-            return fail(QStringLiteral("第 %1 条路径长度为 0").arg(i));
         if (cursor + qint64(entryFixed) + pathLen > hdrSize)
             return fail(QStringLiteral("第 %1 条记录越界（路径区不足）").arg(i));
 
         char fsBuf[8], cpBuf[8];
         if (f.read(fsBuf, 8) != 8) return fail(QStringLiteral("第 %1 条大小读取失败").arg(i));
         if (f.read(cpBuf, 8) != 8) return fail(QStringLiteral("第 %1 条偏移读取失败").arg(i));
-        quint32 entryCrc = 0;
-        if (FwArc::versionHasContentCrc(version))
-        {
-            char crcBuf[4];
-            if (f.read(crcBuf, 4) != 4) return fail(QStringLiteral("第 %1 条内容 CRC 读取失败").arg(i));
-            entryCrc = FwArc::readU32(crcBuf);
-        }
-        // v3：固定字段里的文件系统元数据（时间 UTC 毫秒 + DOS 属性）
-        quint64 createdMs = 0, modifiedMs = 0, accessedMs = 0;
-        quint32 attributes = 0;
-        if (FwArc::versionHasFsMetadata(version))
-        {
-            char metaBuf[8];
-            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条创建时间读取失败").arg(i));
-            createdMs = FwArc::readU64(metaBuf);
-            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条修改时间读取失败").arg(i));
-            modifiedMs = FwArc::readU64(metaBuf);
-            if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条访问时间读取失败").arg(i));
-            accessedMs = FwArc::readU64(metaBuf);
-            char attrBuf[4];
-            if (f.read(attrBuf, 4) != 4) return fail(QStringLiteral("第 %1 条属性读取失败").arg(i));
-            attributes = FwArc::readU32(attrBuf);
-        }
-        // v4：固定字段末尾的 TagCount（标记正文在路径之后，见下面的循环）
-        quint32 tagCount = 0;
-        if (FwArc::versionHasTags(version))
-        {
-            char tagCntBuf[4];
-            if (f.read(tagCntBuf, 4) != 4)
-                return fail(QStringLiteral("第 %1 条标记数量读取失败").arg(i));
-            tagCount = FwArc::readU32(tagCntBuf);
-            if (tagCount > FwArc::MAX_TAGS)
-                return fail(QStringLiteral("第 %1 条标记数量异常: %2").arg(i).arg(tagCount));
-        }
+        char crcBuf[4];
+        if (f.read(crcBuf, 4) != 4) return fail(QStringLiteral("第 %1 条内容 CRC 读取失败").arg(i));
+        const quint32 entryCrc = FwArc::readU32(crcBuf);
+
+        // 固定字段里的文件系统元数据（时间 UTC 毫秒 + DOS 属性）
+        char metaBuf[8];
+        if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条创建时间读取失败").arg(i));
+        const quint64 createdMs = FwArc::readU64(metaBuf);
+        if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条修改时间读取失败").arg(i));
+        const quint64 modifiedMs = FwArc::readU64(metaBuf);
+        if (f.read(metaBuf, 8) != 8) return fail(QStringLiteral("第 %1 条访问时间读取失败").arg(i));
+        const quint64 accessedMs = FwArc::readU64(metaBuf);
+        char attrBuf[4];
+        if (f.read(attrBuf, 4) != 4) return fail(QStringLiteral("第 %1 条属性读取失败").arg(i));
+        const quint32 attributes = FwArc::readU32(attrBuf);
+
+        // 固定字段末尾的 TagCount（标记正文在路径之后，见下面的循环）
+        char tagCntBuf[4];
+        if (f.read(tagCntBuf, 4) != 4)
+            return fail(QStringLiteral("第 %1 条标记数量读取失败").arg(i));
+        const quint32 tagCount = FwArc::readU32(tagCntBuf);
+        if (tagCount > FwArc::MAX_TAGS)
+            return fail(QStringLiteral("第 %1 条标记数量异常: %2").arg(i).arg(tagCount));
+
         const quint64 size = FwArc::readU64(fsBuf);
         const quint64 pos  = FwArc::readU64(cpBuf);
 
-        // v2 墓碑：PathLength 保持原值（槽位大小不变，后续条目才能正确对齐），
-        // 用路径区首字节为 NUL 作为删除标记。写入端 markDeletedOnly() 与此处一致。
         QByteArray pb(qsizetype(pathLen), Qt::Uninitialized);
         if (f.read(pb.data(), pathLen) != pathLen)
             return fail(QStringLiteral("第 %1 条路径读取失败").arg(i));
-        const bool bTomb = (version == FwArc::VERSION_V2) && (pathLen == 0 || pb.at(0) == char(0));
-        if (bTomb)
-        {
-            if (size > FwArc::MAX_CONTENT_LEN)
-                return fail(QStringLiteral("第 %1 条（墓碑）文件大小异常").arg(i));
-            if (pos < hdrSize || pos > fileSize || size > fileSize - pos)
-                return fail(QStringLiteral("第 %1 条（墓碑）内容区越界").arg(i));
-            cursor += qint64(entryFixed) + pathLen;
-            continue;
-        }
         if (!FwArc::isValidUtf8(pb))
             return fail(QStringLiteral("第 %1 条路径不是合法 UTF-8").arg(i));
 
         const QString path = QString::fromUtf8(pb);
 
-        // v4：路径之后的标记区（TagCount 个 [TagLen u32 + UTF-8 正文]）。
+        // 路径之后的标记区（TagCount 个 [TagLen u32 + UTF-8 正文]）。
         // 边界按「条目起点 + 固定字段 + 路径 + 已读标记字节」计算：cursor 此时
         // 仍停在条目起点，不能直接拿它做当前读位置的边界判断。
         QStringList tags;
         qint64 tagBytes = 0;
-        if (FwArc::versionHasTags(version))
+        tags.reserve(int(tagCount));
+        for (quint32 t = 0; t < tagCount; ++t)
         {
-            tags.reserve(int(tagCount));
-            for (quint32 t = 0; t < tagCount; ++t)
-            {
-                const qint64 tagPos = cursor + qint64(entryFixed) + qint64(pathLen) + tagBytes;
-                if (tagPos + 4 > qint64(hdrSize))
-                    return fail(QStringLiteral("第 %1 条标记区越界").arg(i));
-                char tagLenBuf[4];
-                if (f.read(tagLenBuf, 4) != 4)
-                    return fail(QStringLiteral("第 %1 条标记长度读取失败").arg(i));
-                const quint32 tagLen = FwArc::readU32(tagLenBuf);
-                if (tagLen == 0 || tagLen > FwArc::MAX_TAG_LEN)
-                    return fail(QStringLiteral("第 %1 条标记长度异常: %2").arg(i).arg(tagLen));
-                if (tagPos + 4 + qint64(tagLen) > qint64(hdrSize))
-                    return fail(QStringLiteral("第 %1 条标记正文越界").arg(i));
-                QByteArray tb(qsizetype(tagLen), Qt::Uninitialized);
-                if (f.read(tb.data(), tagLen) != tagLen)
-                    return fail(QStringLiteral("第 %1 条标记读取失败").arg(i));
-                if (!FwArc::isValidUtf8(tb))
-                    return fail(QStringLiteral("第 %1 条标记不是合法 UTF-8").arg(i));
-                const QString tag = QString::fromUtf8(tb);
-                QString tagErr;
-                if (!FwArc::isValidTag(tag, &tagErr))
-                    return fail(QStringLiteral("第 %1 条标记非法：%2").arg(i).arg(tagErr));
-                tags << tag;
-                tagBytes += 4 + qint64(tagLen);
-            }
+            const qint64 tagPos = cursor + qint64(entryFixed) + qint64(pathLen) + tagBytes;
+            if (tagPos + 4 > qint64(hdrSize))
+                return fail(QStringLiteral("第 %1 条标记区越界").arg(i));
+            char tagLenBuf[4];
+            if (f.read(tagLenBuf, 4) != 4)
+                return fail(QStringLiteral("第 %1 条标记长度读取失败").arg(i));
+            const quint32 tagLen = FwArc::readU32(tagLenBuf);
+            if (tagLen == 0 || tagLen > FwArc::MAX_TAG_LEN)
+                return fail(QStringLiteral("第 %1 条标记长度异常: %2").arg(i).arg(tagLen));
+            if (tagPos + 4 + qint64(tagLen) > qint64(hdrSize))
+                return fail(QStringLiteral("第 %1 条标记正文越界").arg(i));
+            QByteArray tb(qsizetype(tagLen), Qt::Uninitialized);
+            if (f.read(tb.data(), tagLen) != tagLen)
+                return fail(QStringLiteral("第 %1 条标记读取失败").arg(i));
+            if (!FwArc::isValidUtf8(tb))
+                return fail(QStringLiteral("第 %1 条标记不是合法 UTF-8").arg(i));
+            const QString tag = QString::fromUtf8(tb);
+            QString tagErr;
+            if (!FwArc::isValidTag(tag, &tagErr))
+                return fail(QStringLiteral("第 %1 条标记非法：%2").arg(i).arg(tagErr));
+            tags << tag;
+            tagBytes += 4 + qint64(tagLen);
         }
 
         FwArc::Entry e;
-        e.size          = size;
-        e.contentPos    = pos;
-        e.contentCrc    = entryCrc;
-        e.hasContentCrc = FwArc::versionHasContentCrc(version);
-        e.tags          = tags;
-        if (FwArc::versionHasFsMetadata(version))
-        {
-            // 时间/属性按「头部里存什么就显示什么」处理；伪造的超界时间戳
-            // 收敛为 0（未知），避免显示无意义的年份。
-            e.hasFsMetadata = true;
-            e.createdMs     = FwArc::sanitizeTimestamp(createdMs);
-            e.modifiedMs    = FwArc::sanitizeTimestamp(modifiedMs);
-            e.accessedMs    = FwArc::sanitizeTimestamp(accessedMs);
-            e.attributes    = attributes & FwMeta::ATTR_MASK;
-        }
+        e.size       = size;
+        e.contentPos = pos;
+        e.contentCrc = entryCrc;
+        e.tags       = tags;
+        // 时间/属性按「头部里存什么就显示什么」处理；伪造的超界时间戳
+        // 收敛为 0（未知），避免显示无意义的年份。
+        e.createdMs  = FwArc::sanitizeTimestamp(createdMs);
+        e.modifiedMs = FwArc::sanitizeTimestamp(modifiedMs);
+        e.accessedMs = FwArc::sanitizeTimestamp(accessedMs);
+        e.attributes = attributes & FwMeta::ATTR_MASK;
 
-        if (FwArc::versionHasContentCrc(version))
-        {
-            QString why;
-            if (!FwArc::isSafeRelativePath(path, &why))
-                return fail(QStringLiteral("第 %1 条路径不安全：%2").arg(i).arg(why));
-            e.relPath     = path;
-            e.displayPath = FwArc::displayPathFor(meta.root, path);
-        }
-        else
-        {
-            // v1 允许绝对路径（老归档如 1.dat 全是 G:/...），只做基本字符校验
-            if (path.contains(QChar(0)))
-                return fail(QStringLiteral("第 %1 条路径含 NUL 字符").arg(i));
-            for (int k = 0; k < path.size(); ++k)
-                if (path.at(k).unicode() < 32)
-                    return fail(QStringLiteral("第 %1 条路径含控制字符").arg(i));
-            e.displayPath = path;
-            e.relPath     = path;   // 解析完成后统一按公共根收敛
-        }
+        QString why;
+        if (!FwArc::isSafeRelativePath(path, &why))
+            return fail(QStringLiteral("第 %1 条路径不安全：%2").arg(i).arg(why));
+        e.relPath     = path;
+        e.displayPath = FwArc::displayPathFor(meta.root, path);
 
         // —— 条目字段合法性：伪造 fileSize / contentPos 会在这里被拒绝（P1-1）——
         if (size > FwArc::MAX_CONTENT_LEN)
@@ -651,24 +598,6 @@ bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
         if (ranges.at(i).first < ranges.at(i - 1).second)
             return fail(QStringLiteral("条目内容区重叠（第 %1 条与前一区间冲突）").arg(i));
 
-    // v1：由展示路径推导公共根与相对路径，供分割时还原目录层级（P2-1 / P2-8）。
-    // v1 只记录绝对路径，跨目录 / 跨盘符时推导出的相对路径会带很深的无意义层级
-    // （且换机器后不可靠）；层级 >= 3 时退化为纯文件名，由 chooseOutputPath 的
-    // 自动重命名机制解决同名冲突。
-    if (version == FwArc::VERSION_V1)
-    {
-        QStringList all;
-        for (const FwArc::Entry &e : meta.entries) all << e.displayPath;
-        meta.root = FwArc::commonRoot(all);
-        for (FwArc::Entry &e : meta.entries)
-        {
-            QString rel = FwArc::sanitizeRelativePath(
-                        FwArc::makeRelative(e.displayPath, meta.root));
-            if (rel.count('/') >= 2)
-                rel = FwArc::sanitizeRelativePath(QFileInfo(e.displayPath).fileName());
-            e.relPath = rel;
-        }
-    }
     return true;
 }
 
@@ -685,7 +614,7 @@ bool FileManager::parseFile(const QString &sPath, FwArc::Meta &meta, QString &sE
 
 // P1-1：每个操作使用自己的 QFile。以前 entryHead()/entryContent() 都复用 m_qFile，
 // 而 streamCopy() 又在循环里 processEvents()；重入时第二次 seek 会把外层复制游标
-// 改到别的条目位置，v1 归档没有内容 CRC，错误字节会被静默写进新归档。
+// 改到别的条目位置，错误字节会被静默写进新归档。
 // 独占句柄后，共享游标不再是正确性依赖。
 bool FileManager::openEntrySource(const QString &sFilePath, const FILEINFO &fi,
                                   QFile &localFile, qint64 &srcPos, QString &sErr) const
@@ -928,20 +857,19 @@ bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPrePars
         fi.nFileLen         = qint64(e.size);
         fi.nContentPositon  = qint64(e.contentPos);
         fi.nState           = 0;
-        // v3 记录存在但三项时间与属性全为 0（例如把 v2 归档重写进 v3）时，
-        // 视为「没有可显示的元数据」，属性页会明确写"未记录"。
-        const bool bHasMeta = e.hasFsMetadata
-                              && (e.createdMs != 0 || e.modifiedMs != 0
-                                  || e.accessedMs != 0 || e.attributes != 0);
+        // 三项时间与属性全为 0 时视为「没有可显示的元数据」（源文件当时没有
+        // 可用的文件系统信息），属性页会明确写"未记录"。
+        const bool bHasMeta = e.createdMs != 0 || e.modifiedMs != 0
+                              || e.accessedMs != 0 || e.attributes != 0;
         fi.bHasFsMetadata   = bHasMeta;
-        fi.nCreatedTime     = bHasMeta ? qint64(e.createdMs) : 0;
-        fi.nModifiedTime    = bHasMeta ? qint64(e.modifiedMs) : 0;
-        fi.nAccessedTime    = bHasMeta ? qint64(e.accessedMs) : 0;
-        fi.nAttributes      = bHasMeta ? e.attributes : 0;
+        fi.nCreatedTime     = qint64(e.createdMs);
+        fi.nModifiedTime    = qint64(e.modifiedMs);
+        fi.nAccessedTime    = qint64(e.accessedMs);
+        fi.nAttributes      = e.attributes;
         fi.listTags         = e.tags;
         m_vtFileInfos.push_back(fi);
         m_mapFileInfos[fi.sFilePath] = fi;
-        if (e.hasContentCrc) m_mapContentCrc.insert(fi.sFilePath, e.contentCrc);
+        m_mapContentCrc.insert(fi.sFilePath, e.contentCrc);
     }
 
     m_meta              = meta;
@@ -1007,7 +935,7 @@ void FileManager::addFiles(const QVector<QString> &vtNewFiles)
         info.nFileLen        = fi.size();
         info.nContentPositon = 0;
         info.nState          = 0;
-        // 添加时先记下源文件的时间/属性：v3 保存时会把它们写进归档。
+        // 添加时先记下源文件的时间/属性：保存时会把它们写进归档。
         // 未保存前属性页也直接显示这份信息。
         const FwMeta::Metadata m = FwMeta::capture(fp);
         if (m.valid)
@@ -1042,7 +970,7 @@ bool FileManager::deleteFile(const QString &sFilePath)
     return true;
 }
 
-// v4：设置条目标记。归一化/校验全部在 FwArc 里做，UI 与写归档端共用同一套规则。
+// 设置条目标记。归一化/校验全部在 FwArc 里做，UI 与写归档端共用同一套规则。
 // 注意 m_vtFileInfos、m_mapFileInfos、m_meta.entries 三处必须同步，否则
 // 属性页（读 FILEINFO）、entryHead（读 map）、保存（读 vector）会各说各话。
 bool FileManager::setEntryTags(const QString &sFilePath, const QStringList &listTags,
@@ -1119,8 +1047,7 @@ bool FileManager::save()
         setError(QStringLiteral("另有文件操作正在进行，请稍后重试"));
         return false;
     }
-    // v1/v2/v3 归档即使没有显式改动也需要在保存时升级到 v4（校验提示会要求保存 v1）
-    if (!m_bDirty && m_meta.version != FwArc::VERSION_V1) return true;
+    if (!m_bDirty) return true;
 
     if (m_vtFileInfos.isEmpty())
     {
@@ -1137,7 +1064,7 @@ bool FileManager::save()
 }
 
 // ============================================================
-// v4 归档写入：头部占位 → 流式复制内容 → 回填 CRC
+// 归档写入：头部占位 → 流式复制内容 → 回填 CRC
 // ============================================================
 
 bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos,
@@ -1176,7 +1103,7 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
             return fail(QStringLiteral("第 %1 条标记无效：%2").arg(i).arg(tagErr));
         rels.append(rb);
         tagsList.append(tags);
-        hs += qint64(FwArc::ENTRY_FIXED_V4) + qint64(rb.size())
+        hs += qint64(FwArc::ENTRY_FIXED) + qint64(rb.size())
               + qint64(FwArc::tagPayloadBytes(tags));
     }
     if (hs < FwArc::GLOBAL_HDR || quint64(hs) > FwArc::MAX_HDR_SIZE
@@ -1185,7 +1112,7 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
 
     if (!fOut.seek(0)) return fail(QStringLiteral("定位输出文件失败"));
     if (fOut.write(FwArc::MAGIC, 4) != 4) return fail(QStringLiteral("写入魔数失败"));
-    bool ok = FwArc::writeU32(fOut, FwArc::VERSION_V4)
+    bool ok = FwArc::writeU32(fOut, FwArc::CURRENT_VERSION)
            && FwArc::writeU32(fOut, quint32(hs))
            && FwArc::writeU32(fOut, quint32(infos.size()))
            && FwArc::writeU32(fOut, 0)      // HeaderChecksum 占位
@@ -1208,7 +1135,7 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
         outCrcFieldPos.append(fOut.pos());
         if (!FwArc::writeU32(fOut, 0))    // ContentCrc32 占位
             return fail(QStringLiteral("写入第 %1 条 CRC 字段失败").arg(i));
-        // v3：时间统一收敛到可显示范围，属性只保留 R/H/S/A 位
+        // 时间统一收敛到可显示范围，属性只保留 R/H/S/A 位
         const quint64 created  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
                                      ? quint64(fi.nCreatedTime) : 0;
         const quint64 modified = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
@@ -1220,7 +1147,7 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
           && FwArc::writeU64(fOut, accessed)
           && FwArc::writeU32(fOut, fi.nAttributes & FwMeta::ATTR_MASK);
         if (!ok) return fail(QStringLiteral("写入第 %1 条元数据失败").arg(i));
-        // v4：固定字段末尾的 TagCount，然后是路径，最后是标记正文
+        // 固定字段末尾的 TagCount，然后是路径，最后是标记正文
         if (!FwArc::writeU32(fOut, quint32(tagsList.at(i).size())))
             return fail(QStringLiteral("写入第 %1 条标记数量失败").arg(i));
         if (!rels.at(i).isEmpty() && fOut.write(rels.at(i)) != rels.at(i).size())
@@ -1404,8 +1331,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
-    // ---- 收集输入：已合并的 .dat（FWDA）先拆分成条目，再一起合并 ----
-    // 把 .dat 当成普通文件嵌进输出会变成"归档套归档"，用户还要再拆一层；
+    // ---- 收集输入：已合并的 FWDA 归档先拆分成条目，再一起合并 ----
+    // 把归档当成普通文件嵌进输出会变成"归档套归档"，用户还要再拆一层；
     // 这里直接读它的索引，把每个条目作为独立输入展开。
     //
     // 关键点：每个条目都要记住**它原本的完整路径**（归档 = 该归档的 root + 归档内相对路径；
@@ -1419,14 +1346,13 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         QString sStoredPath;      // 写入输出归档的路径（由 sOriginPath 推导）
         QString sDisplayName;     // 进度与错误提示
         bool    bFromArchive = false;
-        // v3：源文件的文件系统元数据（普通文件现读；展开归档时沿用条目里存的）
+        // 源文件的文件系统元数据（普通文件现读；展开归档时沿用条目里存的）
         FwMeta::Metadata fsMeta;
-        // v4：展开已有归档时沿用条目的标记；普通文件没有标记
+        // 展开已有归档时沿用条目的标记；普通文件没有标记
         QStringList listTags;
         // P1-2：来源归档条目的内容 CRC。复制完必须与它比对，否则「结构完好但
-        // 内容已损坏」的 v2 输入会在二次合并后被重新算出 CRC、变成看似完好的归档。
+        // 内容已损坏」的输入会在二次合并后被重新算出 CRC、变成看似完好的归档。
         quint32 nContentCrc = 0;
-        bool    bHasContentCrc = false;
         // P1-6：收集时记录来源大小，复制前后各核对一次，防止静默保存旧长度前缀。
         qint64  nSourceSize = -1;
     };
@@ -1476,8 +1402,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.sSourcePath  = fp;
                 s.nOffset      = qint64(e.contentPos);
                 s.nLength      = qint64(e.size);
-                // 用来源归档的 root 还原它原本的完整路径；手工构造的归档可能没有 root
-                // v1 的 relPath 可能被降级成纯文件名；displayPath 才是原始完整路径。
+                // 用来源归档的 root 还原它原本的完整路径；手工构造的归档可能没有 root。
                 s.sOriginPath = e.displayPath.isEmpty()
                     ? (meta.root.isEmpty() ? e.relPath
                                            : meta.root + QLatin1Char('/') + e.relPath)
@@ -1485,17 +1410,13 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.sDisplayName = QFileInfo(e.relPath).fileName();
                 s.bFromArchive = true;
                 s.nContentCrc = e.contentCrc;
-                s.bHasContentCrc = e.hasContentCrc;
                 s.nSourceSize = qint64(meta.fileSize);
-                if (e.hasFsMetadata)
-                {
-                    s.fsMeta.valid      = true;
-                    s.fsMeta.createdMs  = qint64(e.createdMs);
-                    s.fsMeta.modifiedMs = qint64(e.modifiedMs);
-                    s.fsMeta.accessedMs = qint64(e.accessedMs);
-                    s.fsMeta.attributes = e.attributes;
-                }
-                s.listTags = e.tags;   // 展开归档时保留标记（来源是 v4 才有）
+                s.fsMeta.valid      = true;
+                s.fsMeta.createdMs  = qint64(e.createdMs);
+                s.fsMeta.modifiedMs = qint64(e.modifiedMs);
+                s.fsMeta.accessedMs = qint64(e.accessedMs);
+                s.fsMeta.attributes = e.attributes;
+                s.listTags = e.tags;   // 展开归档时保留标记
                 sources.append(s);
                 allOrigins << s.sOriginPath;
                 ++nArchiveEntries;
@@ -1510,7 +1431,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         s.sOriginPath  = fi.absoluteFilePath();
         s.sDisplayName = fi.fileName();
         s.nSourceSize  = fi.size();
-        // v3：合并时把源文件的时间/属性一起收进归档
+        // 合并时把源文件的时间/属性一起收进归档
         s.fsMeta       = sourceMeta;
         sources.append(s);
         allOrigins << s.sOriginPath;
@@ -1643,7 +1564,7 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 
     const qint64 rootBytes = qint64(sRoot.toUtf8().size());
     qint64 needBytes = FwArc::GLOBAL_HDR + 4 + rootBytes
-                     + qint64(FwArc::ENTRY_FIXED_V4) * qint64(infos.size()) + totalBytes;
+                     + qint64(FwArc::ENTRY_FIXED) * qint64(infos.size()) + totalBytes;
     for (int i = 0; i < storedPaths.size(); ++i)
     {
         const qint64 one = qint64(storedPaths.at(i).toUtf8().size())
@@ -1738,9 +1659,10 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             err = tr("来源文件在合并过程中被修改：%1").arg(s.sSourcePath);
             bOk = false; break;
         }
-        // P1-2：v2 来源条目的内容 CRC 必须与来源记录一致。结构完好的头部
+        // P1-2：来源归档条目的内容 CRC 必须与来源记录一致。结构完好的头部
         // 不能证明内容区没坏，不比对就会把损坏内容重新盖章成新归档。
-        if (s.bHasContentCrc && eCrc.value() != s.nContentCrc)
+        // 普通文件没有"来源 CRC"，复制结果本身就是要写入的 CRC。
+        if (s.bFromArchive && eCrc.value() != s.nContentCrc)
         {
             err = tr("来源归档内容校验失败（CRC32 不匹配）：%1\n"
                      "该条目在来源归档中已损坏，拒绝把它合并成新归档。")
@@ -1839,152 +1761,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
 }
 
 // ============================================================
-// 保存：重写为 v2 格式 + 内容 CRC + 空间预检 + 具体失败原因
+// 保存：完整重写为当前格式（内容 CRC + 文件系统元数据 + 标记）
 // ============================================================
-
-// v2 墓碑式快速删除：只改写头部区的路径标记与 HeaderChecksum，
-// 内容区一个字节都不动。对 10 GB 归档删除一个 94 B 条目，从「重写 10 GB」
-// 变成「改写几十 KB 头部」（P1-3）。
-//
-// 事务性：头部区一次性读入内存（有上限），在内存里打标记 + 重算 CRC，
-// 最后一次连续写回；任何失败都用原头部整体回滚，绝不留下「标记已改、
-// CRC 未更新」的半写归档。
-bool FileManager::markDeletedOnly(QString &sErr)
-{
-    const QString sArchivePath = m_qFile.fileName();
-    QFile f(sArchivePath);
-
-    auto reopenOwn = [&]() {
-        if (!m_qFile.isOpen() && !sArchivePath.isEmpty()) {
-            m_qFile.setFileName(sArchivePath);
-            m_qFile.open(QIODevice::ReadOnly);
-        }
-    };
-    auto fail = [&](const QString &m) -> bool {
-        if (f.isOpen()) f.close();
-        reopenOwn();
-        sErr = m;
-        return false;
-    };
-
-    if (sArchivePath.isEmpty()) return fail(QStringLiteral("归档路径为空"));
-
-    // Windows 下先关掉自身只读句柄，避免与写入句柄共享冲突
-    if (m_qFile.isOpen()) m_qFile.close();
-    if (!f.open(QIODevice::ReadWrite))
-        return fail(QStringLiteral("无法以读写方式打开归档: %1").arg(f.errorString()));
-
-    const qint64 fileSize = f.size();
-    char gh[FwArc::GLOBAL_HDR];
-    if (!f.seek(0) || f.read(gh, FwArc::GLOBAL_HDR) != FwArc::GLOBAL_HDR)
-        return fail(QStringLiteral("读取全局头失败"));
-    if (std::memcmp(gh, FwArc::MAGIC, 4) != 0)
-        return fail(QStringLiteral("魔数不匹配"));
-    const quint32 version = FwArc::readU32(gh + 4);
-    const quint32 hdrSize = FwArc::readU32(gh + 8);
-    const quint32 count   = FwArc::readU32(gh + 12);
-    if (version != FwArc::VERSION_V2) return fail(QStringLiteral("不是 v2 归档"));
-    if (hdrSize < FwArc::GLOBAL_HDR + 4 || quint64(hdrSize) > quint64(fileSize)
-        || quint64(hdrSize) > FwArc::MAX_HDR_SIZE)
-        return fail(QStringLiteral("头部大小异常"));
-    // 头部过大就不走内存路径，回退流式完整重写
-    static const qint64 kFastMaxHdr = 64LL * 1024 * 1024;
-    if (qint64(hdrSize) > kFastMaxHdr)
-        return fail(QStringLiteral("头部区过大，不适合快速删除"));
-
-    QByteArray hdr(qsizetype(hdrSize), Qt::Uninitialized);
-    if (!f.seek(0) || f.read(hdr.data(), hdrSize) != hdrSize)
-        return fail(QStringLiteral("回读头部区失败"));
-    const QByteArray hdrOrig = hdr;   // 隐式共享，回滚时使用的原始快照
-
-    auto rollback = [&]() -> bool {
-        if (!f.isOpen() && !f.open(QIODevice::ReadWrite)) return false;
-        if (!f.seek(0)) { f.close(); return false; }
-        const bool ok = (f.write(hdrOrig) == hdrOrig.size() && f.flush());
-        f.close();
-        return ok;
-    };
-
-    const char *p = hdr.constData();
-    qint64 cursor = FwArc::GLOBAL_HDR;
-    const quint32 rootLen = FwArc::readU32(p + cursor);
-    if (rootLen > FwArc::MAX_ROOT_LEN || cursor + 4 + qint64(rootLen) > hdrSize)
-        return fail(QStringLiteral("原始根长度异常"));
-    const QString root = QString::fromUtf8(p + cursor + 4, qsizetype(rootLen));
-    cursor += 4 + qint64(rootLen);
-
-    QSet<QString> keep;
-    for (const FILEINFO &fi : m_vtFileInfos) keep.insert(fi.sFilePath);
-    if (keep.isEmpty() || count > FwArc::MAX_FILES)
-        return fail(QStringLiteral("条目数异常，回退完整重写"));
-
-    QVector<qint64> tombPathPos;
-    int matched = 0;
-    for (quint32 i = 0; i < count; ++i)
-    {
-        if (cursor + qint64(FwArc::ENTRY_FIXED_V2) > hdrSize)
-            return fail(QStringLiteral("条目区越界"));
-        const quint32 pathLen = FwArc::readU32(p + cursor);
-        if (pathLen > FwArc::MAX_PATH_LEN
-            || cursor + qint64(FwArc::ENTRY_FIXED_V2) + pathLen > hdrSize)
-            return fail(QStringLiteral("条目区与路径长度不匹配"));
-        const qint64 pathPos = cursor + FwArc::ENTRY_FIXED_V2;
-        const char *pPath = p + pathPos;
-        // 已是墓碑的槽位跳过；PathLength=0 是旧写法的墓碑，保持原样
-        if (pathLen > 0 && pPath[0] != char(0))
-        {
-            const QString display = FwArc::displayPathFor(
-                        root, QString::fromUtf8(pPath, qsizetype(pathLen)));
-            if (keep.contains(display)) ++matched;
-            else tombPathPos.append(pathPos);
-        }
-        cursor += qint64(FwArc::ENTRY_FIXED_V2) + pathLen;
-    }
-    if (tombPathPos.isEmpty())
-        return fail(QStringLiteral("未找到需要标记删除的条目"));
-    if (matched != keep.size())
-        return fail(QStringLiteral("待保留条目与归档头部不一致，回退完整重写"));
-    if (tombPathPos.size() >= int(count))
-        return fail(QStringLiteral("拒绝把全部条目标记为删除，回退完整重写"));
-
-    p = nullptr;   // 下面会写 hdr，触发与 hdrOrig 的分离，原指针不再使用
-
-    // 打墓碑：只把路径区首字节改成 NUL，PathLength 与槽位大小不变，
-    // 这样后续条目仍按原 PathLength 对齐（parseFromDevice 用同一规则识别）。
-    for (qint64 pos : tombPathPos) hdr[qsizetype(pos)] = char(0);
-
-    // HeaderChecksum = 全局头[0..15] + [20..23] + 头部区[24..hdrSize)
-    FwArc::Crc32 c;
-    c.update(hdr.constData(), 16);
-    c.update(hdr.constData() + 20, 4);
-    c.update(hdr.constData() + FwArc::GLOBAL_HDR, qint64(hdrSize) - FwArc::GLOBAL_HDR);
-    const quint32 crc = c.value();
-    for (int k = 0; k < 4; ++k) hdr[16 + k] = char((crc >> (8 * k)) & 0xFFu);
-
-    if (!f.seek(0) || f.write(hdr) != hdr.size() || !f.flush())
-    {
-        rollback();
-        return fail(QStringLiteral("写回头部区失败"));
-    }
-    f.close();
-
-    // 写回后必须能按新头部完整解析，且存活条目数与预期一致
-    FwArc::Meta chk;
-    QString perr;
-    if (!parseFile(sArchivePath, chk, perr) || chk.entries.size() != keep.size())
-    {
-        rollback();
-        return fail(QStringLiteral("快速删除后头部校验失败，已回滚：%1").arg(perr));
-    }
-
-    QLoadMergedFile(sArchivePath);   // 刷新偏移、清 dirty / pending，并重开自身句柄
-    if (!isArchiveLoaded())
-    {
-        rollback();
-        return fail(QStringLiteral("重新加载归档失败"));
-    }
-    return true;
-}
 
 // 写归档时的路径规划：与合并（QMergeFiles）用同一套规则，避免"保存后目录结构被拍平"。
 // 之前 rewriteArchive 直接用 commonRoot + makeRelative：跨盘时 commonRoot 为空，
@@ -2070,7 +1848,7 @@ bool FileManager::rewriteArchive()
     const QString sArchivePath = m_qFile.fileName();
     QVector<FILEINFO> infos = m_vtFileInfos;
 
-    // v3：新增但尚未保存的条目在保存时重新读一次源文件元数据，
+    // 新增但尚未保存的条目在保存时重新读一次源文件元数据，
     // 让归档里记录的时间和属性与真正写进去的内容一致（源文件可能在添加后被修改过）。
     for (FILEINFO &fi : infos)
     {
@@ -2087,8 +1865,7 @@ bool FileManager::rewriteArchive()
         }
     }
 
-    // P1-3：v2 墓碑快速删除已停用（原地改头部没有崩溃恢复日志）。
-    // 删除与新增统一走下面的完整事务重写。
+    // 删除与新增统一走下面的完整事务重写（临时文件 + 校验 + 替换 + 重新解析）。
 
     // P1-6：归档在加载后被外部改写（大小变化）时，内存里的条目偏移已不可信。
     // 继续保存会把「按旧偏移读出来的字节」当成新归档内容，直接中止。
@@ -2140,7 +1917,7 @@ bool FileManager::rewriteArchive()
     }
     for (int i = 0; i < storedPaths.size(); ++i)
     {
-        qint64 one = qint64(FwArc::ENTRY_FIXED_V4)
+        qint64 one = qint64(FwArc::ENTRY_FIXED)
                    + qint64(storedPaths.at(i).toUtf8().size());
         if (!FwArc::checkedAdd64(one,
                                  qint64(FwArc::tagPayloadBytes(infos.at(i).listTags)), &one)
@@ -2568,8 +2345,8 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
             if (m_bCancelRequested) break;
             continue;
         }
-        // 内容 CRC 校验（v1 无校验字段，跳过但会在汇总里说明）
-        if (e.hasContentCrc && crc.value() != e.contentCrc)
+        // 内容 CRC 校验
+        if (crc.value() != e.contentCrc)
         {
             QFile::remove(sOutFinal);
             ++nCrcBad;
@@ -2577,17 +2354,14 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
                                 .arg(i + 1).arg(sOutFinal));
             continue;
         }
-        // v3：把条目录下的文件时间/属性写回磁盘。失败只告警，不删已写出的内容。
-        if (e.hasFsMetadata)
+        // 把条目录下的文件时间/属性写回磁盘。失败只告警，不删已写出的内容。
+        QString sMetaErr;
+        if (!FwMeta::apply(sOutFinal, qint64(e.createdMs), qint64(e.modifiedMs),
+                           qint64(e.accessedMs), e.attributes, &sMetaErr))
         {
-            QString sMetaErr;
-            if (!FwMeta::apply(sOutFinal, qint64(e.createdMs), qint64(e.modifiedMs),
-                               qint64(e.accessedMs), e.attributes, &sMetaErr))
-            {
-                ++nMetaWarn;
-                emit warningOccurred(tr("文件已写出，但时间/属性恢复失败：%1\n%2")
-                                         .arg(sOutFinal, sMetaErr));
-            }
+            ++nMetaWarn;
+            emit warningOccurred(tr("文件已写出，但时间/属性恢复失败：%1\n%2")
+                                     .arg(sOutFinal, sMetaErr));
         }
         ++nDone;
     }
@@ -2620,16 +2394,6 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 // 读取与导出（P1-2 / P1-7 / P3-2）
 // ============================================================
 
-// 只读条目开头若干字节：格式嗅探只需要文件头，不必把整块内容读进内存。
-bool FileManager::verifyMappedCrc(const QString &sFilePath, const char *pData, qint64 nLen) const
-{
-    if (!m_mapContentCrc.contains(sFilePath)) return true;   // v1 无内容 CRC
-    if (pData == nullptr || nLen < 0) return false;
-    FwArc::Crc32 crc;
-    crc.update(pData, nLen);
-    return crc.value() == m_mapContentCrc.value(sFilePath);
-}
-
 bool FileManager::contentCrcFor(const QString &sFilePath, quint32 *pCrc) const
 {
     if (pCrc == nullptr || !m_mapContentCrc.contains(sFilePath)) return false;
@@ -2637,6 +2401,7 @@ bool FileManager::contentCrcFor(const QString &sFilePath, quint32 *pCrc) const
     return true;
 }
 
+// 只读条目开头若干字节：格式嗅探只需要文件头，不必把整块内容读进内存。
 QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr)
 {
     if (psErr) psErr->clear();
@@ -2688,7 +2453,7 @@ QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QS
 }
 
 // C2：直接读出条目内容到 QByteArray，省掉"new char[] -> 插件再复制一份"的中转。
-// 校验语义：大小、完整性、v2 内容 CRC；读取失败时 psErr 给原因。
+// 校验语义：大小、完整性与内容 CRC；读取失败时 psErr 给原因。
 QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
 {
     if (psErr) psErr->clear();
@@ -2873,7 +2638,7 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
         setError(tr("导出失败：内容校验不通过（CRC32 不匹配），%1 可能已损坏。").arg(sFilePath));
         return;
     }
-    // v3：把条目录下的文件时间/属性写回导出文件；失败只告警，内容已经成功写出。
+    // 把条目录下的文件时间/属性写回导出文件；失败只告警，内容已经成功写出。
     if (fi.bHasFsMetadata)
     {
         QString sMetaErr;
@@ -2899,15 +2664,6 @@ bool FileManager::verifyArchive(QString *psReport)
         return false;
     }
     BusyGuard guard(this);
-
-    if (m_meta.version == FwArc::VERSION_V1)
-    {
-        const QString s = tr("当前归档是 v1 格式，不含逐条目内容校验字段，无法检测内容区损坏。"
-                             "\n建议用「保存」重写为 v3 格式后即可校验。");
-        if (psReport) *psReport = s;
-        setError(s);
-        return false;
-    }
 
     QFile f(m_qFile.fileName());
     if (!f.open(QIODevice::ReadOnly))

@@ -257,9 +257,6 @@ private:
     static QString typeLabel(const QString &sFileName);
     void saveUiState();
     void restoreUiState();
-    // 一次性清理旧版本「插件映射」（QSettings [PluginMap] 组）：自动路由已取代它。
-    // 键本身不会再被读取，但留在 ini 里会让人误以为仍然生效。
-    void purgeLegacyPluginMapSettings();
     // 文件列表双击的统一处理（目录 -> 展开/收起，文件 -> 打开）
     void handleFileListDoubleClick(const QModelIndex &index);
     // 「属性」对话框的数据收集：文件按 FILEINFO，文件夹按当前列表子树汇总

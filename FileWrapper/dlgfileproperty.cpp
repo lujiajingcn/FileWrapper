@@ -21,19 +21,9 @@ namespace {
 
 QString archiveFormatText(quint32 nVersion)
 {
-    switch (nVersion)
-    {
-    case FwArc::VERSION_V1:
-        return QCoreApplication::translate("DlgFileProperty", "FWDA v1（旧格式）");
-    case FwArc::VERSION_V2:
-        return QCoreApplication::translate("DlgFileProperty", "FWDA v2");
-    case FwArc::VERSION_V3:
-        return QCoreApplication::translate("DlgFileProperty", "FWDA v3");
-    case FwArc::VERSION_V4:
+    if (nVersion == FwArc::CURRENT_VERSION)
         return QCoreApplication::translate("DlgFileProperty", "FWDA v4");
-    default:
-        return QCoreApplication::translate("DlgFileProperty", "未知");
-    }
+    return QCoreApplication::translate("DlgFileProperty", "未知");
 }
 
 // 文件时间统一按本地时区显示（与资源管理器一致）；0 表示归档未记录。
@@ -61,8 +51,6 @@ QString crcText(const DlgFileProperty::Data &data)
         return QStringLiteral("CRC32 ") + QString::asprintf("0x%08X", data.nCrc);
     if (data.bPending)
         return QCoreApplication::translate("DlgFileProperty", "不可用（新增条目尚未保存）");
-    if (data.nArchiveVersion == FwArc::VERSION_V1)
-        return QCoreApplication::translate("DlgFileProperty", "不可用（v1 归档未记录内容校验）");
     return QCoreApplication::translate("DlgFileProperty", "不可用");
 }
 
@@ -285,7 +273,7 @@ QVector<DlgFileProperty::Section> DlgFileProperty::buildSections(const Data &dat
     }
     sections.append(basic);
 
-    // 文件系统元数据（v3 起随归档保存；v1/v2 归档没有可显示的值）
+    // 文件系统元数据（随归档保存；源文件没有可用信息时显示"未记录"）
     if (!data.bDir)
     {
         Section file;
@@ -300,7 +288,7 @@ QVector<DlgFileProperty::Section> DlgFileProperty::buildSections(const Data &dat
         else
         {
             file.rows.append(qMakePair(tr("文件时间"),
-                tr("未记录（该归档版本未保存文件元数据）")));
+                tr("未记录（源文件没有可用的时间/属性信息）")));
         }
         sections.append(file);
     }

@@ -12,8 +12,8 @@ DlgOutputFile::DlgOutputFile(QWidget *parent) :
 {
     ui->setupUi(this);
     ui->btnSelectDir->setIcon(FwIcons::get(QStringLiteral("browse")));
-    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
-    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
+    // 确定/取消是对话框的默认按钮（主题里 :default 为实心蓝底），固定深色图标
+    // 会和蓝底糊在一起；按钮文字已经足够清楚，不给默认按钮加图标。
 
     this->setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 

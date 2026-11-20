@@ -14,7 +14,7 @@
 //   A   主程序链路：PluginManager 加载、QMergeFiles 合并、resolvePlugin 三步、
 //       插件窗口挂进 QTabWidget、「插件设置」入口存在
 //
-//   * 真实 FileManager 把真实 .docx 合并成 .dat 归档，再把字节读回来
+//   * 真实 FileManager 把真实 .docx 合并成 .fwda 归档，再把字节读回来
 //     （与程序里双击文件时的取数据路径一致）
 //   * 真实插件 DLL，经 QPluginLoader 加载后走 PluginInterface
 //   * 真实 QTextBrowser 文档：逐段/逐字符/逐表格/逐图片检查渲染结果
@@ -861,24 +861,6 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
         ProbeMainWindow::decideRoute(QStringLiteral("mystery"), QByteArray("hello"), QString());
     report(unknown.pluginPath.isEmpty(),
            QStringLiteral("W7d: unknown content without extension -> no plugin"));
-
-    // 旧版 [PluginMap] 配置里的键必须彻底失效（功能已删除）
-    {
-        QSettings st(QSettings::IniFormat, QSettings::UserScope,
-                     QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
-        st.beginGroup(QStringLiteral("PluginMap"));
-        st.setValue(QStringLiteral("qzx"), QStringLiteral("PluginText"));
-        st.endGroup();
-        st.sync();
-    }
-    const bool bIgnored = mw.choosePlugin(QStringLiteral("qzx")).isEmpty();
-    {
-        QSettings st(QSettings::IniFormat, QSettings::UserScope,
-                     QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
-        st.remove(QStringLiteral("PluginMap"));
-        st.sync();
-    }
-    report(bIgnored, QStringLiteral("W7e: legacy PluginMap entry no longer routes .qzx"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,7 +1801,7 @@ static void verifyPluginToggleAndReload()
 }
 
 // ---------------------------------------------------------------------------
-// G: 合并时"已合并的 .dat"先拆分成条目，而不是当普通文件嵌套进去
+// G: 合并时"已合并的归档"先拆分成条目，而不是当普通文件嵌套进去
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // H: 合并对话框的交互契约（多选 + 删除选中项）
@@ -2303,7 +2285,8 @@ static void verifyMergeDialog()
                    .arg(QString(sHint).replace(QLatin1Char('\n'), QStringLiteral(" | "))));
     }
 
-    // H17: 没写扩展名的输出补 .fwda；已有扩展名（.fwda / 老的 .dat / "v1.2" 版本号）原样保留
+    // H17: 没写扩展名的输出补 .fwda；已有扩展名（.fwda / 其他后缀 / "v1.2" 版本号）原样保留；
+    //      归档后缀判定只认 .fwda
     {
         const QString sNoExt  = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged"));
         const QString sDotEnd = DlgMergeFile::ensureArchiveSuffix(QStringLiteral("E:/tmp/merged."));
@@ -2316,18 +2299,18 @@ static void verifyMergeDialog()
                    && sDat == QStringLiteral("E:/tmp/merged.dat")
                    && sVer == QStringLiteral("E:/tmp/v1.2")
                    && FwArc::hasArchiveSuffix(QStringLiteral("x.fwda"))
-                   && FwArc::hasArchiveSuffix(QStringLiteral("x.DAT"))
+                   && FwArc::hasArchiveSuffix(QStringLiteral("x.FWDA"))
+                   && !FwArc::hasArchiveSuffix(QStringLiteral("x.DAT"))
                    && !FwArc::hasArchiveSuffix(QStringLiteral("x.png")),
                QStringLiteral("H17: missing output extension becomes .fwda (%1)").arg(sNoExt));
     }
 
-    // H18: 加载/另存为/拆分共用的过滤器必须同时列出 *.fwda 与老的 *.dat，
-    //      否则「另存成 .fwda」之后老归档在对话框里就看不见了
+    // H18: 加载/另存为/拆分共用的过滤器只认归档的专属后缀 *.fwda
     {
         const QString sFilter = FwArc::fileDialogFilter();
         report(sFilter.contains(QStringLiteral("*.fwda"))
-                   && sFilter.contains(QStringLiteral("*.dat")),
-               QStringLiteral("H18: archive filter lists both *.fwda and *.dat (%1)").arg(sFilter));
+                   && !sFilter.contains(QStringLiteral("*.dat")),
+               QStringLiteral("H18: archive filter lists only *.fwda (%1)").arg(sFilter));
     }
 
     // H19: 文件列表右键菜单——文件行 = 打开 / 打开新标签页 / 以文本查看 / 以十六进制查看 / 属性；
@@ -2446,7 +2429,7 @@ static void verifyMergeDialog()
     report(bTagColumnOk,
            QStringLiteral("H19d: file list exposes a 标记 column (4 columns)"));
 
-    // H20: 属性文本——大小格式、CRC、待保存条目、v1 旧归档、文件夹汇总与筛选说明
+    // H20: 属性文本——大小格式、CRC、待保存条目、无元数据条目、文件夹汇总与筛选说明
     bool bPropTextOk = false;
     bool bPropStateOk = false;
     bool bPropFolderOk = false;
@@ -2456,8 +2439,8 @@ static void verifyMergeDialog()
         d.sType = DlgFileProperty::typeTextForFile(d.sName);
         d.sLocation = QStringLiteral("E:/testfiles_copy");
         d.nSize = 22907;
-        d.sArchivePath = QStringLiteral("E:/testfiles_copy/1.dat");
-        d.nArchiveVersion = FwArc::VERSION_V3;
+        d.sArchivePath = QStringLiteral("E:/testfiles_copy/1.fwda");
+        d.nArchiveVersion = FwArc::CURRENT_VERSION;
         d.sEntryPath = QStringLiteral("E:/testfiles_copy/report.docx");
         d.bHasCrc = true;
         d.nCrc = 0xDEADBEEFu;
@@ -2477,8 +2460,8 @@ static void verifyMergeDialog()
                       && sText.contains(QStringLiteral("修改时间：2025/1/26"))
                       && sText.contains(QStringLiteral("访问时间：2025/1/27"))
                       && sText.contains(QStringLiteral("属性：RA"))
-                      && sText.contains(QStringLiteral("所属归档：E:/testfiles_copy/1.dat"))
-                      && sText.contains(QStringLiteral("归档格式：FWDA v3"))
+                      && sText.contains(QStringLiteral("所属归档：E:/testfiles_copy/1.fwda"))
+                      && sText.contains(QStringLiteral("归档格式：FWDA v4"))
                       && sText.contains(QStringLiteral("归档内路径：E:/testfiles_copy/report.docx"))
                       && sText.contains(QStringLiteral("内容校验：CRC32 0xDEADBEEF"))
                       && sText.contains(QStringLiteral("状态：已保存在归档中"))
@@ -2489,9 +2472,8 @@ static void verifyMergeDialog()
                              == QStringLiteral("文件")
                       && sText.contains(QStringLiteral("标记：—"));
 
-        // v4：归档格式写 v4，标记按顿号连接显示
+        // 标记按顿号连接显示
         DlgFileProperty::Data tagged = d;
-        tagged.nArchiveVersion = FwArc::CURRENT_VERSION;
         tagged.listTags = QStringList{ QStringLiteral("合同"), QStringLiteral("重要") };
         const QString sTagged = DlgFileProperty::formatInfoText(tagged);
         bPropTextOk = bPropTextOk
@@ -2504,18 +2486,17 @@ static void verifyMergeDialog()
         pending.bPending = true;
         const QString sPending = DlgFileProperty::formatInfoText(pending);
 
-        DlgFileProperty::Data v1 = d;
-        v1.bHasCrc = false;
-        v1.nCrc = 0;
-        v1.bHasFsMetadata = false;
-        v1.nArchiveVersion = FwArc::VERSION_V1;
-        const QString sV1 = DlgFileProperty::formatInfoText(v1);
+        // 源文件没有可用元数据（三项时间与属性全 0）时明确写"未记录"
+        DlgFileProperty::Data noMeta = d;
+        noMeta.bHasCrc = false;
+        noMeta.nCrc = 0;
+        noMeta.bHasFsMetadata = false;
+        const QString sNoMeta = DlgFileProperty::formatInfoText(noMeta);
         bPropStateOk = sPending.contains(QStringLiteral("内容校验：不可用（新增条目尚未保存）"))
                        && sPending.contains(QStringLiteral("状态：新增条目，尚未保存"))
-                       && sV1.contains(QStringLiteral("归档格式：FWDA v1（旧格式）"))
-                       && sV1.contains(QStringLiteral("内容校验：不可用（v1 归档未记录内容校验）"))
-                       && sV1.contains(QStringLiteral("状态：已保存在归档中"))
-                       && sV1.contains(QStringLiteral("文件时间：未记录（该归档版本未保存文件元数据）"));
+                       && sNoMeta.contains(QStringLiteral("内容校验：不可用"))
+                       && sNoMeta.contains(QStringLiteral("状态：已保存在归档中"))
+                       && sNoMeta.contains(QStringLiteral("文件时间：未记录（源文件没有可用的时间/属性信息）"));
 
         DlgFileProperty::Data folderData;
         folderData.bDir = true;
@@ -2526,8 +2507,8 @@ static void verifyMergeDialog()
         folderData.nFileCount = 20;
         folderData.nDirCount = 4;
         folderData.bFiltered = true;
-        folderData.sArchivePath = QStringLiteral("E:/study/1.dat");
-        folderData.nArchiveVersion = FwArc::VERSION_V3;
+        folderData.sArchivePath = QStringLiteral("E:/study/1.fwda");
+        folderData.nArchiveVersion = FwArc::CURRENT_VERSION;
         folderData.sEntryPath = QStringLiteral("E:/study/代码");
         const QString sFolder = DlgFileProperty::formatInfoText(folderData);
         DlgFileProperty::Data unfiltered;
@@ -2546,7 +2527,7 @@ static void verifyMergeDialog()
     report(bPropTextOk,
            QStringLiteral("H20a: property text formats size/CRC/archive fields"));
     report(bPropStateOk,
-           QStringLiteral("H20b: pending entry and v1 archive show explicit CRC/state text"));
+           QStringLiteral("H20b: pending/no-metadata entries show explicit CRC/state text"));
     report(bPropFolderOk,
            QStringLiteral("H20c: folder property text shows aggregate and filter scope"));
 
@@ -2673,6 +2654,48 @@ static void verifyMergeDialog()
         QDir(sThumbDir).removeRecursively();
     }
 
+    // H22: 合并摘要统计——目录递归计数（后台线程里跑的就是这个纯函数）。
+    //      以前统计在 UI 线程里同步做，添加大文件夹时待合并列表要等整棵目录树
+    //      数完才刷新，看起来就是「添加文件夹后列表更新很慢」。
+    {
+        const QString sDir = makeWritableTestDir(QStringLiteral("merge_summary"));
+        bool bFixtureOk = QDir(sDir).exists();
+        if (bFixtureOk)
+        {
+            QDir().mkpath(sDir + QStringLiteral("/sub"));
+            auto writeBytes = [](const QString &sPath, int nLen) {
+                QFile f(sPath);
+                return f.open(QIODevice::WriteOnly) && f.write(QByteArray(nLen, 'x')) == nLen;
+            };
+            bFixtureOk = writeBytes(sDir + QStringLiteral("/a.txt"), 100)
+                         && writeBytes(sDir + QStringLiteral("/sub/b.fwda"), 200)
+                         && writeBytes(sDir + QStringLiteral("/sub/c.txt"), 300);
+        }
+
+        DlgMergeFile::MergeSummary stDir;
+        DlgMergeFile::MergeSummary stWithFile;
+        DlgMergeFile::MergeSummary stAborted;
+        if (bFixtureOk)
+        {
+            stDir = DlgMergeFile::computeMergeSummary(QStringList{ sDir });
+            // 目录 + 目录里的 .fwda 各算一个输入（与添加文件的行为一致）
+            stWithFile = DlgMergeFile::computeMergeSummary(
+                QStringList{ sDir, sDir + QStringLiteral("/sub/b.fwda") });
+            QAtomicInt abortFlag(1);   // 已作废：必须立刻返回，一个文件都不数
+            stAborted = DlgMergeFile::computeMergeSummary(QStringList{ sDir }, &abortFlag);
+        }
+        report(bFixtureOk
+                   && stDir.nInputs == 1 && stDir.nFiles == 3 && stDir.nBytes == 600
+                   && stDir.nArchives == 0 && !stDir.bCapped
+                   && stWithFile.nInputs == 2 && stWithFile.nFiles == 4
+                   && stWithFile.nBytes == 800 && stWithFile.nArchives == 1
+                   && stAborted.nInputs == 0 && stAborted.nFiles == 0,
+               QStringLiteral("H22: merge summary counts directory tree and stops when "
+                              "cancelled (%1 files / %2 bytes / %3 archives)")
+                   .arg(stDir.nFiles).arg(stDir.nBytes).arg(stWithFile.nArchives));
+        QDir(sDir).removeRecursively();
+    }
+
     QDir(sChainDir).removeRecursively();
 }
 
@@ -2779,7 +2802,7 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     }
 
     // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
-    const QString sDup = work + QStringLiteral("/dup_paths.dat");
+    const QString sDup = work + QStringLiteral("/dup_paths.fwda");
     if (QFileInfo::exists(sDup))
     {
         FileManager fm5;
@@ -2793,7 +2816,7 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     else
     {
         // 缺素材时不能把整条断言静默吞掉（否则退出码仍可能为 0）
-        report(false, QStringLiteral("K3: missing fixture dup_paths.dat"));
+        report(false, QStringLiteral("K3: missing fixture dup_paths.fwda"));
     }
 
     // K5: 取消标志复位：上一次"取消"不应让后续导出/大文件打开立刻失败
@@ -2908,7 +2931,7 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
     }
 
     // K10: 后缀只是命名约定——.fwda 归档必须能原样加载回来（识别一律看文件头魔数 FWDA，
-    //      不依赖后缀；老的 .dat 同理，所以换后缀不需要迁移任何旧文件）
+    //      不依赖后缀）
     {
         const QString sSrc = scratchDir + QStringLiteral("/fwda_suffix_src.bin");
         const QString sArc = scratchDir + QStringLiteral("/fwda_suffix.fwda");
@@ -2933,12 +2956,12 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
 }
 
 // ---------------------------------------------------------------------------
-// P: FWDA v3 文件系统元数据
-//   合并时把创建/修改/访问时间与 DOS 属性写进归档；导出/分割时写回磁盘；
-//   v1/v2 归档仍可读取（没有元数据）。
+// P: FWDA 当前格式的条目元数据
+//   合并时把创建/修改/访问时间与 DOS 属性写进归档；导出/分割时写回磁盘。
 // ---------------------------------------------------------------------------
 static void verifyArchiveMetadata(const QString &work, const QString &scratchDir)
 {
+    Q_UNUSED(work);
     Q_UNUSED(scratchDir);
     const QString sDir = makeWritableTestDir(QStringLiteral("archive_meta"));
     const bool bDirOk = QDir(sDir).exists();
@@ -3000,7 +3023,7 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     QString sErr;
     const bool bInspect = FileManager::inspectArchive(sArc, meta, sErr);
     report(bMergeDone && bMergeOk && bInspect
-               && meta.version == FwArc::VERSION_V4 && meta.entries.size() == 2,
+               && meta.version == FwArc::CURRENT_VERSION && meta.entries.size() == 2,
            QStringLiteral("P1b: merge writes FWDA v4 (%1 entries, err=%2)")
                .arg(bInspect ? meta.entries.size() : -1).arg(sErr));
 
@@ -3014,7 +3037,6 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     const int iBeta  = entryIndexBySuffix(QStringLiteral("beta.txt"));
     const qint64 nModMs = dtModified.toMSecsSinceEpoch();
     const bool bHeaderMeta = iAlpha >= 0 && iBeta >= 0
-        && meta.entries.at(iAlpha).hasFsMetadata
         && near(qint64(meta.entries.at(iAlpha).modifiedMs), nModMs)
         // 访问时间会被「读文件」等操作刷新（Windows 也可能在句柄关闭时回写），
         // 这里只要求它被记录成一个有效时间，不比对具体值。
@@ -3022,10 +3044,9 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
         && (meta.entries.at(iAlpha).attributes & FwMeta::ATTR_ARCHIVE)
         && (meta.entries.at(iBeta).attributes & FwMeta::ATTR_READONLY);
     report(bHeaderMeta,
-           QStringLiteral("P2: v3 header stores times/attributes "
-                          "[iA=%1 iB=%2 meta=%3 mod=%4/%5 acc=%6 attrA=0x%7 attrB=0x%8]")
+           QStringLiteral("P2: header stores times/attributes "
+                          "[iA=%1 iB=%2 mod=%3/%4 acc=%5 attrA=0x%6 attrB=0x%7]")
                .arg(iAlpha).arg(iBeta)
-               .arg(iAlpha >= 0 ? meta.entries.at(iAlpha).hasFsMetadata : false)
                .arg(iAlpha >= 0 ? qint64(meta.entries.at(iAlpha).modifiedMs) : -1)
                .arg(nModMs)
                .arg(iAlpha >= 0 ? qint64(meta.entries.at(iAlpha).accessedMs) : -1)
@@ -3046,7 +3067,7 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     report(bLoaded && fiAlpha.bHasFsMetadata && near(fiAlpha.nModifiedTime, nModMs)
                && fiAlpha.nAccessedTime > 0
                && (fiBeta.nAttributes & FwMeta::ATTR_READONLY),
-           QStringLiteral("P3: loaded FILEINFO exposes v3 metadata "
+           QStringLiteral("P3: loaded FILEINFO exposes metadata "
                           "[loaded=%1 meta=%2 mod=%3 acc=%4 attrB=0x%5]")
                .arg(bLoaded).arg(fiAlpha.bHasFsMetadata)
                .arg(fiAlpha.nModifiedTime).arg(fiAlpha.nAccessedTime)
@@ -3120,29 +3141,38 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
         {
             if (!e.displayPath.endsWith(QStringLiteral("gamma.txt"), Qt::CaseInsensitive))
                 continue;
-            bSavedMeta = e.hasFsMetadata
-                         && near(qint64(e.modifiedMs), dtGammaMod.toMSecsSinceEpoch())
+            bSavedMeta = near(qint64(e.modifiedMs), dtGammaMod.toMSecsSinceEpoch())
                          && (e.attributes & FwMeta::ATTR_ARCHIVE);
         }
     }
     report(bSavedMeta, QStringLiteral("P7: pending add captures metadata and save persists it"));
 
-    // —— v2 旧归档：照常解析，只是没有元数据 ——
-    const QString sV2 = work + QStringLiteral("/rooted.dat");
-    FwArc::Meta metaV2;
-    QString sV2Err;
-    const bool bV2Inspect = FileManager::inspectArchive(sV2, metaV2, sV2Err)
-                            && metaV2.version == FwArc::VERSION_V2
-                            && !metaV2.entries.isEmpty()
-                            && !metaV2.entries.first().hasFsMetadata;
-    FileManager fmV2;
-    const bool bV2Load = fmV2.QLoadMergedFile(sV2)
-                         && !fmV2.getFileInfos().isEmpty()
-                         && !fmV2.getFileInfos().first().bHasFsMetadata;
-    report(bV2Inspect && bV2Load,
-           QStringLiteral("P8: v2 fixture still loads, without metadata flag"));
+    // —— 旧版本归档：没有任何存量数据，必须明确拒绝（而不是按当前格式误读）——
+    const QString sOldVer = sDir + QStringLiteral("/old_version.fwda");
+    bool bOldPatched = false;
+    if (QFile::copy(sArc, sOldVer))
+    {
+        QFile f(sOldVer);
+        if (f.open(QIODevice::ReadWrite) && f.seek(4))
+        {
+            // 把 Version 改成 3；版本检查发生在头部 CRC 校验之前
+            char v[4] = { 3, 0, 0, 0 };
+            bOldPatched = f.write(v, 4) == 4;
+        }
+    }
+    FwArc::Meta metaOld;
+    QString sOldErr;
+    const bool bOldRejected = bOldPatched
+        && !FileManager::inspectArchive(sOldVer, metaOld, sOldErr)
+        && sOldErr.contains(QStringLiteral("不支持的归档版本"));
+    FileManager fmOld;
+    const bool bOldLoadRejected = bOldPatched && !fmOld.QLoadMergedFile(sOldVer)
+                                  && fmOld.lastError().contains(QStringLiteral("不支持的归档版本"));
+    report(bOldRejected && bOldLoadRejected,
+           QStringLiteral("P8: archives with an old version field are rejected (%1)").arg(sOldErr));
+    QFile::remove(sOldVer);
 
-    // —— v3 头部 CRC 仍然覆盖新增的元数据字段 ——
+    // —— 头部 CRC 覆盖新增的元数据字段 ——
     const QString sBad = sDir + QStringLiteral("/bad_meta.fwda");
     bool bCorrupted = false;
     if (QFile::copy(sArc, sBad) && bInspect)
@@ -3164,9 +3194,9 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
     FileManager fmBad;
     QString sBadErr;
     const bool bBadRejected = bCorrupted && !fmBad.validateMergedFile(sBad, &sBadErr);
-    report(bBadRejected, QStringLiteral("P9: corrupted v3 metadata rejected by header CRC"));
+    report(bBadRejected, QStringLiteral("P9: corrupted metadata rejected by header CRC"));
 
-    // —— v3 归档再合并：条目里已有的元数据必须随条目一起带走 ——
+    // —— 当前格式归档再合并：条目里已有的元数据必须随条目一起带走 ——
     const QString sAgain = sDir + QStringLiteral("/again.fwda");
     FileManager fmAgain;
     bool bAgainDone = false, bAgainOk = false;
@@ -3182,19 +3212,17 @@ static void verifyArchiveMetadata(const QString &work, const QString &scratchDir
         {
             if (!e.displayPath.endsWith(QStringLiteral("beta.txt"), Qt::CaseInsensitive))
                 continue;
-            bAgainMeta = e.hasFsMetadata
-                         && near(qint64(e.modifiedMs), nModMs)
+            bAgainMeta = near(qint64(e.modifiedMs), nModMs)
                          && (e.attributes & FwMeta::ATTR_READONLY);
         }
     }
     report(bAgainMeta,
-           QStringLiteral("P10: merging an existing v3 archive keeps entry metadata"));
+           QStringLiteral("P10: merging an existing archive keeps entry metadata"));
 
     QFile::remove(sBad);
     QFile::remove(sAgain);
     // 释放仍打开的归档句柄，否则 Windows 上 meta.fwda 删不掉、临时目录会残留
     fmLoad.unLoadMergedFile();
-    fmV2.unLoadMergedFile();
     clearReadOnlyForCleanup(sDir);
     QDir(sDir).removeRecursively();
 }
@@ -3250,7 +3278,7 @@ static void verifyArchiveTags(const QString &work, const QString &scratchDir)
     QString sErr;
     const bool bInspect = FileManager::inspectArchive(sArc, meta, sErr);
     report(bMergeDone && bMergeOk && bInspect
-               && meta.version == FwArc::VERSION_V4 && meta.entries.size() == 3,
+               && meta.version == FwArc::CURRENT_VERSION && meta.entries.size() == 3,
            QStringLiteral("Q2: merge writes FWDA v4 (v=%1, n=%2, err=%3)")
                .arg(bInspect ? int(meta.version) : -1)
                .arg(bInspect ? meta.entries.size() : -1)
@@ -3315,7 +3343,7 @@ static void verifyArchiveTags(const QString &work, const QString &scratchDir)
     const FILEINFO fiThree2 = findInfo(infos2, QStringLiteral("three.txt"));
     FwArc::Meta meta2;
     const bool bHeaderOk = FileManager::inspectArchive(sArc, meta2, sErr)
-                           && meta2.version == FwArc::VERSION_V4
+                           && meta2.version == FwArc::CURRENT_VERSION
                            && meta2.entries.size() == 3;
     bool bEntryInHeader = false;
     for (const FwArc::Entry &e : meta2.entries)
@@ -3466,7 +3494,7 @@ static void verifyArchiveTags(const QString &work, const QString &scratchDir)
                 // 第一条目的 TagCount 位于「全局头 + 根长度 + 根 + 固定字段末尾」
                 const qint64 nTagCountPos = qint64(FwArc::GLOBAL_HDR) + 4
                                             + qint64(meta2.root.toUtf8().size())
-                                            + qint64(FwArc::ENTRY_FIXED_V4) - 4;
+                                            + qint64(FwArc::ENTRY_FIXED) - 4;
                 const quint32 nBadCount = FwArc::MAX_TAGS + 1;
                 for (int k = 0; k < 4; ++k)
                     hdr[int(nTagCountPos) + k] = char((nBadCount >> (8 * k)) & 0xFF);
@@ -3537,7 +3565,7 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
     report(bG1, QStringLiteral("G1: same-dir merge keeps short relative names (%1)")
                     .arg(innerPaths.join(QStringLiteral(", "))));
 
-    // G2: "已有归档 + 普通文件"再合并 -> 归档被拆开，两个来源都不丢，且没有嵌套 .dat
+    // G2: "已有归档 + 普通文件"再合并 -> 归档被拆开，两个来源都不丢，且没有嵌套归档
     //     （临时目录与素材目录可能不同盘，走扁平模式；这里只断言"来源路径结尾"）
     FileManager fm2;
     fm2.QMergeFiles(QVector<QString>{ sArcInner, sNote }, sArcOuter);
@@ -3566,10 +3594,10 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
            QStringLiteral("G3: duplicate path auto-renamed (%1)")
                .arg(dupPaths.join(QStringLiteral(", "))));
 
-    // G4: 来源归档的 root 与当前盘符不同（rooted.dat 的 root = D:/testfiles_copy）：
+    // G4: 来源归档的 root 与当前盘符不同（rooted.fwda 的 root = D:/testfiles_copy）：
     //     展开后必须保留它原来的归属，不能被改挂到另一个盘下（用户实际报过的问题）
     FileManager fm4;
-    fm4.QMergeFiles(QVector<QString>{ work + QStringLiteral("/rooted.dat"),
+    fm4.QMergeFiles(QVector<QString>{ work + QStringLiteral("/rooted.fwda"),
                                       work + QStringLiteral("/basic.docx") }, sArcRoot);
     FwArc::Meta rooted;
     QString err4;
@@ -4332,7 +4360,7 @@ int main(int argc, char **argv)
     // ---------- K: 保存路径规划（P0：添加文件后不得拍平目录） ----------
     verifySavePathPreservation(work, scratchDir);
 
-    // ---------- P: v3/v4 元数据与标记（合并保存 / 导出恢复 / 旧归档兼容） ----------
+    // ---------- P: 元数据与标记（合并保存 / 导出恢复） ----------
     verifyArchiveMetadata(work, scratchDir);
     verifyArchiveTags(work, scratchDir);
 

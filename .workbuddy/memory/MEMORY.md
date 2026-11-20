@@ -318,3 +318,23 @@
   本次未解析；需要时另加（JPEG APP1/TIFF IFD 或 Windows WIC 均可）。
 - **测试**：P 组 12 条（v3 写入/读取、导出/分割恢复、新增保存、v3 再合并传递、v2 兼容、
   头部 CRC 覆盖元数据）。atime 断言只要求"有值"——关闭句柄时系统可能回写访问时间。
+
+## 2026-11-20 移除旧版本数据兼容（尚未正式发布，无存量数据）
+- **决定**：FileWrapper 没有正式使用、没有存量归档，不保留任何旧版本读取/升级分支。
+  旧格式代码留着只会随格式演进腐烂，且测试/文档会被迫长期维护它。
+- **归档格式**：`archiveformat.h` 只剩 `CURRENT_VERSION=4` / `ENTRY_FIXED=56`；
+  删除 `VERSION_V1–V3`、`ENTRY_FIXED_V1–V3`、`entryFixedSize()`、`versionHas*()`
+  以及 `Entry::hasContentCrc` / `Entry::hasFsMetadata`。`parseFromDevice` 版本不等于 4
+  直接报「不支持的归档版本」；不再解析 v2 墓碑、不再从 v1 绝对路径推导 root。
+  保存不再检查"旧格式需要升级"，`needsSave()` 只看脏标记。
+- **后缀**：删除 `LEGACY_SUFFIX=".dat"`，文件对话框只列 `*.fwda`，
+  `hasArchiveSuffix()` 只认 `.fwda`。测试素材 `rooted.dat`/`dup_paths.dat` 改名
+  `rooted.fwda`/`dup_paths.fwda` 并按 v4 重新生成；`make_fixtures.py::build_fwda` 写 v4。
+- **旧配置迁移**：删除启动时清理 `[PluginMap]` 的 `purgeLegacyPluginMapSettings()`，
+  以及 `treeMode` 旧配置回退/双写；`restoreUiState()`/`saveUiState()` 只认 `viewMode`。
+- **属性页**：只显示 `FWDA v4`；v1 的「内容校验不可用」文案删除；无元数据文案改为
+  「源文件没有可用的时间/属性信息」。
+- **测试**：W7e（旧 PluginMap 键失效）随清理删除；P8 改为「旧版本字段被明确拒绝」；
+  H17/H18 改为只认 `.fwda`；H20 覆盖无元数据条目。
+  实测 `--integrate --shots` 为 **275 PASS / 0 FAIL / 0 SKIP**；
+  `-SkipShots` 为 **272 PASS / 0 FAIL / 3 SKIP**（README 计数已同步）。

@@ -10,18 +10,18 @@
 
 typedef struct FILEINFO
 {
-    QString sFilePath;          // 展示路径（v2/v3 = 原始根 + 相对路径；v1 = 归档内原路径）
+    QString sFilePath;          // 展示路径（原始根 + 归档内相对路径）
     QString sFileName;          // 文件名称（包括后缀）
     qint64  nFileLen;           // 文件大小
     qint64  nContentPositon;    // 文件内容在归档中的位置
     int     nState;             // 是否已经删除
-    // v3 文件系统元数据（v1/v2 条目 bHasFsMetadata=false，时间/属性为 0）
+    // 文件系统元数据（源文件没有可用信息时 bHasFsMetadata=false、时间/属性为 0）
     qint64  nCreatedTime = 0;   // UTC 毫秒时间戳，0 = 未知
     qint64  nModifiedTime = 0;
     qint64  nAccessedTime = 0;
     quint32 nAttributes = 0;    // FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h）
     bool    bHasFsMetadata = false;
-    // v4 条目级标记（归一化后保存；v1–v3 归档条目为空）
+    // 条目级标记（归一化后保存）
     QStringList listTags;
 } FILEINFO;
 
@@ -42,14 +42,12 @@ public:
     void unLoadMergedFile();
 
     // C2：直接读出条目内容（不经过 new char[] + delete[] 的中转）。
-    // 校验语义：大小、完整性、v2 内容 CRC；失败时 psErr 给原因。
+    // 校验语义：大小、完整性与内容 CRC；失败时 psErr 给原因。
     QByteArray entryContent(const QString &sFilePath, QString *psErr = nullptr);
 
     // 只读取条目开头至多 nMaxBytes 字节（格式嗅探用；不会为了"看文件头"把整块载入内存）
     QByteArray entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr = nullptr);
-    // 校验已映射归档内容区的 CRC（无记录 CRC 的 v1 返回 true）
-    bool verifyMappedCrc(const QString &sFilePath, const char *pData, qint64 nLen) const;
-    // 取加载时记录的内容 CRC；v1/无记录返回 false
+    // 取加载时记录的内容 CRC；条目不在归档内时返回 false
     bool contentCrcFor(const QString &sFilePath, quint32 *pCrc) const;
     QVector<FILEINFO> getFileInfos();
 
@@ -77,7 +75,7 @@ public:
     bool deleteFile(const QString &sFilePath);
     bool save();
     bool isDirty() const;
-    // v1 归档即使用户没改动也需要重写为 v2；保存按钮据此启用
+    // 归档有未保存改动时，保存按钮与标题星号据此启用
     bool needsSave() const;
     bool isCancelRequested() const;
 
@@ -92,10 +90,10 @@ public:
     QString lastError() const;
     bool isBusy() const;
 
-    // 校验当前归档的内容区 CRC（v1 无校验字段，会明确报告「无法校验」）
+    // 校验当前归档的内容区 CRC（逐条目）
     bool verifyArchive(QString *psReport);
     FwArc::Meta archiveMeta() const;
-    // 只取归档格式版本（v1/v2）：不用为了读一个字段把整个 Meta（含条目表）复制一份
+    // 只取归档格式版本：不用为了读一个字段把整个 Meta（含条目表）复制一份
     quint32 archiveVersion() const { return m_meta.version; }
 
     // 读取任意归档的元数据（不做状态变更），供分割「按原路径」二次确认展示
@@ -133,12 +131,8 @@ private:
     static bool computeStoredPaths(const QVector<FILEINFO> &infos,
                                    QString &sRoot, QStringList &storedPaths,
                                    QString &sErr);
-    // P1-3：v2 墓碑式「原地改头部」快速删除已停用。
-    // 它没有崩溃恢复日志：进程在 half-updated 头部时被终止，整个归档会无法加载。
-    // 删除现在统一走 rewriteArchive() 的完整事务重写（临时文件 + 校验 + 替换 +
-    // 重新解析 + 备份回滚），代价是大归档删除需要重写内容区。
-    // 下面这个实现仅保留供后续「写前日志 + 恢复」方案参考，禁止从保存路径调用。
-    bool markDeletedOnly(QString &sErr);
+    // 删除与新增都走 rewriteArchive() 的完整事务重写：
+    // 临时文件 + 校验 + 替换 + 重新解析 + 备份回滚。
 
 
     static bool parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr);
@@ -150,7 +144,7 @@ private:
     bool openEntrySource(const QString &sFilePath, const FILEINFO &fi,
                          QFile &localFile, qint64 &srcPos, QString &sErr) const;
 
-    // 写 v3 头部（内容 CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
+    // 写 v4 头部（内容 CRC 字段先占位），返回每条 CRC 字段与内容区的文件偏移。
     // pStoredPaths 非空时直接用它作为每条目的存储路径（合并时展开已有归档用）。
     bool writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos,
                             const QString &sRoot, QVector<qint64> &outCrcFieldPos,

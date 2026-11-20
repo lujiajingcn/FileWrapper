@@ -565,41 +565,6 @@ QIcon MainWindow::tabIconForFile(const QString &sFileName)
     return it.value();
 }
 
-// 「缩略图显示」工具按钮图标：2×2 圆角块（左上角用品牌青色强调），
-// 与 view_tree / view_flat 一样是运行期绘制的深蓝线性图标，不新增资源文件。
-static QIcon makeThumbnailViewIcon()
-{
-    QIcon icon;
-    for (int nSize : {20, 24, 32, 40, 48, 64})
-    {
-        QPixmap pm(nSize, nSize);
-        pm.fill(Qt::transparent);
-
-        QPainter painter(&pm);
-        painter.setRenderHint(QPainter::Antialiasing, true);
-        painter.setPen(Qt::NoPen);
-
-        const qreal dGap = nSize * 0.10;
-        const qreal dCell = (nSize - 3.0 * dGap) / 2.0;
-        const QColor clrDark(QStringLiteral("#1F2A3D"));
-        const QColor clrCyan(QStringLiteral("#0FB2FB"));
-        for (int r = 0; r < 2; ++r)
-        {
-            for (int c = 0; c < 2; ++c)
-            {
-                const QRectF rcCell(dGap + c * (dCell + dGap),
-                                    dGap + r * (dCell + dGap), dCell, dCell);
-                painter.setBrush((r == 0 && c == 0) ? clrCyan : clrDark);
-                const qreal dRadius = qMax<qreal>(1.0, nSize * 0.07);
-                painter.drawRoundedRect(rcCell, dRadius, dRadius);
-            }
-        }
-        painter.end();
-        icon.addPixmap(pm);
-    }
-    return icon;
-}
-
 // 窗口标题：归档名 + 未保存标记（和标签页的关闭确认逻辑保持一致）
 void MainWindow::updateWindowTitle()
 {
@@ -636,7 +601,6 @@ MainWindow::MainWindow(QWidget *parent) :
     initWidgetFilePath();
     initWidgetFileContent();
     restoreUiState();
-    purgeLegacyPluginMapSettings();
 
     // 所有停靠窗创建完之后统一处理标题栏按钮（新增停靠窗时在这里能一并覆盖）
     polishDockTitleButtons();
@@ -972,7 +936,7 @@ void MainWindow::initWidgetFilePath()
             this, [this](const QItemSelection &, const QItemSelection &) { syncActionStates(); });
 
     // 图标：统一使用 resources/icons（应用图标同款蓝青风格）
-    setWindowIcon(FwIcons::get(QStringLiteral("appicon")));
+    setWindowIcon(FwIcons::appIcon());
     ui->actionLoadFile->setIcon(FwIcons::get(QStringLiteral("load")));
     ui->actionUnloadFile->setIcon(FwIcons::get(QStringLiteral("unload")));
     ui->actionMergeFile->setIcon(FwIcons::get(QStringLiteral("merge")));
@@ -980,7 +944,7 @@ void MainWindow::initWidgetFilePath()
     ui->actionAbout->setIcon(FwIcons::get(QStringLiteral("about")));
     m_acViewTree->setIcon(FwIcons::get(QStringLiteral("view_tree")));
     m_acViewFlat->setIcon(FwIcons::get(QStringLiteral("view_flat")));
-    m_acViewThumbnail->setIcon(makeThumbnailViewIcon());
+    m_acViewThumbnail->setIcon(FwIcons::get(QStringLiteral("view_thumb")));
     m_acShowFilePath->setIcon(FwIcons::get(QStringLiteral("show_path")));
     m_acShowFileName->setIcon(FwIcons::get(QStringLiteral("show_name")));
     m_acAddFile->setIcon(FwIcons::get(QStringLiteral("add")));
@@ -3342,7 +3306,7 @@ void MainWindow::on_actionMergeFile_triggered()
         dlgProgress.setRange(0, 100);
         dlgProgress.setLabelText(QStringLiteral("正在合并文件..."));
 
-        // 选中的文件里如果有已合并的 .dat：合并时会把它们拆分成条目，而不是当成普通文件
+        // 选中的文件里如果有已合并的归档：合并时会把它们拆分成条目，而不是当成普通文件
         int nArchivedInputs = 0;
         for (const QString &sP : vtFilesPaths)
         {
@@ -5038,16 +5002,14 @@ void MainWindow::restoreUiState()
     if (!geo.isEmpty()) restoreGeometry(geo);
     const QByteArray state = st.value(QStringLiteral("state")).toByteArray();
     if (!state.isEmpty()) restoreState(state);
-    // 新版写 viewMode；旧配置只有 treeMode（true/false），按它回退成树形/平铺。
+    // 只认 viewMode；缺失或非法时回退到默认的树形视图。
     const QString sMode = st.value(QStringLiteral("viewMode")).toString();
     if (sMode == QLatin1String("flat"))
         m_eViewMode = ViewFlat;
     else if (sMode == QLatin1String("thumbnail"))
         m_eViewMode = ViewThumbnail;
-    else if (sMode == QLatin1String("tree"))
-        m_eViewMode = ViewTree;
     else
-        m_eViewMode = st.value(QStringLiteral("treeMode"), true).toBool() ? ViewTree : ViewFlat;
+        m_eViewMode = ViewTree;
     m_bShowPath = st.value(QStringLiteral("showPath"), false).toBool();
     st.endGroup();
     if (m_swFilePathViews != nullptr)
@@ -5057,21 +5019,6 @@ void MainWindow::restoreUiState()
                                                 : static_cast<QWidget *>(m_tvFilePath));
     }
     updateViewActionState();
-}
-
-// 旧版本把「后缀 -> 插件」映射持久化在 QSettings 的 [PluginMap] 组里。
-// 自动路由（内容优先 + 插件声明）已经取代它，运行时不再读取；但残留键会让
-// 用户/排查者误以为它还在生效，所以启动时删一次（之后每次启动都是 no-op）。
-// 只删这一个组：同文件里的 [MainWindow] 与 [PluginEnabled] 仍在使用。
-void MainWindow::purgeLegacyPluginMapSettings()
-{
-    QSettings st(QSettings::IniFormat, QSettings::UserScope,
-                 QStringLiteral("FileWrapper"), QStringLiteral("FileWrapper"));
-    if (!st.childGroups().contains(QStringLiteral("PluginMap"), Qt::CaseSensitive))
-        return;
-    st.remove(QStringLiteral("PluginMap"));
-    st.sync();
-    qInfo() << "[Settings] 已清理废弃的「插件映射」配置（[PluginMap]）";
 }
 
 void MainWindow::saveUiState()
@@ -5085,8 +5032,6 @@ void MainWindow::saveUiState()
                         : (m_eViewMode == ViewFlat)      ? QStringLiteral("flat")
                                                          : QStringLiteral("tree");
     st.setValue(QStringLiteral("viewMode"), sMode);
-    // 兼容旧版读取逻辑（只认 treeMode）：平铺/缩略图都按"非树形"保存
-    st.setValue(QStringLiteral("treeMode"), m_eViewMode == ViewTree);
     st.setValue(QStringLiteral("showPath"), m_bShowPath);
     st.endGroup();
 }

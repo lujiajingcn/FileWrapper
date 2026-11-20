@@ -13,8 +13,8 @@ DlgSplitFile::DlgSplitFile(QWidget *parent) :
     ui->setupUi(this);
     ui->btnMergedFilePath->setIcon(FwIcons::get(QStringLiteral("browse")));
     ui->btnSplittedFileDir->setIcon(FwIcons::get(QStringLiteral("browse")));
-    ui->btnOk->setIcon(FwIcons::get(QStringLiteral("ok")));
-    ui->btnCancel->setIcon(FwIcons::get(QStringLiteral("cancel")));
+    // 确定/取消是对话框的默认按钮（主题里 :default 为实心蓝底），图标是固定深色，
+    // 放上去会和蓝底糊在一起；按钮文字本身已经足够清楚，这里只保留操作类按钮的图标。
 
     // 固定 1000px 在 1366@150%/1920@200% 下会超出可用区，右侧按钮被裁。
     int w = 1000;

@@ -713,20 +713,22 @@ def crc32_bytes(data):
 
 
 def build_fwda(entries, root=""):
-    """按 FWDA v2 布局生成归档字节（entries: [(相对路径, 内容 bytes)]）。
+    """按 FWDA 当前布局（版本 4）生成归档字节（entries: [(相对路径, 内容 bytes)]）。
 
     布局与 FileWrapper/archiveformat.h、filemanager.cpp 的 parseFromDevice 一致：
-      全局头 24B: magic | version=2 | headerSize | fileCount | headerChecksum | reserved
-      头部区    : rootLen + root(UTF-8)；每条 pathLen|size|contentPos|contentCrc32|path
+      全局头 24B: magic | version=4 | headerSize | fileCount | headerChecksum | reserved
+      头部区    : rootLen + root(UTF-8)；每条
+                  pathLen|size|contentPos|contentCrc32|created|modified|accessed|attributes|tagCount|path
+                  （测试素材不需要时间/属性/标记，统一写 0）
       headerChecksum = CRC32(全局头[0..15] + 全局头[20..23] + 头部区)
     """
     root_b = root.encode("utf-8")
-    entry_fixed = 4 + 8 + 8 + 4
+    entry_fixed = 4 + 8 + 8 + 4 + 8 + 8 + 8 + 4 + 4
     hsize = (24 + 4 + len(root_b)
              + sum(entry_fixed + len(p.encode("utf-8")) for p, _ in entries))
 
     out = bytearray(FWDA_MAGIC)
-    out += struct.pack("<III", 2, hsize, len(entries))
+    out += struct.pack("<III", 4, hsize, len(entries))
     out += b"\x00\x00\x00\x00"      # headerChecksum 占位
     out += b"\x00\x00\x00\x00"      # reserved
     out += struct.pack("<I", len(root_b))
@@ -739,6 +741,9 @@ def build_fwda(entries, root=""):
         out += struct.pack("<Q", len(data))
         out += struct.pack("<Q", pos)
         out += struct.pack("<I", crc32_bytes(data))
+        out += struct.pack("<QQQ", 0, 0, 0)   # created / modified / accessed
+        out += struct.pack("<I", 0)           # attributes
+        out += struct.pack("<I", 0)           # tagCount
         out += path_b
         pos += len(data)
 
@@ -750,26 +755,26 @@ def build_fwda(entries, root=""):
     return bytes(out)
 
 
-def make_rooted_dat():
+def make_rooted_archive():
     """一个 root 不是当前盘符的归档：用来验证合并展开后路径归属不会被改挂。
 
     root 故意写成 D:/testfiles_copy（与测试素材所在的 E: 不同盘），
     条目 a/file1.txt 合并后应仍保留 D/testfiles_copy/... 的来源信息。
     """
-    path = os.path.join(WORK, "rooted.dat")
+    path = os.path.join(WORK, "rooted.fwda")
     with open(path, "wb") as f:
         f.write(build_fwda([("a/file1.txt", b"rooted archive entry")],
                            root="D:/testfiles_copy"))
     return path
 
 
-def make_dup_paths_dat():
-    """两条相对路径完全相同的归档：用于验证保存时的重复路径拦截。
+def make_dup_paths_archive():
+    """两条相对路径完全相同的归档：用于验证加载时的重复路径拦截。
 
-    真实场景来自旧版"添加外部文件后保存"：root 为空时条目被拍平成文件名，
-    不同目录的同名文件会撞成同一路径，保存后无法区分。
+    手工构造的归档可能出现同一路径两条记录；加载必须拒绝，
+    否则 QMap 单值覆盖后两行显示同一内容、删一条会让幸存条目变成"归档内未找到"。
     """
-    path = os.path.join(WORK, "dup_paths.dat")
+    path = os.path.join(WORK, "dup_paths.fwda")
     with open(path, "wb") as f:
         f.write(build_fwda([("same.bin", b"first copy"), ("same.bin", b"second copy")]))
     return path
@@ -845,8 +850,8 @@ if __name__ == "__main__":
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     for fn in (make_html, make_odt, make_svg, make_webp, make_rtf,
-               make_ods, make_odp, make_xlsx, make_pptx, make_rooted_dat,
-               make_dup_paths_dat, make_opc_percent_docx,
+               make_ods, make_odp, make_xlsx, make_pptx, make_rooted_archive,
+               make_dup_paths_archive, make_opc_percent_docx,
                make_opc_percent_pptx, make_opc_percent_xlsx, make_odt_repeat):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")

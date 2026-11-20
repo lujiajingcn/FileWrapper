@@ -21,7 +21,6 @@
 //    不会出现「界面上是一套、复制出来是另一套」；
 //  * 文件夹的大小与数量统计的是**当前列表里可见的子树**；筛选状态下只统计匹配项，
 //    因此 Data::bFiltered 为真时界面与复制文本都会明确写出统计范围。
-//  * FWDA 格式不保存条目的修改时间，这里就不显示时间字段（不编造一个空值）。
 class DlgFileProperty : public QDialog
 {
     Q_OBJECT
@@ -38,15 +37,15 @@ public:
         int     nDirCount = 0;         // 文件夹：包含的子文件夹数（递归）
         bool    bFiltered = false;     // 大小/数量是否来自当前搜索筛选结果
 
-        QStringList listTags;          // v4 条目标记（v1–v3 归档为空）
+        QStringList listTags;          // 条目标记
         QString sArchivePath;          // 所属归档的完整路径
-        quint32 nArchiveVersion = 0;   // 1 / 2 / 3 / 4
+        quint32 nArchiveVersion = 0;   // 归档格式版本（当前固定为 4）
         QString sEntryPath;            // 归档内路径（FILEINFO::sFilePath）
         bool    bPending = false;      // 新增条目，尚未保存进归档
         bool    bHasCrc = false;
         quint32 nCrc = 0;
 
-        // v3 文件系统元数据（v1/v2 或来源归档没有记录时 bHasFsMetadata=false）
+        // 文件系统元数据（源文件没有可用信息时 bHasFsMetadata=false）
         bool    bHasFsMetadata = false;
         qint64  nCreatedTime = 0;      // UTC 毫秒，0 = 未知
         qint64  nModifiedTime = 0;
