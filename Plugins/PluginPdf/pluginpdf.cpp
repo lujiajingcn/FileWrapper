@@ -4,6 +4,10 @@
 
 bool PluginPdf::showFile(const PluginFile &file)
 {
+    if (m_wMainWindow == nullptr)
+        return false;
+    m_wMainWindow->clearLastError();   // 不回报上一次打开留下的陈旧原因
+
     if (file.isPath())
     {
         if (file.path().isEmpty() || !QFileInfo::exists(file.path()))
@@ -14,8 +18,12 @@ bool PluginPdf::showFile(const PluginFile &file)
     const QByteArray &data = file.memory();
     if (data.isEmpty())
         return false;
-    m_wMainWindow->showPdf(const_cast<char *>(data.constData()), data.size());
-    return true;
+    return m_wMainWindow->showPdf(const_cast<char *>(data.constData()), data.size());
+}
+
+QString PluginPdf::lastError() const
+{
+    return m_wMainWindow ? m_wMainWindow->lastError() : QString();
 }
 
 bool PluginPdf::prefersFileByPath() const
@@ -26,7 +34,10 @@ bool PluginPdf::prefersFileByPath() const
 bool PluginPdf::sendFileByPath(const QString &path, const QString &displayName)
 {
     Q_UNUSED(displayName);
-    if (path.isEmpty() || !QFileInfo::exists(path) || m_wMainWindow == nullptr)
+    if (m_wMainWindow == nullptr)
+        return false;
+    m_wMainWindow->clearLastError();   // 同上：每次打开尝试都从"没有原因"开始
+    if (path.isEmpty() || !QFileInfo::exists(path))
         return false;
     return m_wMainWindow->showPdfFile(path);
 }

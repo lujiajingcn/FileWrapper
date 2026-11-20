@@ -54,6 +54,8 @@ public:
     bool isValid() const { return m_ok; }
 
     QStringList entryNames() const;
+    // 中央目录条目数（不解压）。调用方据此按实际条目数放宽 ParseBudget::maxExtractions。
+    int         entryCount() const { return int(m_entries.size()); }
     bool        contains(const QString &name) const;   // 归一化后不区分大小写匹配
     QByteArray  entry(const QString &name) const;       // 归一化匹配并解压
 

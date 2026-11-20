@@ -17,7 +17,7 @@
 // 并同步到所有插件 JSON 里的 "apiVersion"。
 //
 // 为什么需要：主程序与插件是两个二进制，各自编译。接口从最初的 2 个纯虚一路长到
-// 现在 10 个虚函数，每次增加虚函数都是一次 ABI 断裂 —— 「旧插件 DLL + 新主程序」时，
+// 现在 14 个虚函数（另有虚析构），每次增加虚函数都是一次 ABI 断裂 —— 「旧插件 DLL + 新主程序」时，
 // 主程序调用新虚函数会越界访问旧插件的虚函数表（UB/崩溃），而 qobject_cast 仍会成功，
 // 表现为"能加载、一用就崩"。版本不一致时，编译器/链接器都不会报错。
 //
@@ -35,8 +35,10 @@
 //   5  新增 stopPlaybackAndWait()：停止后台线程并确认可安全 unmap（M-04）
 //   6  新增 lastError()：打开失败时插件回报**真实原因**（例如"没有可用的音频
 //      输出设备"），取代宿主统一显示的"插件无法显示该文件"（见 lastError）
+//   7  新增 isPlaybackStopped()：停播超时后宿主可非阻塞地复查后台线程是否已
+//      自行退出，从而解除 m_setStopUnsafe，恢复保存/重载（见 isPlaybackStopped）
 // ============================================================================
-#define PLUGIN_API_VERSION 6
+#define PLUGIN_API_VERSION 7
 
 // ==================== 文件数据载体（C2） ====================
 //
@@ -174,6 +176,15 @@ public:
     virtual bool stopPlaybackAndWait() { stopPlayback(); return true; }
     // 该插件是否存在「后台播放」（音视频解码线程 / 音频输出等持续占用的运行态）。
     virtual bool hasBackgroundPlayback() const { return false; }
+
+    // —— v7：停播超时后的非阻塞复查 ——
+    // stopPlaybackAndWait() 返回 false 后，宿主会把实例记为 unsafe 并禁止
+    // unmap/delete/卸载 DLL。但后台线程可能过一会儿才真正退出；宿主需要一个
+    // **不阻塞 GUI** 的查询来解除这个状态。默认实现按 hasBackgroundPlayback()
+    // 保守判断：没有后台播放的插件恒为 true；声称有后台播放却没重写本函数的
+    // 插件返回 false（宁可继续保留，也不误放行）。
+    // 约定：只有确认此刻起不会再访问宿主的映射/临时文件时才能返回 true。
+    virtual bool isPlaybackStopped() const { return !hasBackgroundPlayback(); }
 
     // 由主程序在「新建标签页 / 在该标签页打开文件」时调用：创建独立的插件实例。
     // 必须实现（B2）：返回空会被主程序当作"打开失败"，不允许退化成共享实例。

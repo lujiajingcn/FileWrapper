@@ -58,6 +58,13 @@ if ($outRoot -ne '' -and $outFull -ieq $outRoot) { Fail "OutDir must not be a dr
 # start with "$outFull\", which is never true when both paths are equal.
 # Without this, -OutDir pointing at the repo root would recursively delete it.
 if ($outFull -ieq $repoRoot) { Fail "OutDir must not be the repository root: $OutDir" }
+# Refuse any directory *inside* the repository as well.  The equality check above
+# alone still allowed -OutDir <repo>\.git (or any source subdirectory) to reach
+# the recursive delete below: a descendant is neither equal to nor an ancestor of
+# the repo root, so the StartsWith() guard did not catch it.
+if ($outFull.ToLowerInvariant().StartsWith($repoRoot.ToLowerInvariant() + '\')) {
+    Fail "OutDir must not be inside the repository: $OutDir"
+}
 foreach ($protected in @($buildFull, $repoRoot)) {
     if ($protected.ToLowerInvariant().StartsWith($outFull.ToLowerInvariant() + '\')) {
         Fail "OutDir must not be an ancestor of $protected : $OutDir"
@@ -77,7 +84,7 @@ Set-Content -LiteralPath (Join-Path $OutDir '.filewrapper-package') -Value 'crea
 
 # 1) main binary + plugin folders
 Copy-Item -LiteralPath $exe -Destination $OutDir -Force
-foreach ($sub in @('plugins', 'imageformats', 'multimedia', 'platforms', 'styles')) {
+foreach ($sub in @('plugins', 'imageformats', 'multimedia', 'platforms', 'styles', 'translations')) {
     $src = Join-Path $BuildDir $sub
     if (Test-Path -LiteralPath $src) {
         Copy-Item -LiteralPath $src -Destination (Join-Path $OutDir $sub) -Recurse -Force

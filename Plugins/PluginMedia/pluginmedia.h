@@ -20,6 +20,8 @@ public:
     void stopPlayback() override;
     bool stopPlaybackAndWait() override;
     bool hasBackgroundPlayback() const override;
+    // v7：停播超时后宿主非阻塞复查；解码线程真正退出后返回 true。
+    bool isPlaybackStopped() const override;
 
     // 大文件走文件路径通道，FFmpeg 直接流式读取，避免整块载入内存（P1-2）
     bool prefersFileByPath() const override;

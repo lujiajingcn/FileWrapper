@@ -64,7 +64,7 @@ private:
     bool    loadEpub(const QByteArray &data);
     bool    loadFb2(const QByteArray &data);
     bool    loadMobi(const QByteArray &data);   // 依赖 libmobi（WITH_LIBMOBI）
-    QString fb2ToHtml(const QDomNode &node);
+    QString fb2ToHtml(const QDomNode &node, int nDepth = 0);
 
     // 轻量 XML 解析辅助（避免命名空间带来的 QDomDocument 复杂性）
     QList<QMap<QString, QString>> findTags(const QString &xml, const QString &tag) const;

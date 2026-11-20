@@ -123,12 +123,17 @@ void RtfDocument::reset()
     m_paraLeftPt = 0.0;
     m_paraIndentPt = 0.0;
     m_chars = 0;
+    m_truncated = false;
 }
 
 void RtfDocument::flushParagraph()
 {
     flushRun();
-    if (m_paras.size() >= kMaxParagraphs) return;
+    if (m_paras.size() >= kMaxParagraphs)
+    {
+        m_truncated = true;
+        return;
+    }
     // 对齐/缩进属于刚结束的段落；必须先写入再 append，否则每段都滞后一段。
     m_para.align    = m_paraAlign;
     m_para.leftPt   = m_paraLeftPt;
@@ -160,7 +165,8 @@ void RtfDocument::appendText(const QString &text)
 {
     if (text.isEmpty()) return;
     const int remaining = kMaxChars - m_chars - m_textBuf.size();
-    if (remaining <= 0) return;
+    if (remaining <= 0) { m_truncated = true; return; }
+    if (text.size() > remaining) m_truncated = true;
     m_textBuf += text.left(remaining);   // 单段长文本也必须受 kMaxChars 约束
 }
 
@@ -177,7 +183,9 @@ void RtfDocument::decodePendingBytes()
     const QString decoded = QString::fromLocal8Bit(m_pendingBytes);
     m_pendingBytes.clear();
     const int remaining = kMaxChars - m_chars - m_textBuf.size();
-    if (remaining > 0) m_textBuf += decoded.left(remaining);
+    if (remaining <= 0) { m_truncated = true; return; }
+    if (decoded.size() > remaining) m_truncated = true;
+    m_textBuf += decoded.left(remaining);
 }
 
 // ---- 字体表 / 颜色表：整组跳过渲染，但要先从中取出映射 ----

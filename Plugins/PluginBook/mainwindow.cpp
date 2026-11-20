@@ -3,6 +3,7 @@
 
 #include "zipreader.h"
 #include "xmlguard.h"
+#include "../common/percentdecode.h"
 #include <QLayout>
 #include <QDomDocument>
 #include <QRegularExpression>
@@ -32,7 +33,9 @@ static QString joinPath(const QString &base, const QString &rel)
 {
     // OPF/ZIP 里的 href 是 URL，目录名可能写成 %20/%E4%B8%AD 等；
     // 先百分号解码，否则合法 EPUB 会因条目名不匹配而整章/整图跳过。
-    const QString relDecoded = QUrl::fromPercentEncoding(rel.toUtf8());
+    // 必须用 strict 解码：QUrl::fromPercentEncoding() 会把未转义的 "100%.png"
+    // 解成 "100\uFFFDng"（吃掉 '%' 后两个字符），导致名字里带字面 '%' 的条目查不到。
+    const QString relDecoded = percentDecodeStrict(rel);
     QStringList parts    = base.split('/', Qt::SkipEmptyParts);
     QStringList relParts = relDecoded.split('/', Qt::SkipEmptyParts);
     for (const QString &r : relParts)
@@ -64,7 +67,10 @@ static QString escapeText(const QString &s)
 // - 4096 个条目：正常电子书（含图片）通常远小于此，封顶防止中央目录被灌入海量条目；
 // - 解压后 256 MiB：与 showBook 的整书大小预算一致，且单条目另有 ZipReader 的 64 MiB 上限。
 // 超限时只保留已展开的部分并标记截断，不再继续解压，避免 ZIP bomb 打爆内存。
-static bool expandZipEntries(ZipReader &reader, QMap<QString, QByteArray> &entries)
+// pReason（可选）回传**静态**可读原因（不含条目名，避免被当作 HTML 拼进提示页）；
+// 具体诊断信息（含条目名）只进 qWarning。
+static bool expandZipEntries(ZipReader &reader, QMap<QString, QByteArray> &entries,
+                             QString *pReason = nullptr)
 {
     constexpr int    kMaxEntries    = 4096;
     constexpr qint64 kMaxTotalBytes = 256LL * 1024 * 1024;   // 256 MiB
@@ -78,16 +84,29 @@ static bool expandZipEntries(ZipReader &reader, QMap<QString, QByteArray> &entri
         if (entryCount >= kMaxEntries || totalBytes >= kMaxTotalBytes)
         {
             qWarning() << "[PluginBook] ZIP 条目过多或解压后体积超限，停止展开";
+            if (pReason) *pReason = QStringLiteral("电子书内含条目过多或解压后体积超过上限");
             return false;
         }
         ++entryCount;
 
         const QByteArray entryData = reader.entry(n);
-        if (entryData.isEmpty()) continue;
+        if (entryData.isEmpty())
+        {
+            // entry() 返回空有两种原因：条目本来就是 0 字节，或解压预算拒绝了它。
+            // 后者必须让调用方知道（否则后续章节静默丢失、还被误报成文件损坏）。
+            if (reader.budget().exhausted)
+            {
+                qWarning() << "[PluginBook] ZIP 解压预算用尽，停止展开:" << reader.lastError();
+                if (pReason) *pReason = QStringLiteral("电子书解压预算用尽，后续条目未展开");
+                return false;
+            }
+            continue;
+        }
         const qint64 entryBytes = static_cast<qint64>(entryData.size());
         if (entryBytes > kMaxTotalBytes - totalBytes)
         {
             qWarning() << "[PluginBook] ZIP 条目累计体积超限，停止展开";
+            if (pReason) *pReason = QStringLiteral("电子书解压后体积超过上限");
             return false;
         }
         totalBytes += entryBytes;
@@ -142,6 +161,9 @@ static QString truncationTip(const QObject *owner)
 static constexpr qint64 kMaxImageCompressedBytes = 32LL * 1024 * 1024;    // 32 MiB
 static constexpr qint64 kMaxDecodedImageBytes    = 256LL * 1024 * 1024;   // 256 MiB
 static const char kDecodedImageBytesProperty[]   = "fwBookDecodedImageBytes";
+// FB2 的递归转换必须限制结构深度（与 Word/Sheet/Slides 的 200 同口径）：
+// 只限标签总数挡不住深嵌套，1500 层 <section>（28KB 文件）就能打爆主线程栈。
+static constexpr int kMaxXmlDepth = 200;
 
 static QImage decodeImageWithBudget(const QByteArray &data, qint64 &decodedBytes, bool &limitHit)
 {
@@ -491,11 +513,19 @@ bool MainWindow::loadEpub(const QByteArray &data)
     ZipReader reader;
     if (!reader.open(data)) return false;
 
+    // 提取次数默认上限 2048 低于中央目录条目上限 4096：条目多的 EPUB 会在
+    // 第 2049 次 entry() 处被预算拒绝，后续章节/图片静默丢失。这里按实际
+    // 条目数放宽（+16 余量）；单条/累计字节预算保持不变。
+    if (reader.budget().maxExtractions < reader.entryCount() + 16)
+        reader.budget().maxExtractions = reader.entryCount() + 16;
+
     // 展开条目到内存映射（键为归一化路径，避免前导 '/' 导致查不到）。
     // ZIP bomb 防护：条目数/解压总量上限由 expandZipEntries() 统一提供，
     // 与 FB2 的 .fb2.zip 分支共用；超限时保留已展开部分并标记截断。
-    if (!expandZipEntries(reader, m_entries))
-        markTruncated(this, QStringLiteral("EPUB ZIP 条目超限"));
+    QString zipReason;
+    if (!expandZipEntries(reader, m_entries, &zipReason))
+        markTruncated(this, zipReason.isEmpty()
+                                 ? QStringLiteral("EPUB ZIP 条目超限") : zipReason);
 
     // 定位 OPF：META-INF/container.xml -> rootfile full-path
     QString containerKey;
@@ -646,9 +676,15 @@ bool MainWindow::loadFb2(const QByteArray &data)
         ZipReader reader;
         if (reader.open(data))
         {
+            // 与 EPUB 分支一致：提取次数按实际条目数放宽，避免 2048<4096 的静默截断。
+            if (reader.budget().maxExtractions < reader.entryCount() + 16)
+                reader.budget().maxExtractions = reader.entryCount() + 16;
+
             // 与 EPUB 分支共用条目数/解压总量上限，避免 .fb2.zip 绕过 ZIP bomb 防护。
-            if (!expandZipEntries(reader, m_entries))
-                markTruncated(this, QStringLiteral("FB2 ZIP 条目超限"));
+            QString zipReason;
+            if (!expandZipEntries(reader, m_entries, &zipReason))
+                markTruncated(this, zipReason.isEmpty()
+                                         ? QStringLiteral("FB2 ZIP 条目超限") : zipReason);
             for (const QString &n : reader.entryNames())
             {
                 if (n.endsWith(".fb2", Qt::CaseInsensitive))
@@ -691,7 +727,7 @@ bool MainWindow::loadFb2(const QByteArray &data)
     // 取第一个 <body> 渲染
     QDomNodeList bodies = root.elementsByTagName("body");
     if (bodies.isEmpty()) return false;
-    QString html = fb2ToHtml(bodies.at(0));
+    QString html = fb2ToHtml(bodies.at(0), 0);   // 根调用深度 0，递归内有 kMaxXmlDepth 上限
     if (html.isEmpty()) return false;
 
     m_chapterHtml.append(html);
@@ -830,8 +866,15 @@ bool MainWindow::loadMobi(const QByteArray &data)
 #endif
 }
 
-QString MainWindow::fb2ToHtml(const QDomNode &node)
+QString MainWindow::fb2ToHtml(const QDomNode &node, int nDepth)
 {
+    // 结构过深：停止递归并留下截断原因（否则畸形 FB2 会打爆主线程栈）
+    if (nDepth > kMaxXmlDepth)
+    {
+        markTruncated(this, QStringLiteral("FB2 结构过深，部分内容未显示"));
+        return QString();
+    }
+
     QString out;
     QDomNode child = node.firstChild();
     while (!child.isNull())
@@ -857,7 +900,7 @@ QString MainWindow::fb2ToHtml(const QDomNode &node)
                 if (!href.isEmpty())
                     out += "<img src=\"fb2img://" + href.toHtmlEscaped() + "\">";
             }
-            else out += fb2ToHtml(e); // section 等容器，递归
+            else out += fb2ToHtml(e, nDepth + 1); // section 等容器，递归（带深度上限）
         }
         else if (child.isText())
         {

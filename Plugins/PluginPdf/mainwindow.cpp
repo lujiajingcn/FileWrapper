@@ -7,6 +7,32 @@
 #include <QColor>
 #include <QFont>
 
+namespace {
+// QPdfDocument 的错误码 -> 用户能照做的中文说明。
+// 以前这些原因只进 qWarning，界面只剩「空文档」，用户分不清"文件是空的"
+// 和"文件损坏/加密/读不到"。
+QString pdfErrorText(QPdfDocument::Error err)
+{
+    switch (err)
+    {
+    case QPdfDocument::Error::InvalidFileFormat:
+        return QStringLiteral("不是有效的 PDF 文件（文件已损坏，或扩展名与实际内容不符）。");
+    case QPdfDocument::Error::IncorrectPassword:
+        return QStringLiteral("该 PDF 已加密，需要密码才能打开；当前查看器不支持输入密码。");
+    case QPdfDocument::Error::UnsupportedSecurityScheme:
+        return QStringLiteral("该 PDF 使用了不支持的加密/安全方案，无法显示。");
+    case QPdfDocument::Error::FileNotFound:
+        return QStringLiteral("PDF 文件不存在或无法读取。");
+    case QPdfDocument::Error::DataNotYetAvailable:
+        return QStringLiteral("PDF 数据尚未就绪，无法显示。");
+    case QPdfDocument::Error::None:
+    case QPdfDocument::Error::Unknown:
+        break;
+    }
+    return QStringLiteral("无法解析该 PDF（文件可能已损坏）。");
+}
+} // namespace
+
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::MainWindow)
@@ -46,6 +72,7 @@ void MainWindow::clearContent()
     m_pdfBuf.setData(QByteArray());
     m_nPageCount = 0;
     m_nCurPage = 0;
+    m_lastError.clear();   // 每次打开尝试/清屏都清掉上一次的失败原因
     // P2-10：0 页时给出明确的"空文档"文案，并禁用翻页动作；
     // 页码框同样显示"空文档"，避免出现 "1/0" 这种无意义的页码。
     if (m_lbContent) m_lbContent->setText(tr("空文档"));
@@ -53,7 +80,16 @@ void MainWindow::clearContent()
     setLineEditPageNum();
 }
 
-void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
+// 打开失败：清掉旧画面并把中文原因留在内容区（插件层 lastError() 同时回报宿主）
+void MainWindow::showLoadError(const QString &msg)
+{
+    m_lastError = msg;
+    if (!m_lbContent) return;
+    m_lbContent->setPixmap(QPixmap());   // QLabel 的 pixmap 与 text 互斥，先清图再写字
+    m_lbContent->setText(msg);
+}
+
+bool MainWindow::showPdf(char *szBuf, qint64 nFileLen)
 {
     // 换文件先清掉上一份的画面/页码/文档：任何失败路径都不会残留旧 PDF 页面。
     // 原实现只在 load 失败时 qWarning，而 updatePage() 在 m_nPageCount<=0 时
@@ -61,7 +97,7 @@ void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
     clearContent();
 
     if (szBuf == nullptr || nFileLen <= 0)
-        return;
+        return false;
 
     // 主程序会在 sendFileData 返回后释放原始缓冲区，因此必须复制一份数据。
     // QBuffer::setData() 会在内部保存副本；QPdfDocument::load(QIODevice*) 对
@@ -72,7 +108,8 @@ void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
     if (!m_pdfBuf.open(QIODevice::ReadOnly))
     {
         qWarning() << "[PluginPdf] 无法打开内存 PDF 缓冲区.";
-        return;
+        showLoadError(QStringLiteral("无法打开 PDF 内存缓冲区。"));
+        return false;
     }
 
     m_doc.load(&m_pdfBuf);
@@ -80,12 +117,16 @@ void MainWindow::showPdf(char *szBuf, qint64 nFileLen)
     {
         qWarning() << "[PluginPdf] PDF 加载失败, code =" << int(m_doc.error())
                    << ", pageCount =" << m_doc.pageCount();
-        return;
+        showLoadError(m_doc.error() != QPdfDocument::Error::None
+                          ? pdfErrorText(m_doc.error())
+                          : QStringLiteral("未能读出任何页面（PDF 可能为空或已损坏）。"));
+        return false;
     }
 
     m_nPageCount = m_doc.pageCount();
     m_nCurPage = 0;
     gotoPage();
+    return true;
 }
 
 bool MainWindow::showPdfFile(const QString &sPath)
@@ -94,6 +135,9 @@ bool MainWindow::showPdfFile(const QString &sPath)
     if (m_doc.load(sPath) != QPdfDocument::Error::None || m_doc.pageCount() <= 0)
     {
         qWarning() << "[PluginPdf] 按路径加载 PDF 失败:" << sPath << "code =" << int(m_doc.error());
+        showLoadError(m_doc.error() != QPdfDocument::Error::None
+                          ? pdfErrorText(m_doc.error())
+                          : QStringLiteral("未能读出任何页面（PDF 可能为空或已损坏）。"));
         return false;
     }
     m_nPageCount = m_doc.pageCount();

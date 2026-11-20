@@ -54,6 +54,9 @@ public:
     const QVector<Para> &paragraphs() const { return m_paras; }
     double defaultSizePt() const { return m_defaultSizePt; }
     int    charCount() const { return m_chars; }
+    // 是否因段落/字符上限丢弃了内容（调用方必须把原因写进 RenderResult，
+    // 不能像以前那样固定 truncated=false，让用户以为文档完整）
+    bool   isTruncated() const { return m_truncated; }
 
 private:
     void parse();
@@ -96,6 +99,7 @@ private:
     int            m_ucCount = 1;          // \ucN 的 N（默认为 1）
     int            m_fallbackRemaining = 0;
     int            m_chars = 0;
+    bool           m_truncated = false;
 };
 
 #endif // RTFDOCUMENT_H

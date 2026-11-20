@@ -92,6 +92,7 @@
 #include "pluginmanager.h"
 #include "plugindiag.h"
 #include "zipreader.h"
+#include "xmlguard.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1088,13 +1089,14 @@ static void verifyOtherViewers(const QString &work)
     }
 
     // V6: PluginWord 的 ODT（OpenDocument Text）分支：段落/标题 + 表格
-    if (want("V6", 2))
+    if (want("V6", 3))
     {
         QPluginLoader loader(sPluginDir + QStringLiteral("/PluginWord.dll"));
         PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
         PluginInterface *p = templ ? templ->createInstance() : nullptr;
         bool bText = false;
         bool bTable = false;
+        bool bRepeat = false;
         if (p != nullptr)
         {
             p->setSourceName(QStringLiteral("sample.odt"));
@@ -1110,8 +1112,65 @@ static void verifyOtherViewers(const QString &work)
             }
         }
         delete p;
+
+        // ODT 的 number-rows/columns-repeated：2 行 ×（3 个 R + 1 个 Z）。
+        PluginInterface *pRepeat = templ ? templ->createInstance() : nullptr;
+        if (pRepeat != nullptr)
+        {
+            pRepeat->setSourceName(QStringLiteral("sample_odt_repeat.odt"));
+            const QByteArray data = readFile(work + QStringLiteral("/sample_odt_repeat.odt"));
+            pRepeat->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QApplication::processEvents();
+            QTextDocument *doc = documentOf(pRepeat->getPluginWidget());
+            if (doc != nullptr)
+            {
+                const QString plain = doc->toPlainText();
+                const QString html = doc->toHtml();
+                bRepeat = html.contains(QStringLiteral("<table"))
+                           && plain.count(QLatin1Char('R')) == 6
+                           && plain.count(QLatin1Char('Z')) == 2;
+            }
+            delete pRepeat;
+        }
+
         report(bText, QStringLiteral("V6a: PluginWord renders .odt text (ODF)"));
         report(bTable, QStringLiteral("V6b: PluginWord renders .odt table"));
+        report(bRepeat, QStringLiteral("V6c: ODT number-rows/columns-repeated is materialized"));
+    }
+
+    // V15: OPC 部件名的百分号解码（C3-14 回归）。三个最小包分别把主文档/
+    // 幻灯片/工作表部件名写成 `%20`，ZIP 条目名是字面的空格；如果不做解码，
+    // 三个插件会静默丢正文/整页/整表。
+    if (want("V15", 3))
+    {
+        auto renderText = [&](const QString &sDll, const QString &sFile, QString *psText) {
+            QPluginLoader loader(sPluginDir + QLatin1Char('/') + sDll);
+            PluginInterface *pTemplate = qobject_cast<PluginInterface *>(loader.instance());
+            if (pTemplate == nullptr) return false;
+            PluginInterface *p = pTemplate->createInstance();
+            if (p == nullptr) return false;
+            const QByteArray data = readFile(sFile);
+            p->sendFileData(const_cast<char *>(data.constData()), data.size());
+            QApplication::processEvents();
+            QTextDocument *pDoc = documentOf(p->getPluginWidget());
+            if (pDoc != nullptr && psText != nullptr) *psText = pDoc->toPlainText();
+            delete p;
+            return pDoc != nullptr;
+        };
+
+        QString sWord, sSlides, sSheet;
+        const bool bWord = renderText(QStringLiteral("PluginWord.dll"),
+                                      work + QStringLiteral("/opc_percent.docx"), &sWord);
+        const bool bSlides = renderText(QStringLiteral("PluginSlides.dll"),
+                                        work + QStringLiteral("/opc_percent.pptx"), &sSlides);
+        const bool bSheet = renderText(QStringLiteral("PluginSheet.dll"),
+                                       work + QStringLiteral("/opc_percent.xlsx"), &sSheet);
+        report(bWord && sWord.contains(QStringLiteral("OPC percent word")),
+               QStringLiteral("V15a: docx main part with %20-encoded Target"));
+        report(bSlides && sSlides.contains(QStringLiteral("OPC percent slide")),
+               QStringLiteral("V15b: pptx slide part with %20-encoded Target"));
+        report(bSheet && sSheet.contains(QStringLiteral("OPC percent sheet")),
+               QStringLiteral("V15c: xlsx worksheet part with %20-encoded Target"));
     }
 
     // V7: PluginPicture 解码 WebP（qwebp 已在部署清单里）
@@ -1266,7 +1325,7 @@ static void verifyOtherViewers(const QString &work)
         PluginInterface *templ = qobject_cast<PluginInterface *>(loader.instance());
         PluginInterface *p = templ ? templ->createInstance() : nullptr;
         bool bOpen = false, bPlayingIcon = false, bStopIcon = false;
-        bool bReplayIcon = false, bBadReset = false;
+        bool bReplayIcon = false, bBadReset = false, bStopQuery = false;
         if (p != nullptr)
         {
             // 生成 0.5 秒静音 PCM WAV（合法容器，FFmpeg 可解析）
@@ -1304,10 +1363,12 @@ static void verifyOtherViewers(const QString &work)
             if (!bOpen)
             {
                 QApplication::processEvents();
+                bStopQuery = p->isPlaybackStopped();   // v7：失败复位的实例必须已无后台线程
                 const bool bRejectedCleanly = pTime != nullptr
                         && pTime->text() == QStringLiteral("0:00 / 0:00")
                         && pSlider != nullptr && !pSlider->isEnabled()
-                        && pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+                        && pPlay != nullptr && pPlay->text() == QStringLiteral("▶")
+                        && bStopQuery;
                 note(QStringLiteral("[INFO] V13: no audio device; audio-only open correctly rejected"));
                 report(bRejectedCleanly,
                        QStringLiteral("V13: audio-only open without device fails cleanly"));
@@ -1331,12 +1392,13 @@ static void verifyOtherViewers(const QString &work)
                 if (pStop) pStop->click();
                 QApplication::processEvents();
                 bStopIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("▶");
+                bStopQuery = p->isPlaybackStopped();   // v7：停止确认后必须为 true
 
                 if (pPlay) pPlay->click();   // 从起点重播
                 for (int i = 0; i < 5; ++i) QApplication::processEvents();
                 bReplayIcon = pPlay != nullptr && pPlay->text() == QStringLiteral("⏸");
 
-                report(bPlayingIcon && bStopIcon && bReplayIcon,
+                report(bPlayingIcon && bStopIcon && bReplayIcon && bStopQuery,
                        QStringLiteral("V13: media stop/replay button"));
             }
 
@@ -3272,15 +3334,56 @@ static void verifyAudit2026Fixes(const QString &work, const QString &scratchDir)
         const bool bHeld = held.open(QIODevice::WriteOnly | QIODevice::NewOnly);
         held.write(QByteArray::number(qint64(QCoreApplication::applicationPid())));
         held.close();
+
+        auto runMerge = [&](bool *pbDone, bool *pbOk, QString *psMsg) {
+            *pbDone = false; *pbOk = true; psMsg->clear();
+            FileManager fm;
+            QObject::connect(&fm, &FileManager::operationFinished,
+                             [=](bool o, const QString &m) { *pbDone = true; *pbOk = o; *psMsg = m; });
+            fm.QMergeFiles(QVector<QString>{in}, out);
+        };
+
         bool bDone = false, bOk = true;
         QString sMsg;
-        FileManager fm;
-        QObject::connect(&fm, &FileManager::operationFinished,
-                         [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
-        fm.QMergeFiles(QVector<QString>{in}, out);
+        runMerge(&bDone, &bOk, &sMsg);
+        const bool bFreshRejected = bHeld && bDone && !bOk && sMsg.contains(QStringLiteral("实例"));
+
+        // 锁龄超过 30 秒，但 PID 仍是当前存活进程：不能把活锁当崩溃残留删掉。
+        // 旧实现只看 mtime，长保存（几 GB）会被第二个实例抢锁。
+        QFile ageLock(lockPath);
+        const bool bAged = ageLock.open(QIODevice::ReadWrite);
+        if (bAged)
+            ageLock.setFileTime(QDateTime::currentDateTime().addSecs(-40),
+                                QFileDevice::FileModificationTime);
+        ageLock.close();
+        bool bDone2 = false, bOk2 = true;
+        QString sMsg2;
+        runMerge(&bDone2, &bOk2, &sMsg2);
+        const bool bAliveStillRejected = bAged && bDone2 && !bOk2
+                                         && sMsg2.contains(QStringLiteral("实例"));
+
+        // 换成“已退出进程”的 PID + 陈旧时间：才允许清理并继续。
+        QFile deadLock(lockPath);
+        const bool bDeadWritten = deadLock.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        if (bDeadWritten)
+        {
+            deadLock.write("2147483647");
+            deadLock.close();
+        }
+        QFile deadAge(lockPath);
+        if (deadAge.open(QIODevice::ReadWrite))
+            deadAge.setFileTime(QDateTime::currentDateTime().addSecs(-40),
+                                QFileDevice::FileModificationTime);
+        deadAge.close();
+        bool bDone3 = false, bOk3 = false;
+        QString sMsg3;
+        runMerge(&bDone3, &bOk3, &sMsg3);
         QFile::remove(lockPath);
-        report(bHeld && bDone && !bOk && sMsg.contains(QStringLiteral("实例")),
-               QStringLiteral("AUDIT-P0-1: output write lock rejects a concurrent writer"));
+        const bool bStaleReclaimed = bDeadWritten && bDone3 && bOk3
+                                     && QFileInfo::exists(out);
+
+        report(bFreshRejected && bAliveStillRejected && bStaleReclaimed,
+               QStringLiteral("AUDIT-P0-1: lock rejects live writer even when old; reclaims dead stale lock"));
     }
 
     // ---- A5: 二次合并必须校验来源内容 CRC（P1-2）----
@@ -3448,8 +3551,28 @@ static void verifyAudit2026Fixes(const QString &work, const QString &scratchDir)
         const bool bRejectedBudget = bOpenBig && bigData.isEmpty()
                                      && overBudget.budget().exhausted;
 
-        report(bGood && bRejectedCrc && bRejectedBudget,
-               QStringLiteral("AUDIT-P1-12/P2-3: ZipReader verifies CRC and enforces budget"));
+        // 声明 0 字节却带压缩数据：不能解出内容，更不能按 0 字节计入预算。
+        ZipReader zeroDeclared;
+        const bool bOpenZero = zeroDeclared.open(buildStoredZip(name, payload, 0u));
+        const QByteArray zeroData = zeroDeclared.entry(QString::fromLatin1(name));
+        const bool bRejectedZero = bOpenZero && zeroData.isEmpty()
+                                   && zeroDeclared.budget().totalBytes == 0;
+
+        report(bGood && bRejectedCrc && bRejectedBudget && bRejectedZero,
+               QStringLiteral("AUDIT-P1-12/P2-3: ZipReader verifies CRC, budget and zero-length lie"));
+    }
+
+    // ---- A12: XML 属性放大（QDom 的二次方属性插入）----
+    {
+        QByteArray oneTag("<r");
+        for (int i = 0; i < 5000; ++i)
+            oneTag += " a" + QByteArray::number(i) + "=\"v\"";
+        oneTag += "/>";
+        const bool bRejected = !xmlWithinTagBudget(oneTag);
+        const bool bNormal = xmlWithinTagBudget(
+            QByteArray("<r a=\"1\" b='2'><c/></r>"));
+        report(bRejected && bNormal,
+               QStringLiteral("AUDIT-XMLGUARD: per-element attribute bomb rejected, normal XML accepted"));
     }
 }
 

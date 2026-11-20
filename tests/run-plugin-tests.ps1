@@ -23,7 +23,8 @@ param(
     [ValidateSet('debug','release')][string]$Config = 'debug',
     [switch]$SkipProjectBuild,
     [switch]$RegenerateFixtures,
-    [switch]$SkipShots
+    [switch]$SkipShots,
+    [int]$TimeoutSec = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,7 +156,8 @@ try {
     $LogDir = Join-Path $BuildRoot 'logs'
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $LogPath = Join-Path $LogDir 'plugin_tests.log'
-    # 每次运行前清掉旧日志：测试崩溃/提前 return 时不能让上次的 RESULT 冒充本次结果
+    # Delete the old log first: if the test crashes/returns early, an old RESULT
+    # must not be mistaken for this run's result.
     if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
     $ShotsDir = Join-Path $BuildRoot 'shots'
     if (-not $SkipShots) { New-Item -ItemType Directory -Force -Path $ShotsDir | Out-Null }
@@ -168,9 +170,36 @@ try {
     if (-not $SkipShots) { $testArgs += @('--shots', $ShotsDir) }
     $testArgs += '--integrate'
 
-    Step "running tests"
-    & $TestExe @testArgs
-    $rc = $LASTEXITCODE
+    Step "running tests (timeout ${TimeoutSec}s)"
+    # Do not invoke the GUI test executable with `&`: if it deadlocks or opens a
+    # modal dialog, the runner would hang forever and never print RESULT.  Use a
+    # child process with an explicit .NET WaitForExit(ms) timeout (Wait-Process
+    # -Timeout is PowerShell 7 only), then kill its process tree on expiry.
+    $argLine = ($testArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+
+    # ProcessStartInfo (not Start-Process -NoNewWindow) is used because in
+    # Windows PowerShell 5.1 a redirected / NoNewWindow child can leave
+    # Process.ExitCode empty even after WaitForExit.  This form reliably exposes
+    # ExitCode after WaitForExit(ms), which the runner must report.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $TestExe
+    $psi.Arguments = $argLine
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $timeoutMs = [int]([Math]::Max(1, $TimeoutSec) * 1000)
+    $exited = $p.WaitForExit($timeoutMs)
+    if (-not $exited) {
+        Write-Host "   TIMEOUT after ${TimeoutSec}s; killing process tree (pid $($p.Id))" -ForegroundColor Red
+        & taskkill.exe /PID $p.Id /T /F 2>$null | Out-Null
+        $p.WaitForExit(5000) | Out-Null
+        $rc = 124
+    } else {
+        $rc = $p.ExitCode
+    }
+    $p.Dispose()
 
     # ---------------------------------------------------------------- summary
     Write-Host ""
@@ -179,7 +208,10 @@ try {
         Select-String -Path $LogPath -Pattern '^RESULT:' | ForEach-Object { Write-Host ("   " + $_.Line) -ForegroundColor Green }
         Write-Host "   log  : $LogPath"
     } else {
-        Write-Host "   NO RESULT LOG (test crashed or exited early)" -ForegroundColor Red
+        Write-Host "   NO RESULT LOG (test crashed, timed out or exited early)" -ForegroundColor Red
+    }
+    if ($rc -eq 124) {
+        Write-Host "   RESULT: TIMEOUT (process tree killed)" -ForegroundColor Red
     }
     if (-not $SkipShots) { Write-Host "   shots: $ShotsDir" }
     Write-Host "   exit : $rc"

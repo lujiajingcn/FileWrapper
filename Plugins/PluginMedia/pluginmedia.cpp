@@ -68,6 +68,11 @@ bool PluginMedia::stopPlaybackAndWait()
     return m_wMainWindow ? m_wMainWindow->stopPlaybackAndWait() : true;
 }
 
+bool PluginMedia::isPlaybackStopped() const
+{
+    return m_wMainWindow ? m_wMainWindow->isPlaybackStopped() : true;
+}
+
 void PluginMedia::stopPlayback()
 {
     if (m_wMainWindow)

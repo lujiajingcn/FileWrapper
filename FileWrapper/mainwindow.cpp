@@ -34,6 +34,7 @@
 #include <QHBoxLayout>
 #include <QSet>
 #include <functional>
+#include <new>
 #include <QList>
 #include <QMap>
 #include <QStyle>
@@ -48,6 +49,9 @@
 #include <QCloseEvent>
 #include <QLineEdit>
 #include <QTimer>
+#include <QThread>
+#include <QThreadPool>
+#include <QRunnable>
 #include <QEventLoop>
 #include <QFile>
 #include <QMutexLocker>
@@ -74,15 +78,24 @@ static const qint64 kLargeFileThreshold = 128LL * 1024 * 1024;
 // 文件列表「文件路径」列的最小宽度：面板再窄也保留这么宽，超出部分交给横向滚动条
 static const int kMinPathColumnWidth = 140;
 
-// 缩略图：网格里显示的图标边长（逻辑像素），解码时按 2 倍像素生成，
-// 150%/200% 缩放下也不会因为放大而发糊。
+// 缩略图：网格里显示的图标是 96 逻辑像素。解码尺寸取 128：既比显示尺寸大一点、
+// 缩小时仍然清晰，又不至于像 2x（192）那样每张固定 147 KiB。模型项会长期持有
+// QIcon（缓存 clear() 并不会释放它们），所以这个像素尺寸直接决定大归档的内存
+// 上限；128×128 ARGB32 约 64 KiB/张。
 static const int kThumbnailIconSize  = 96;
-static const int kThumbnailPixelSize = kThumbnailIconSize * 2;
+static const int kThumbnailPixelSize = 128;
 // 单张图片条目的预算：超过后不再整块读进内存解码（宁可显示类型角标也不卡死界面）
 static const qint64 kThumbnailMaxBytes  = 32LL * 1024 * 1024;
 static const qint64 kThumbnailMaxPixels = 40LL * 1000 * 1000;
-// 缩略图内存缓存条数上限：超过后丢弃旧缓存（当前已在模型里的 QIcon 不受影响）
-static const int kThumbnailCacheLimit = 1024;
+// 每次重建视图最多生成多少张缩略图。项目图标由 QStandardItem 持有，
+// 只清 QHash 缓存不会释放它们；必须有“本轮生成总数”上限，否则一万张图片
+// 会线性吃过 GB 内存。超过上限后其余条目保留类型角标，用户可用筛选缩小范围。
+static const int kThumbnailMaxGenerated = 1024;
+static const int kThumbnailCacheLimit   = 1024;
+// 后台同时读取/解码的张数。固定为 1：单张 40 MP 图仍可能先解出约 160 MiB
+// 再缩放，两个并发就会把峰值翻倍；缩略图本来只是预览，没必要用内存换吞吐。
+// 保存前也最多只需等这一个任务，等待时间可控。
+static const int kThumbnailMaxInFlight  = 1;
 
 // 列表项是否为“文件叶子节点”：只有文件节点携带 FILEINFO，目录节点不带数据
 static bool isFileLeafItem(const QStandardItem *pItem)
@@ -591,6 +604,16 @@ MainWindow::MainWindow(QWidget *parent) :
 {
     ui->setupUi(this);
 
+    // 缩略图解码离开 GUI 线程：专职线程池，单并发（另见 kThumbnailMaxInFlight）。
+    m_thumbPool = new QThreadPool(this);
+    m_thumbPool->setMaxThreadCount(kThumbnailMaxInFlight);
+
+    // 停播超时后的非阻塞复查：不再次阻塞等插件，只轮询 isPlaybackStopped()。
+    m_stopUnsafePoll = new QTimer(this);
+    m_stopUnsafePoll->setInterval(1000);
+    connect(m_stopUnsafePoll, &QTimer::timeout,
+            this, &MainWindow::pollStopUnsafeInstances);
+
     // 文件管理器需先于视图初始化：视图初始化时会查询“归档是否已加载”来设置工具栏可用状态
     m_fileManager = new FileManager;
 
@@ -688,6 +711,14 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
+    if (m_stopUnsafePoll != nullptr)
+        m_stopUnsafePoll->stop();
+
+    // 缩略图任务也会打开归档文件；先作废代数并等它们读完，再销毁窗口/线程池。
+    // QPointer 在任务回调里校验窗口是否还活着，等待失败时任务也不会访问已销毁的 this。
+    cancelThumbnailGeneration();
+    waitForThumbnailReads(3000);
+
     // 后台 CRC 线程可能仍在读归档并通过 qApp 投递回调：析构前先请求中止并等它退出，
     // 避免析构期间回调再去访问窗口状态。
     waitForMappedCrc(3000);
@@ -1565,12 +1596,13 @@ void MainWindow::reloadAllPlugins()
         m_pCurrentInterface = nullptr;
     }
     closeAllTabs();                        // 销毁标签页持有的插件实例
+    pollStopUnsafeInstances();             // 后台线程可能已自行退出，先复查一次
     if (!m_vtDeferredInstances.isEmpty() || !m_setStopUnsafe.isEmpty())
     {
         // P0-3：仍有实例停播未确认 —— 卸载 DLL 会让后台线程执行已卸载代码
         QMessageBox::warning(this, QStringLiteral("重新加载插件"),
             QStringLiteral("有插件的后台播放未能确认停止，为避免访问已卸载的代码，\n"
-                           "本次不重新加载插件。请稍后重试或重启程序。"));
+                           "本次不重新加载插件。程序会每秒自动复查，也可稍后重试。"));
         return;
     }
     m_setWarnedPlugins.clear();
@@ -1841,8 +1873,13 @@ bool MainWindow::ensureInstanceStopped(PluginInterface *iface)
         return true;
 
     // 已经确认停不下来：不再重复等待几十秒；实例保持延期清理状态。
+    // 轮询器会继续用 isPlaybackStopped() 非阻塞地复查，后台线程退出后自动解除。
     if (m_setStopUnsafe.contains(iface))
+    {
+        if (m_stopUnsafePoll != nullptr && !m_stopUnsafePoll->isActive())
+            m_stopUnsafePoll->start();
         return false;
+    }
 
     if (m_pCurrentInterface == iface)
         m_pCurrentInterface = nullptr;
@@ -1850,6 +1887,8 @@ bool MainWindow::ensureInstanceStopped(PluginInterface *iface)
     if (!iface->stopPlaybackAndWait())
     {
         m_setStopUnsafe.insert(iface);
+        if (m_stopUnsafePoll != nullptr && !m_stopUnsafePoll->isActive())
+            m_stopUnsafePoll->start();
         qWarning() << "[Lifecycle] 插件停播未确认，保留映射与实例:"
                    << static_cast<const void *>(iface);
         return false;
@@ -1886,6 +1925,71 @@ bool MainWindow::ensureAllInstancesStopped()
         }
     }
     return bAllSafe;
+}
+
+// 每秒调用一次（只在存在 unsafe 实例时运行）。只问插件“后台线程退出了吗”，
+// 不调用 stopPlaybackAndWait()，因此不会把 GUI 再阻塞 30 秒。
+void MainWindow::pollStopUnsafeInstances()
+{
+    if (m_setStopUnsafe.isEmpty())
+    {
+        if (m_stopUnsafePoll != nullptr)
+            m_stopUnsafePoll->stop();
+        return;
+    }
+
+    bool bRecovered = false;
+    for (auto it = m_setStopUnsafe.begin(); it != m_setStopUnsafe.end(); )
+    {
+        PluginInterface *pIface = *it;
+        if (pIface == nullptr)
+        {
+            it = m_setStopUnsafe.erase(it);
+            continue;
+        }
+        // v7 契约：true = 此刻起不会再访问宿主映射/临时文件。
+        if (pIface->isPlaybackStopped())
+        {
+            it = m_setStopUnsafe.erase(it);
+            releaseMappedInput(pIface);   // 已不在 unsafe 集合，这里会真正 unmap
+            bRecovered = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    if (!bRecovered)
+        return;
+
+    // 延期实例里已经安全的，可以真正销毁（它们已从标签页摘除）。
+    for (int i = m_vtDeferredInstances.size() - 1; i >= 0; --i)
+    {
+        PluginInterface *pIface = m_vtDeferredInstances.at(i);
+        if (pIface == nullptr)
+        {
+            m_vtDeferredInstances.removeAt(i);
+            continue;
+        }
+        if (m_setStopUnsafe.contains(pIface) || !pIface->isPlaybackStopped())
+            continue;
+        QWidget *pWidget = pIface->getPluginWidget();
+        m_vtDeferredInstances.removeAt(i);
+        if (pWidget != nullptr)
+            m_setPluginWidgets.remove(pWidget);
+        delete pIface;
+    }
+
+    if (m_setStopUnsafe.isEmpty() && m_vtDeferredInstances.isEmpty())
+    {
+        if (m_stopUnsafePoll != nullptr)
+            m_stopUnsafePoll->stop();
+        PluginManager::getInstance()->setUnloadEnabled(true);
+        statusBar()->showMessage(
+            tr("后台播放已停止，保存/重新加载插件功能已恢复"), 5000);
+        qWarning() << "[Lifecycle] 停播超时实例已自行退出，已解除 unsafe 状态";
+    }
 }
 
 // 销毁某个标签页：先把页面从 tabWidget 摘下，再释放该页独占的插件实例（连带销毁其内部窗口），
@@ -2080,13 +2184,20 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
             if (pArc->open(QIODevice::ReadOnly))
             {
                 uchar *pMapped = pArc->map(info.nContentPositon, info.nFileLen);
-                const bool bMappedAccepted = (pMapped != nullptr
-                    && iface->sendFileMapped(reinterpret_cast<char *>(pMapped),
-                                             info.nFileLen, info.sFileName));
-                // v6：插件可能已经**认出**文件但播不了（没有音频输出设备、解码器
-                // 不支持该编码…）。这种失败再抽一遍临时文件重试毫无意义，还可能白写
-                // 几 GB；必须把插件给的真实原因直接说出去。
-                const QString sMappedWhy = bMappedAccepted ? QString() : iface->lastError().trimmed();
+                bool bMappedAccepted = false;
+                QString sMappedWhy;
+                if (pMapped != nullptr)
+                {
+                    bMappedAccepted = iface->sendFileMapped(
+                        reinterpret_cast<char *>(pMapped), info.nFileLen, info.sFileName);
+                    // v6：插件可能已经**认出**文件但播不了（没有音频输出设备、解码器
+                    // 不支持该编码…）。这种失败再抽一遍临时文件重试毫无意义，还可能白写
+                    // 几 GB；必须把插件给的真实原因直接说出去。
+                    if (!bMappedAccepted)
+                        sMappedWhy = iface->lastError().trimmed();
+                }
+                // pMapped == nullptr 时插件根本没被调用：不能去读 lastError()，
+                // 那可能是上一个文件留下的原因，会误报并跳过本可成功的临时文件回退。
                 if (bMappedAccepted)
                 {
                     // 先交给插件开始播放；CRC 改为后台校验，不阻塞首帧。
@@ -2388,6 +2499,15 @@ void MainWindow::releaseMappedInput(PluginInterface *iface)
 {
     if (iface == nullptr)
         return;
+    // P0-3 的不变量：停播未确认的实例，其映射可能仍被后台解码线程读取。
+    // releaseAllMappedInputs() 已经这样保护；releaseMappedInput() 的调用点
+    // （打开失败/换文件/关闭标签）也必须一致，否则一次 stopPlaybackAndWait
+    // 超时后 unmap 会让卡住的 worker 读到悬空内存。
+    if (m_setStopUnsafe.contains(iface))
+    {
+        qWarning() << "[Lifecycle] 停播未确认，保留内存映射不释放";
+        return;
+    }
     m_mapMappedInputs.remove(iface);
 }
 
@@ -2949,13 +3069,22 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
             stopCurrentPlaybackAndInvalidate();
             releaseAllMappedInputs();
         }
-        // P0-3：仍有停播未确认的实例时，映射不能释放，归档也无法安全替换
+        // P0-3：仍有停播未确认的实例时，映射不能释放，归档也无法安全替换。
+        // 先做一次非阻塞复查：后台线程可能刚好在等待期间退出了。
+        pollStopUnsafeInstances();
         if (!m_setStopUnsafe.isEmpty())
         {
             QMessageBox::warning(this, tr("保存失败"),
                 tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
                    "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
-                   "请稍后重试，或关闭正在播放的标签页。"));
+                   "程序会每秒自动复查；也可关闭正在播放的标签页后重试。"));
+            return false;
+        }
+        if (!prepareThumbnailsForArchiveWrite(5000))
+        {
+            QMessageBox::warning(this, tr("保存失败"),
+                tr("缩略图仍在读取归档内容，暂时无法替换文件。请稍等几秒后重试。"));
+            refreshFilePathView();   // 恢复待生成的缩略图
             return false;
         }
         QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -2964,14 +3093,28 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
         if (!bOk)
         {
             const QString sReason = m_fileManager->lastError();
+            refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
             QMessageBox::critical(this, tr("保存失败"),
                 tr("保存失败，操作已取消。改动仍保留在内存中，可以重试。\n\n原因：%1")
                    .arg(sReason.isEmpty() ? tr("未知错误") : sReason));
             return false;
         }
+        // 这里也必须完成与 Ctrl+S 相同的刷新：用户可能在“加载文件”提示里选择保存，
+        // 随后取消文件对话框；若列表仍持有保存前的路径/偏移快照，接下来双击、
+        // 导出、属性都会报“归档内未找到文件”，大文件还会拿 nContentPositon=0 去映射。
+        afterArchiveSaved();
     }
     // Discard 或 保存成功：继续
     return true;
+}
+
+void MainWindow::afterArchiveSaved()
+{
+    // 保存会重写归档并重算内容偏移/展示路径；列表、标签页快照和缩略图都必须作废。
+    invalidateThumbnailCache();
+    refreshTabInfosFromManager();
+    refreshFilePathView();
+    syncActionStates();
 }
 
 void MainWindow::on_actionLoadFile_triggered()
@@ -3460,6 +3603,9 @@ void MainWindow::populateFilePathList(bool bShowPath)
 void MainWindow::populateFilePathThumbnails(bool bShowPath)
 {
     cancelThumbnailGeneration();   // 作废上一轮（筛选/增删导致重建）的空闲回调
+    // 已缓存的图标也占模型内存：把它们计入本轮预算，避免“1024 缓存 + 1024 新生成”
+    // 在反复切换视图时叠成两倍。
+    m_nThumbnailGenerated = m_mapThumbnailIcons.size();
     m_hModelFilePath->removeRows(0, m_hModelFilePath->rowCount());
 
     const QVector<FILEINFO> vtFileInfos = m_fileManager->getFileInfos();
@@ -3533,25 +3679,17 @@ bool MainWindow::isThumbnailImageName(const QString &sFileName)
     return kImageSuffixes.contains(QFileInfo(sFileName).suffix().toLower());
 }
 
-// 读归档内容并解码成缩略图（与界面无关，测试可以直接调用）。
-// 返回的 QPixmap 按 2x 像素生成并标记 DPR=2，供 96px 网格使用。
-QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
+// 纯解码 + 合成，可在任意线程调用（只操作 QImage/QBuffer/QImageReader，不碰 QPixmap）。
+// 返回 128×128 的成品底片；GUI 线程只负责 QPixmap::fromImage()。
+static QImage renderThumbnailImage(const QByteArray &data)
 {
-    if (m_fileManager == nullptr || !m_fileManager->isArchiveLoaded())
-        return QPixmap();
-    if (!isThumbnailImageName(info.sFileName)
-        || info.nFileLen <= 0 || info.nFileLen > kThumbnailMaxBytes)
-        return QPixmap();
-
-    QString sErr;
-    const QByteArray data = m_fileManager->entryContent(info.sFilePath, &sErr);
     if (data.isEmpty())
-        return QPixmap();
+        return QImage();
 
     QBuffer buffer;
     buffer.setData(data);
     if (!buffer.open(QIODevice::ReadOnly))
-        return QPixmap();
+        return QImage();
 
     QImageReader reader(&buffer);
     // 归档条目来自外部文件，后缀不一定可信：以内容嗅探为准；
@@ -3563,7 +3701,7 @@ QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
     const QSize szSource = reader.size();
     if (szSource.isValid()
         && qint64(szSource.width()) * qint64(szSource.height()) > kThumbnailMaxPixels)
-        return QPixmap();
+        return QImage();
     if (szSource.isValid())
     {
         const QSize szTarget = szSource.scaled(
@@ -3574,12 +3712,12 @@ QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
 
     const QImage img = reader.read();
     if (img.isNull())
-        return QPixmap();
+        return QImage();
 
     const QImage scaled = img.scaled(QSize(kThumbnailPixelSize, kThumbnailPixelSize),
                                      Qt::KeepAspectRatio, Qt::SmoothTransformation);
     if (scaled.isNull())
-        return QPixmap();
+        return QImage();
 
     // 统一画进正方形底片：不同宽高比的图片都占满 96×96 的图标格，
     // 文件名才会在同一行对齐；否则宽图会把文字顶上去、竖图把文字压下去。
@@ -3601,14 +3739,172 @@ QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
                           scaled);
     }
 
-    QPixmap pm = QPixmap::fromImage(canvas);
-    pm.setDevicePixelRatio(2.0);
-    return pm;
+    // 128px 源图直接用于 96px 网格：不声明 2x DPR，否则 Qt 会按 64 逻辑像素
+    // 解释并放大，反而发糊；同时每张图的实际内存也小一半以上。
+    return canvas;
+}
+
+// 后台任务只拿到“归档路径 + 偏移 + 长度”快照，自己开 QFile 读取；不引用
+// FileManager（它的 QMap/QFile 游标属于 GUI 线程）。普通文件和未保存的新增
+// 条目（pending）分别按源路径读取；归档条目在 GUI 线程先取到期望 CRC，读完校验。
+struct ThumbnailJob
+{
+    QString  sKey;
+    QString  sArchivePath;
+    QString  sSourcePath;
+    qint64   nPos = 0;
+    qint64   nLen = 0;
+    quint32  nExpectedCrc = 0;
+    bool     bHasCrc = false;
+    bool     bPending = false;
+    quint64  nEpoch = 0;
+};
+
+static QByteArray readThumbnailJobData(const ThumbnailJob &job)
+{
+    if (job.nLen <= 0 || job.nLen > kThumbnailMaxBytes)
+        return QByteArray();
+
+    QFile f(job.bPending ? job.sSourcePath : job.sArchivePath);
+    if (!f.open(QIODevice::ReadOnly))
+        return QByteArray();
+
+    if (job.bPending)
+    {
+        // 新增条目没有归档内偏移；源文件在等待期间被改写则放弃（保存前会再核对）。
+        if (f.size() != job.nLen)
+            return QByteArray();
+    }
+    else
+    {
+        if (job.nPos < 0 || job.nPos > f.size() || job.nLen > f.size() - job.nPos)
+            return QByteArray();
+        if (!f.seek(job.nPos))
+            return QByteArray();
+    }
+
+    QByteArray data;
+    try
+    {
+        data.resize(qsizetype(job.nLen));
+    }
+    catch (const std::bad_alloc &)
+    {
+        return QByteArray();
+    }
+
+    qint64 done = 0;
+    while (done < job.nLen)
+    {
+        const qint64 n = qMin<qint64>(job.nLen - done, 1024 * 1024);
+        const qint64 got = f.read(data.data() + done, n);
+        if (got <= 0)
+            return QByteArray();
+        done += got;
+    }
+
+    if (job.bHasCrc)
+    {
+        FwArc::Crc32 crc;
+        crc.update(data);
+        if (crc.value() != job.nExpectedCrc)
+            return QByteArray();
+    }
+    return data;
+}
+
+class ThumbnailDecodeTask : public QRunnable
+{
+public:
+    using Done = std::function<void(const QString &, const QImage &, quint64)>;
+
+    ThumbnailDecodeTask(ThumbnailJob job, QSharedPointer<ThumbnailGate> gate, Done done)
+        : m_job(std::move(job)), m_gate(std::move(gate)), m_done(std::move(done))
+    {
+        setAutoDelete(true);
+    }
+
+    void run() override
+    {
+        // 运行期自检：这个任务一旦在 GUI 线程执行，就会重新引入卡顿，
+        // 也为“QPixmap 不能在后台线程创建”之外的线程归属留下明确日志。
+        if (QCoreApplication::instance() != nullptr
+            && QThread::currentThread() == QCoreApplication::instance()->thread())
+        {
+            qWarning() << "[Thumb] 缩略图解码任务意外运行在 GUI 线程";
+        }
+
+        QImage img;
+        try
+        {
+            if (m_gate
+                && m_gate->generation.load(std::memory_order_relaxed) == m_job.nEpoch)
+            {
+                const QByteArray data = readThumbnailJobData(m_job);
+                if (!data.isEmpty()
+                    && m_gate->generation.load(std::memory_order_relaxed) == m_job.nEpoch)
+                {
+                    img = renderThumbnailImage(data);
+                }
+            }
+        }
+        catch (...)
+        {
+            img = QImage();   // 后台线程不能让异常逃逸，否则 std::terminate
+        }
+
+        // 共享计数在任务线程归还：保存前主线程阻塞等待它归零，不依赖事件循环。
+        if (m_gate)
+        {
+            QMutexLocker locker(&m_gate->mutex);
+            if (--m_gate->inFlight < 0)
+                m_gate->inFlight = 0;
+            if (m_gate->inFlight == 0)
+                m_gate->idle.wakeAll();
+        }
+
+        if (!m_done)
+            return;
+        QCoreApplication *pApp = QCoreApplication::instance();
+        if (pApp == nullptr)
+            return;   // 应用正在退出：结果已无意义
+
+        const Done done = m_done;
+        const QString sPath = m_job.sKey;
+        const quint64 nEpoch = m_job.nEpoch;
+        QMetaObject::invokeMethod(pApp, [done, sPath, img, nEpoch]() {
+            done(sPath, img, nEpoch);
+        }, Qt::QueuedConnection);
+    }
+
+private:
+    ThumbnailJob m_job;
+    QSharedPointer<ThumbnailGate> m_gate;
+    Done m_done;
+};
+
+// 读归档内容并解码成缩略图（与界面无关，测试可以直接调用）。
+// 生产路径走 ThumbnailDecodeTask；这个同步版本保留给测试/调试。
+QPixmap MainWindow::renderEntryThumbnail(const FILEINFO &info) const
+{
+    if (m_fileManager == nullptr || !m_fileManager->isArchiveLoaded())
+        return QPixmap();
+    if (!isThumbnailImageName(info.sFileName)
+        || info.nFileLen <= 0 || info.nFileLen > kThumbnailMaxBytes)
+        return QPixmap();
+
+    QString sErr;
+    const QByteArray data = m_fileManager->entryContent(info.sFilePath, &sErr);
+    if (data.isEmpty())
+        return QPixmap();
+    return QPixmap::fromImage(renderThumbnailImage(data));
 }
 
 void MainWindow::cancelThumbnailGeneration()
 {
-    ++m_nThumbnailEpoch;             // 已排队的 singleShot 看到代数不同就直接退出
+    ++m_nThumbnailEpoch;             // 已排队的 singleShot/后台任务看到代数不同就直接退出
+    if (m_thumbGate)
+        m_thumbGate->generation.store(m_nThumbnailEpoch, std::memory_order_relaxed);
     m_listThumbnailPending.clear();
     m_mapThumbnailIndex.clear();
 }
@@ -3621,20 +3917,34 @@ void MainWindow::invalidateThumbnailCache()
 
 void MainWindow::scheduleNextThumbnail()
 {
-    if (m_listThumbnailPending.isEmpty() || m_eViewMode != ViewThumbnail)
+    if (m_thumbPool == nullptr || m_listThumbnailPending.isEmpty()
+        || m_eViewMode != ViewThumbnail)
         return;
+    if (m_nThumbnailInFlight >= kThumbnailMaxInFlight)
+        return;   // 由 onThumbnailDecoded 在任务回来后再续
     const quint64 nEpoch = m_nThumbnailEpoch;
     QTimer::singleShot(0, this, [this, nEpoch]() { processNextThumbnail(nEpoch); });
 }
 
-// 每轮回调只解码一张：既有机会让界面先画出占位角标，
-// 也让用户在大归档里切视图/筛选时能立刻中止。
+// 提交一张到后台线程池：GUI 只做“取任务快照 + 提交”，不读文件、不解码。
+// 最多 kThumbnailMaxInFlight 张同时在途；每完成一张再由 onThumbnailDecoded 续下一张。
 void MainWindow::processNextThumbnail(quint64 nEpoch)
 {
     if (nEpoch != m_nThumbnailEpoch || m_eViewMode != ViewThumbnail)
         return;
-    if (m_listThumbnailPending.isEmpty())
+    if (m_listThumbnailPending.isEmpty() || m_thumbPool == nullptr)
         return;
+    if (m_nThumbnailInFlight >= kThumbnailMaxInFlight)
+        return;
+    if (m_nThumbnailGenerated >= kThumbnailMaxGenerated)
+    {
+        // 模型项会持有 QIcon，缓存上限并不能限制内存；达到本轮总量后立即停。
+        m_listThumbnailPending.clear();
+        statusBar()->showMessage(
+            tr("图片较多，本次只为前 %1 张生成缩略图；可用筛选查看其余文件。")
+                .arg(kThumbnailMaxGenerated), 8000);
+        return;
+    }
 
     const QString sPath = m_listThumbnailPending.takeFirst();
     const QPersistentModelIndex index = m_mapThumbnailIndex.value(sPath);
@@ -3644,24 +3954,119 @@ void MainWindow::processNextThumbnail(quint64 nEpoch)
         scheduleNextThumbnail();
         return;
     }
-
-    if (!m_mapThumbnailIcons.contains(sPath))
+    if (m_mapThumbnailIcons.contains(sPath))
     {
-        const FILEINFO info = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
-        const QPixmap pm = renderEntryThumbnail(info);
-        if (!pm.isNull())
+        scheduleNextThumbnail();
+        return;
+    }
+
+    const FILEINFO info = pItem->data(FileListModel::InfoRole).value<FILEINFO>();
+    if (info.nFileLen <= 0 || info.nFileLen > kThumbnailMaxBytes)
+    {
+        scheduleNextThumbnail();
+        return;
+    }
+
+    ThumbnailJob job;
+    job.sKey       = sPath;
+    job.nPos       = info.nContentPositon;
+    job.nLen       = info.nFileLen;
+    job.nEpoch     = nEpoch;
+    job.bPending   = m_fileManager->isPendingEntry(sPath);
+    if (job.bPending)
+    {
+        // 新增未保存条目没有归档偏移，后台按源文件路径读；保存前会再核对大小。
+        job.sSourcePath = info.sFilePath;
+    }
+    else
+    {
+        job.sArchivePath = m_fileManager->archivePath();
+        if (job.sArchivePath.isEmpty())
         {
-            QIcon icon;
-            icon.addPixmap(pm);
-            if (m_mapThumbnailIcons.size() >= kThumbnailCacheLimit)
-                m_mapThumbnailIcons.clear();   // 只丢缓存；模型里已设的图标不受影响
-            m_mapThumbnailIcons.insert(sPath, icon);
-            if (QStandardItem *pNow = m_hModelFilePath->itemFromIndex(index))
-                pNow->setIcon(icon);
+            scheduleNextThumbnail();
+            return;
+        }
+        quint32 nCrc = 0;
+        if (m_fileManager->contentCrcFor(sPath, &nCrc))
+        {
+            job.bHasCrc = true;
+            job.nExpectedCrc = nCrc;
+        }
+    }
+
+    ++m_nThumbnailGenerated;   // 失败也算一次尝试，避免反复读坏图
+    ++m_nThumbnailInFlight;
+    {
+        QMutexLocker locker(&m_thumbGate->mutex);
+        ++m_thumbGate->inFlight;
+    }
+
+    QPointer<MainWindow> self(this);
+    auto done = [self](const QString &sDonePath, const QImage &img, quint64 nDoneEpoch) {
+        if (!self.isNull())
+            self->onThumbnailDecoded(sDonePath, img, nDoneEpoch);
+    };
+    m_thumbPool->start(new ThumbnailDecodeTask(job, m_thumbGate, done));
+
+    // 立即尝试再提交一张（最多两张在途）；后续由完成回调续。
+    scheduleNextThumbnail();
+}
+
+void MainWindow::onThumbnailDecoded(const QString &sPath, const QImage &img,
+                                    quint64 nEpoch)
+{
+    if (m_nThumbnailInFlight > 0)
+        --m_nThumbnailInFlight;
+
+    if (nEpoch == m_nThumbnailEpoch && m_eViewMode == ViewThumbnail
+        && !img.isNull() && !m_mapThumbnailIcons.contains(sPath))
+    {
+        const QPersistentModelIndex index = m_mapThumbnailIndex.value(sPath);
+        QStandardItem *pItem = index.isValid() ? m_hModelFilePath->itemFromIndex(index)
+                                               : nullptr;
+        if (pItem != nullptr)
+        {
+            // QPixmap 只能在 GUI 线程创建：后台只交回 QImage。
+            const QPixmap pm = QPixmap::fromImage(img);
+            if (!pm.isNull())
+            {
+                QIcon icon;
+                icon.addPixmap(pm);
+                if (m_mapThumbnailIcons.size() >= kThumbnailCacheLimit)
+                    m_mapThumbnailIcons.clear();   // 只丢缓存；模型里已设的图标不受影响
+                m_mapThumbnailIcons.insert(sPath, icon);
+                if (QStandardItem *pNow = m_hModelFilePath->itemFromIndex(index))
+                    pNow->setIcon(icon);
+            }
         }
     }
 
     scheduleNextThumbnail();
+}
+
+bool MainWindow::waitForThumbnailReads(int nTimeoutMs)
+{
+    const QSharedPointer<ThumbnailGate> gate = m_thumbGate;
+    QElapsedTimer timer;
+    timer.start();
+    QMutexLocker locker(&gate->mutex);
+    while (gate->inFlight > 0)
+    {
+        const qint64 nLeft = qint64(nTimeoutMs) - timer.elapsed();
+        if (nLeft <= 0)
+            return false;
+        if (!gate->idle.wait(&gate->mutex, QDeadlineTimer(nLeft)))
+            return false;
+    }
+    return true;
+}
+
+bool MainWindow::prepareThumbnailsForArchiveWrite(int nTimeoutMs)
+{
+    // 先让所有在途任务看到新代数（尽早放弃后续解码），再等它们把归档句柄关掉。
+    // 不等待事件循环：任务线程直接归还 inFlight，所以保存不会被 GUI 阻塞逻辑卡死。
+    cancelThumbnailGeneration();
+    return waitForThumbnailReads(nTimeoutMs);
 }
 
 // 当前视图（树/平铺/缩略图）的当前项。删除/导出/属性/可用状态统一从这里取，
@@ -4397,13 +4802,25 @@ void MainWindow::onActionSaveFileTriggered()
         releaseAllMappedInputs();
     }
 
-    // P0-3：停播未被确认时，映射仍可能被后台线程访问，不能替换归档
+    // P0-3：停播未被确认时，映射仍可能被后台线程访问，不能替换归档。
+    // 先非阻塞复查一次，避免后台线程已经退出、界面却一直拒绝保存。
+    pollStopUnsafeInstances();
     if (!m_setStopUnsafe.isEmpty())
     {
         QMessageBox::warning(this, tr("保存文件"),
             tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
                "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
-               "请稍后重试，或关闭正在播放的标签页。"));
+               "程序会每秒自动复查；也可关闭正在播放的标签页后重试。"));
+        return;
+    }
+
+    // 缩略图后台任务也持有归档的只读句柄；Windows 下未关闭会让 rename 失败。
+    // 取消尚未开始的任务并等待在途任务结束（最多 5 秒），失败则明确中止本次保存。
+    if (!prepareThumbnailsForArchiveWrite(5000))
+    {
+        QMessageBox::warning(this, tr("保存文件"),
+            tr("缩略图仍在读取归档内容，暂时无法替换文件。\n请稍等几秒后重试。"));
+        refreshFilePathView();   // 恢复待生成的缩略图
         return;
     }
 
@@ -4442,16 +4859,12 @@ void MainWindow::onActionSaveFileTriggered()
                 ? tr("保存已取消。改动仍保留在内存中，可重试。")
                 : tr("保存失败。改动仍保留在内存中，可重试。\n\n原因：%1")
                     .arg(sReason.isEmpty() ? tr("未知错误") : sReason);
+        refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
         QMessageBox::critical(this, tr("保存文件"), sMsg);
         return;
     }
 
-    // 保存后刷新列表（重写会更新内存中的内容偏移），并按脏标记更新保存按钮。
-    // 跨盘保存可能改动展示路径（E:/x -> E/x），缩略图缓存一并作废。
-    invalidateThumbnailCache();
-    refreshTabInfosFromManager();
-    refreshFilePathView();
-    syncActionStates();
+    afterArchiveSaved();
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

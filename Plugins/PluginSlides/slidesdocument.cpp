@@ -392,7 +392,18 @@ bool SlidesDocument::parsePptx(QString *error)
         const QString path = slidePaths.at(si);
         QDomDocument slideDoc;
         const QByteArray slideXml = m_zip.entry(path);
-        if (!xmlWithinTagBudget(slideXml) || !slideDoc.setContent(slideXml)) continue;
+        // 单页部件超预算/损坏不能静默跳过：否则 open() 仍报成功，界面把
+        // 「共 N 页」少算，用户完全不知道丢了一页。
+        if (!xmlWithinTagBudget(slideXml))
+        {
+            markTruncated(QStringLiteral("第 %1 页 XML 元素过多，已跳过").arg(si + 1));
+            continue;
+        }
+        if (!slideDoc.setContent(slideXml))
+        {
+            markTruncated(QStringLiteral("第 %1 页 XML 无法解析，已跳过").arg(si + 1));
+            continue;
+        }
 
         Slide slide;
         const QString slideDir = path.left(path.lastIndexOf(QLatin1Char('/')));
@@ -567,7 +578,10 @@ bool SlidesDocument::parsePptx(QString *error)
     }
 
     m_ok = !m_slides.isEmpty();
-    if (!m_ok) return fail(QStringLiteral("没有可显示的幻灯片内容。"));
+    if (!m_ok)
+        return fail(m_truncatedReason.isEmpty()
+                        ? QStringLiteral("没有可显示的幻灯片内容。")
+                        : QStringLiteral("没有可显示的幻灯片内容（%1）。").arg(m_truncatedReason));
     return true;
 }
 
@@ -722,7 +736,10 @@ bool SlidesDocument::parseOdp(QString *error)
     }
 
     m_ok = !m_slides.isEmpty();
-    if (!m_ok) return fail(QStringLiteral("没有可显示的幻灯片内容。"));
+    if (!m_ok)
+        return fail(m_truncatedReason.isEmpty()
+                        ? QStringLiteral("没有可显示的幻灯片内容。")
+                        : QStringLiteral("没有可显示的幻灯片内容（%1）。").arg(m_truncatedReason));
     return true;
 }
 

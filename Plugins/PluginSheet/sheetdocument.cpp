@@ -399,7 +399,19 @@ bool SheetDocument::parseXlsx(QString *error)
         const QString &target = sheetList.at(si).second;
         QDomDocument sheetDoc;
         const QByteArray sheetXml = m_zip.entry(target);
-        if (!xmlWithinTagBudget(sheetXml) || !sheetDoc.setContent(sheetXml)) continue;
+        // 单个工作表部件超预算/损坏不能静默跳过：否则 open() 仍报成功，
+        // 用户只看到少了几个表且没有任何提示。
+        const QString sheetName = sheetList.at(si).first;
+        if (!xmlWithinTagBudget(sheetXml))
+        {
+            markTruncated(QStringLiteral("工作表「%1」XML 元素过多，已跳过").arg(sheetName));
+            continue;
+        }
+        if (!sheetDoc.setContent(sheetXml))
+        {
+            markTruncated(QStringLiteral("工作表「%1」XML 无法解析，已跳过").arg(sheetName));
+            continue;
+        }
 
         Sheet sheet;
         sheet.name = sheetList.at(si).first;
@@ -490,7 +502,10 @@ bool SheetDocument::parseXlsx(QString *error)
     }
 
     m_ok = !m_sheets.isEmpty();
-    if (!m_ok) return fail(QStringLiteral("没有可显示的工作表内容。"));
+    if (!m_ok)
+        return fail(m_truncatedReason.isEmpty()
+                        ? QStringLiteral("没有可显示的工作表内容。")
+                        : QStringLiteral("没有可显示的工作表内容（%1）。").arg(m_truncatedReason));
     return true;
 }
 
@@ -602,7 +617,10 @@ bool SheetDocument::parseOds(QString *error)
     }
 
     m_ok = !m_sheets.isEmpty();
-    if (!m_ok) return fail(QStringLiteral("没有可显示的工作表内容。"));
+    if (!m_ok)
+        return fail(m_truncatedReason.isEmpty()
+                        ? QStringLiteral("没有可显示的工作表内容。")
+                        : QStringLiteral("没有可显示的工作表内容（%1）。").arg(m_truncatedReason));
     return true;
 }
 

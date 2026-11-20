@@ -14,6 +14,16 @@
 #include <cstring>
 #include <new>
 
+#ifdef Q_OS_WIN
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 #define MAXBUFFERSIZE (1024 * 1024 * 16)
 static const qint64 kCopyChunk = 1024 * 1024;      // 流式复制缓冲 1 MB
 static const qint64 kCrcChunk  = 1024 * 1024;      // 头部区校验缓冲
@@ -163,6 +173,30 @@ bool restoreFromBackup(const QString &sTargetPath, const QString &sBakPath,
     return true;
 }
 
+// 锁文件里记录的 PID 是否仍存活。30 秒只是“崩溃残留”的判定起点，不能
+// 单独作为“可以删锁”的依据：一次几 GB 的保存完全可能超过 30 秒，旧实现
+// 会让第二个实例把仍在写的锁删掉，两个进程同时替换同一个输出。
+bool isProcessAliveForLock(qint64 nPid)
+{
+    if (nPid <= 0)
+        return false;
+#ifdef Q_OS_WIN
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                           FALSE, DWORD(nPid));
+    if (h == nullptr)
+    {
+        // 打不开不等于已退出：权限不足时保守地当成“仍在运行”，避免误删活锁。
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    DWORD nExit = 0;
+    const bool bAlive = GetExitCodeProcess(h, &nExit) && nExit == STILL_ACTIVE;
+    CloseHandle(h);
+    return bAlive;
+#else
+    return QFileInfo::exists(QStringLiteral("/proc/%1").arg(nPid));
+#endif
+}
+
 // P0-1：同一输出文件的跨进程写锁。
 //
 // 不用 QLockFile：它在受限权限/沙箱环境里会因 CreateFile 的附加权限请求失败
@@ -196,12 +230,22 @@ public:
             }
 
             const QFileInfo fi(m_path);
+            qint64 nLockPid = 0;
+            {
+                QFile lockReader(m_path);
+                if (lockReader.open(QIODevice::ReadOnly))
+                    nLockPid = lockReader.read(64).trimmed().toLongLong();
+            }
             const qint64 nAgeMs = fi.lastModified().isValid()
                 ? fi.lastModified().msecsTo(QDateTime::currentDateTime())
                 : 0;
-            if (nAgeMs > 30000)
+            // 只有“锁已超过陈旧阈值”且“记录的进程确实不在了”时才删锁。
+            // 长保存期间不刷新 mtime 也没关系：PID 仍存活就必须拒绝第二个写者。
+            if (nAgeMs > 30000 && !isProcessAliveForLock(nLockPid))
             {
-                QFile::remove(m_path);   // 崩溃残留的陈旧锁
+                qWarning() << "[FileManager] 清理崩溃残留的写锁:" << m_path
+                           << "pid=" << nLockPid << "ageMs=" << nAgeMs;
+                QFile::remove(m_path);
                 continue;
             }
             sErr = QObject::tr("另一个 FileWrapper 实例正在写入该文件，请稍后重试：%1")
@@ -214,7 +258,17 @@ public:
 
     ~OutputWriteLock()
     {
-        if (m_locked)
+        if (!m_locked)
+            return;
+        // 只删除仍属于自己的锁：若另一个实例清理过陈旧锁并重新建锁，
+        // 无条件 remove 会把它的锁也删掉，导致后续写入者无保护。
+        QFile f(m_path);
+        bool bOurs = false;
+        if (f.open(QIODevice::ReadOnly))
+            bOurs = f.read(64).trimmed().toLongLong()
+                    == qint64(QCoreApplication::applicationPid());
+        f.close();
+        if (bOurs)
             QFile::remove(m_path);
     }
 
@@ -872,12 +926,31 @@ void FileManager::addFiles(const QVector<QString> &vtNewFiles)
 {
     if (!isArchiveLoaded() || isBusy()) return;
 
+    // 保存时会把“绝对路径”压成归档内的存储路径；根为空的扁平归档还会把盘符
+    // 写成路径首段（E:/x -> E/x）。添加时只比较原始绝对路径，会让“再次添加
+    // 一个已在扁平归档里的文件”成功进入列表，直到保存才报重复路径。
+    // 这里用与保存一致的规范化键做一次前置去重。
+    auto addKey = [](const QString &p) {
+        // 归档里的 rootless 显示路径（如 "E/x"）没有冒号，不能再按当前工作目录
+        // 解析成绝对路径；只有真正的绝对路径才做 absoluteFilePath 归一化。
+        const QString sAbs = FwArc::isAbsolutePath(p)
+                                 ? QFileInfo(p).absoluteFilePath() : p;
+        QString s = FwArc::normalizePath(sAbs);
+        if (s.size() >= 2 && s.at(1) == QLatin1Char(':') && s.at(0).isLetter())
+            s = s.left(1) + s.mid(2);
+        return s.toLower();
+    };
+    QSet<QString> setExistingKeys;
+    for (const FILEINFO &info : m_vtFileInfos)
+        setExistingKeys.insert(addKey(info.sFilePath));
+
     bool bChanged = false;
     for (const QString &fp : vtNewFiles)
     {
         QFileInfo fi(fp);
         if (!fi.exists() || !fi.isFile()) continue;
         if (m_mapFileInfos.contains(fp)) continue;
+        if (setExistingKeys.contains(addKey(fp))) continue;
         if (quint64(fi.size()) > FwArc::MAX_CONTENT_LEN) continue;
 
         FILEINFO info;

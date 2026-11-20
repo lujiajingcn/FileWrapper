@@ -18,6 +18,9 @@ public:
     bool prefersFileByPath() const override;
     bool sendFileByPath(const QString &path, const QString &displayName) override;
 
+    // 打开失败的真实原因（损坏/加密/读不到）；宿主据此显示可照做的提示
+    QString lastError() const override;
+
 protected:
     bool showFile(const PluginFile &file) override;
 };

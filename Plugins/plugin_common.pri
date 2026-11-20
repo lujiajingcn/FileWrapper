@@ -67,9 +67,12 @@ DESTDIR = $$PLUGIN_OUT_DIR
 #   * 依赖 Windows cmd 的小技巧，跨平台无意义；
 #   * 构建过程改源码时间戳，干扰增量构建与版本管理。
 #
-# 现在构建过程完全不碰源码树：JSON 只作为构建输入登记（DISTFILES），
-# 修改插件 JSON 后重新运行一次 qmake 即可让 moc 重新内嵌元数据
-# （QtCreator 里「执行 qmake / 重新构建」等价）。内嵌元数据的权威性不变。
+# 现在构建过程完全不碰源码树：JSON 只作为构建输入登记（DISTFILES）。
+# ⚠️ DISTFILES 不是 moc 的构建依赖：只改 JSON 后跑 qmake + make，moc_*.cpp
+# 不会重新生成，内嵌元数据仍是旧值（sidecar 也只有重新链接时才复制）。
+# 修改插件 JSON 后必须让该插件的 moc/对象失效：删除构建目录里的
+# moc_<plugin>.cpp 与对应 object，或直接 `mingw32-make clean` 后重新 qmake+make。
+# QtCreator 里「清理 → 执行 qmake → 重新构建」等价。内嵌元数据的权威性不变。
 !isEmpty(PLUGIN_METADATA_JSON) {
     DISTFILES += $$PLUGIN_METADATA_JSON
 }

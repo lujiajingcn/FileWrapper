@@ -22,11 +22,16 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
-    void showPdf(char *szBuf, qint64 nFileLen);
+    // 内存通道：返回 false 表示加载失败（原因见 lastError() 与内容区提示）
+    bool showPdf(char *szBuf, qint64 nFileLen);
     // 大文件按路径加载，QPdfDocument 自行按需读取，避免全量内存副本（P1-2）
     bool showPdfFile(const QString &sPath);
     // 打开失败 / 0 字节时清空内容区并复位页码状态
     void clearContent();
+    // 最近一次打开失败的中文原因（成功时为空）；供插件层 lastError() 回报给宿主
+    QString lastError() const { return m_lastError; }
+    // 新的打开尝试开始时清掉上一次原因（接口约定：插件不得回报陈旧原因）
+    void clearLastError() { m_lastError.clear(); }
 
 private slots:
     void on_actionFirstPage_triggered();
@@ -48,6 +53,8 @@ private:
     void updatePage();
     void getLineEditPageNum();
     void setLineEditPageNum();
+    // 打开失败：把中文原因写进内容区（不能只 qWarning，否则用户只看到"空文档"）
+    void showLoadError(const QString &msg);
     // P2-10：空文档状态 —— 翻页按钮按页数/当前页启用，页码显示不出现 "1/0"
     void updatePageActions();
     void clampPageIndex();
@@ -64,6 +71,7 @@ private:
     int            m_nScale;
     QLabel        *m_lbContent;
     QLineEdit     *m_lePageNum;
+    QString        m_lastError;   // 最近一次打开失败的原因（中文）
 
     Ui::MainWindow *ui;
 };

@@ -257,6 +257,21 @@ QByteArray ZipReader::entry(const QString &name) const
         if (!chargeBudget(e.uncompSize, n))
             return QByteArray();
 
+        // 中央目录声明“解压后 0 字节”，却带有压缩数据：这是伪造/损坏的条目。
+        // 旧实现只比较 `uncompSize > 0` 时的长度，导致这种条目可以解出最多
+        // 64 MiB 内容而预算只记 0 字节；同一图片被 2048 次引用时即可反复解压，
+        // 把累计预算和 CPU 上限完全绕过。空条目必须真的没有数据。
+        if (e.uncompSize == 0)
+        {
+            if (e.compSize != 0)
+            {
+                m_lastError = QStringLiteral("条目长度声明异常（声明 0 字节但有压缩数据）：%1")
+                                  .arg(n);
+                return QByteArray();
+            }
+            return QByteArray();
+        }
+
         if (e.method == 0)
         {
             if (e.compSize != e.uncompSize)
@@ -291,7 +306,7 @@ QByteArray ZipReader::inflate(const QByteArray &comp, const Entry &e) const
 {
     // ZIP 头中的 uncompSize 是攻击者可控的 quint32：>2 GiB 时 int() 会变负，
     // 按声明值一次分配可被 ZIP bomb 吃掉数 GB 内存。预算已在 entry() 中收取。
-    if (e.uncompSize < 0 || e.uncompSize > m_budget.maxEntryBytes)
+    if (e.uncompSize <= 0 || e.uncompSize > m_budget.maxEntryBytes)
         return QByteArray();
     // zlib 的 avail_in / avail_out 是 uInt（32 位），超过会被静默截断
     if (comp.size() > qint64(std::numeric_limits<uInt>::max()))
@@ -300,65 +315,56 @@ QByteArray ZipReader::inflate(const QByteArray &comp, const Entry &e) const
         return QByteArray();
     }
 
-    const qsizetype maxCap = static_cast<qsizetype>(m_budget.maxEntryBytes);
-    qsizetype cap = e.uncompSize > 0 ? static_cast<qsizetype>(e.uncompSize)
-                                     : qMax<qsizetype>(16384, comp.size() * 2);
-    if (cap > maxCap) cap = maxCap;
+    // 声明长度就是本次解压的硬上限：只分配这么大的输出缓冲，一次 inflate。
+    // 旧实现以 maxEntryBytes 为上限反复放大重试，遇到「声明 1 字节、实际 64 MiB」
+    // 的条目会先完整解压多遍再判定长度不符；同一图片被大量引用时可造成 CPU 放大。
+    const qsizetype cap = static_cast<qsizetype>(e.uncompSize);
+    QByteArray out(cap, Qt::Uninitialized);
+    z_stream strm;
+    std::memset(&strm, 0, sizeof(strm));
+    strm.next_in   = (Bytef *)comp.constData();
+    strm.avail_in  = (uInt)comp.size();
+    strm.next_out  = (Bytef *)out.data();
+    strm.avail_out = (uInt)out.size();
 
-    for (int attempt = 0; attempt < 6; ++attempt)
+    // -MAX_WBITS：裸 deflate（无 zlib 头），这正是 ZIP 条目的压缩格式
+    // 注意用 :: 前缀调用全局 zlib 函数，避免与本类的 inflate() 成员名冲突
+    if (::inflateInit2(&strm, -MAX_WBITS) != Z_OK)
     {
-        QByteArray out(cap, Qt::Uninitialized);
-        z_stream strm;
-        std::memset(&strm, 0, sizeof(strm));
-        strm.next_in   = (Bytef *)comp.constData();
-        strm.avail_in  = (uInt)comp.size();
-        strm.next_out  = (Bytef *)out.data();
-        strm.avail_out = (uInt)out.size();
-
-        // -MAX_WBITS：裸 deflate（无 zlib 头），这正是 ZIP 条目的压缩格式
-        // 注意用 :: 前缀调用全局 zlib 函数，避免与本类的 inflate() 成员名冲突
-        if (::inflateInit2(&strm, -MAX_WBITS) != Z_OK)
-            return QByteArray();
-
-        int r = ::inflate(&strm, Z_FINISH);
-        if (r == Z_STREAM_END)
-        {
-            out.resize(static_cast<qsizetype>(strm.total_out));
-            ::inflateEnd(&strm);
-
-            // P2-3：实际输出长度与声明长度必须一致（声明值用于预算/分配，
-            // 不能同时相信它；两者不一致说明头部或数据被篡改）。
-            if (e.uncompSize > 0 && qint64(out.size()) != e.uncompSize)
-            {
-                m_lastError = QStringLiteral("解压长度与声明不一致：%1").arg(e.name);
-                return QByteArray();
-            }
-            const quint32 actual = quint32(::crc32(0L, reinterpret_cast<const Bytef *>(out.constData()),
-                                                    uInt(out.size())));
-            if (actual != e.crc32)
-            {
-                m_lastError = QStringLiteral("内容 CRC 不匹配：%1").arg(e.name);
-                return QByteArray();
-            }
-            return out;
-        }
-        ::inflateEnd(&strm);
-
-        if (r != Z_BUF_ERROR)
-        {
-            m_lastError = QStringLiteral("解压失败：%1").arg(e.name);
-            return QByteArray();
-        }
-        // 缓冲区不足：放大重试。注意 cap 已经到上限时不能再「同容量重试」，
-        // 否则会白烧最多 6 次完整的 inflate（P2-3 的有限 CPU 放大）。
-        const qsizetype nextCap = qMin(cap * 2, maxCap);
-        if (nextCap <= cap)
-        {
-            m_lastError = QStringLiteral("解压输出超过上限：%1").arg(e.name);
-            return QByteArray();
-        }
-        cap = nextCap;
+        m_lastError = QStringLiteral("无法初始化解压器：%1").arg(e.name);
+        return QByteArray();
     }
-    m_lastError = QStringLiteral("解压重试次数耗尽：%1").arg(e.name);
-    return QByteArray();
+
+    const int r = ::inflate(&strm, Z_FINISH);
+    const qint64 nProduced = qint64(strm.total_out);
+    ::inflateEnd(&strm);
+
+    if (r == Z_BUF_ERROR || nProduced > qint64(cap))
+    {
+        // 输出比中央目录声明的长度更长：不能继续放大分配，直接拒绝。
+        m_lastError = QStringLiteral("解压输出超过声明长度：%1").arg(e.name);
+        return QByteArray();
+    }
+    if (r != Z_STREAM_END)
+    {
+        m_lastError = QStringLiteral("解压失败：%1").arg(e.name);
+        return QByteArray();
+    }
+
+    out.resize(static_cast<qsizetype>(nProduced));
+    // P2-3：实际输出长度与声明长度必须一致（声明值用于预算/分配，
+    // 不能同时相信它；两者不一致说明头部或数据被篡改）。
+    if (nProduced != qint64(e.uncompSize))
+    {
+        m_lastError = QStringLiteral("解压长度与声明不一致：%1").arg(e.name);
+        return QByteArray();
+    }
+    const quint32 actual = quint32(::crc32(0L, reinterpret_cast<const Bytef *>(out.constData()),
+                                            uInt(out.size())));
+    if (actual != e.crc32)
+    {
+        m_lastError = QStringLiteral("内容 CRC 不匹配：%1").arg(e.name);
+        return QByteArray();
+    }
+    return out;
 }

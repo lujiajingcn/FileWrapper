@@ -1,7 +1,11 @@
 # 插件测试（plugin tests）
 
 本目录是**仓库内的可复现测试套件**，覆盖「插件基础设施」与 `PluginWord` 的真实渲染，
-共 **236 项断言**（完整 236 PASS；`-SkipShots` 为 233 PASS + 3 SKIP）。其中 V13b/c 只在**没有音频输出设备**时执行，换到无设备机器会多 2 条（238 PASS）。它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
+共 **247 项断言**（其中 V13b/c 只在**没有音频输出设备**时执行；有设备时少 2 条 = 245）。
+本机（有音频设备、TEMP 可写）`--integrate --shots` 实测为
+**245 PASS / 0 FAIL / 0 SKIP**；`-SkipShots` 为 **242 PASS / 0 FAIL / 3 SKIP**
+（3 条是未启用的截图断言）。无音频设备时 V13b/c 会多 2 条，总数变为 247。
+它替代了以前只存在于 `.workbuddy/tmp`（被 gitignore）里的临时探针 ——
 那些探针随机器一起消失，导致同一套验证别人无法跑、也没法回归。
 
 ## 为什么这样设计
@@ -39,7 +43,9 @@
 | `P` | FWDA v3 元数据：合并时把创建/修改/访问时间与 DOS 属性（R/H/S/A）写进归档；v2 旧归档照常读取但标为无元数据；导出/分割把时间与只读属性写回磁盘；新增文件保存时落盘；v3 归档再合并时条目元数据随条目保留；头部 CRC 覆盖新增字段，损坏被拒 |
 
 素材见 [fixtures/](fixtures)：`basic.docx`（常规排版）、`chinese.docx`（中文样式名 +
-中文编号 + 合并单元格）、`legacy.doc`/`broken.docx`/`notword.docx`/`empty.docx`（异常输入），`sample.rtf`（RTF 正向用例）。
+中文编号 + 合并单元格）、`legacy.doc`/`broken.docx`/`notword.docx`/`empty.docx`（异常输入），
+`sample.rtf`（RTF 正向用例）、`sample_odt_repeat.odt`（ODT 行列 repeat）、
+`opc_percent.docx/pptx/xlsx`（OPC Target `%20` 解码）。
 
 ## 前置条件
 
@@ -76,6 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1 -
 | `-SkipShots` | 不输出渲染截图（3 条截图断言计 SKIP） |
 | `-RegenerateFixtures` | 先跑 `fixtures/make_fixtures.py` 重新生成素材 |
 | `-Python <exe>` | Python 可执行文件路径（配合 `-RegenerateFixtures`） |
+| `-TimeoutSec <n>` | 测试进程超时秒数；默认 600，超时会杀掉进程树并返回退出码 124 |
 
 产物（均被 gitignore）：
 
@@ -123,7 +130,7 @@ copy ..\..\..\build\Desktop_Qt_6_9_3_MinGW_64_bit_Debug\FileWrapper\debug\plugin
     卸载其一会让插件侧遗留对象的虚表悬空 → 退出期崩溃，V 组踩过）。
 - **改插件接口**：记得 `PLUGIN_API_VERSION +1`（见 `include/plugininterface.h`），
   并同步所有插件 JSON 的 `"apiVersion"`；版本门禁用例 `W8` 会继续守住"旧插件被拒"。
-  **当前接口版本 = 6**（v3 引入 `sendFile(const PluginFile &)`；v4 增加 `sendFileMapped()` 归档内存映射零拷贝通道；v5 增加 `stopPlaybackAndWait()`，保存/卸载前确认后台解码线程已退出；v6 增加 `lastError()`：插件把打开失败的**真实原因**回报宿主——以前界面一律显示「插件无法显示该文件」，把"这台机器没有音频输出设备"说成"文件坏了"）。
+  **当前接口版本 = 7**（v3 引入 `sendFile(const PluginFile &)`；v4 增加 `sendFileMapped()` 归档内存映射零拷贝通道；v5 增加 `stopPlaybackAndWait()`，保存/卸载前确认后台解码线程已退出；v6 增加 `lastError()`：插件把打开失败的**真实原因**回报宿主；v7 增加 `isPlaybackStopped()`：停播超时后宿主可非阻塞复查，后台线程退出后自动解除 unsafe 状态、恢复保存/重载）。
 - **新插件想吃"零拷贝"通道**：在 `showFile()` 里直接用 `file.memory()`；
   基类的 `sendFile()` 已经把空值/路径/旧通道都适配好了。
 

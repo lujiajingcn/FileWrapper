@@ -11,6 +11,7 @@
 #include <QStackedWidget>
 #include <QHeaderView>
 #include <QPixmap>
+#include <QImage>
 #include <QPersistentModelIndex>
 #include <QToolBar>
 #include <QLayout>
@@ -36,6 +37,17 @@
 class QProgressDialog;
 class QCloseEvent;
 class QResizeEvent;
+class QThreadPool;
+
+// 缩略图后台解码的共享门：任务线程在完成时归还 inFlight，主线程在保存前
+// 等待它归零（Windows 下后台仍打开归档句柄会让 rename 失败）。
+struct ThumbnailGate
+{
+    QMutex mutex;
+    QWaitCondition idle;
+    int inFlight = 0;
+    std::atomic<quint64> generation{0};   // 切归档/切视图后旧结果直接丢弃
+};
 
 namespace Ui {
 class MainWindow;
@@ -167,6 +179,9 @@ protected:
     void refreshFilePathView();
     // 保存重写归档后，按路径把各标签页缓存的 FILEINFO 更新为最新偏移
     void refreshTabInfosFromManager();
+    // 保存成功后的统一善后：作废缩略图缓存、回填标签页偏移、刷新列表与动作状态。
+    // Ctrl+S 与“未保存改动”提示里的保存都必须走这里。
+    void afterArchiveSaved();
     void populateFilePathList(bool bShowPath);
     void populateFilePathTree();
     void populateFilePathThumbnails(bool bShowPath);
@@ -183,7 +198,12 @@ protected:
     void invalidateThumbnailCache();
     void scheduleNextThumbnail();
     void processNextThumbnail(quint64 nEpoch);
-    // 离开树形前记住展开状态（切平铺/切缩略图共用）
+    // 后台解码完成（GUI 线程）：降 inFlight、校验代数、QPixmap::fromImage 后设置图标。
+    void onThumbnailDecoded(const QString &sPath, const QImage &img, quint64 nEpoch);
+    // 保存/替换归档前等待后台缩略图读取结束，避免 Windows 下归档句柄让 rename 失败。
+    bool waitForThumbnailReads(int nTimeoutMs);
+    bool prepareThumbnailsForArchiveWrite(int nTimeoutMs = 5000);
+    // 离开树形前记住展开状态（切平铺、切缩略图共用）
     void captureTreeExpansionState();
     static bool isThumbnailImageName(const QString &sFileName);
 
@@ -296,6 +316,10 @@ private:
     QStringList              m_listThumbnailPending;
     QHash<QString, QPersistentModelIndex> m_mapThumbnailIndex;
     quint64                  m_nThumbnailEpoch = 0;   // 模式切换/重建时作废过期的空闲回调
+    int                      m_nThumbnailGenerated = 0;   // 本轮已提交张数（防模型图标无限囤积）
+    int                      m_nThumbnailInFlight = 0;    // 已提交、尚未回到 GUI 的任务数
+    QSharedPointer<ThumbnailGate> m_thumbGate = QSharedPointer<ThumbnailGate>::create();
+    QThreadPool             *m_thumbPool = nullptr;       // 专职缩略图解码，最多 2 线程
 
     PluginInterface         *m_pCurrentInterface = nullptr;
 
@@ -341,6 +365,9 @@ private:
     QSet<PluginInterface*>   m_setStopUnsafe;
     // 已从标签页摘除、但因停止失败而无法销毁的独占实例（延期清理）
     QVector<PluginInterface*> m_vtDeferredInstances;
+    // v7：每秒非阻塞复查 unsafe 实例的 isPlaybackStopped()，后台线程退出后
+    // 自动解除 unsafe、释放映射、销毁延期实例并恢复保存/重载。
+    QTimer                  *m_stopUnsafePoll = nullptr;
     // 已经提示过「插件不可用」且用户选择放弃的插件：避免对同一插件反复弹窗
     QSet<QString>            m_setWarnedPlugins;
     QSet<QString>            m_setBuiltinTextPlugins;   // 用户选择“以文本查看”的插件，允许再次兜底
@@ -375,6 +402,8 @@ private:
     bool ensureInstanceStopped(PluginInterface *iface);
     // 批量尝试停止：返回是否所有实例都可安全销毁
     bool ensureAllInstancesStopped();
+    // 非阻塞复查 unsafe 集合；只调用插件 isPlaybackStopped()，不等待解码线程。
+    void pollStopUnsafeInstances();
     void closeAllTabs();
     void newEmptyTab();
     bool resolvePlugin(const FILEINFO &info, QString &sPluginPath, PluginInterface* &pInterface, bool &bOwned);

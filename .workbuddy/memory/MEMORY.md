@@ -51,7 +51,8 @@
   （`plugindiag.cpp` 比对清单得出缺了哪个依赖、干什么用的）+「插件设置 → 插件诊断」。
   `PluginManager::retryFailedPlugins()` 只重试失败项，**不要实现整表 reload**：
   标签页里持有插件实例，卸载 DLL 会让指针悬空。
-- **回归测试在仓库里（C4）**：`tests/` 下插件测试套件（当前基线 194 PASS / 3 SKIP），
+- **回归测试在仓库里（C4）**：`tests/` 下插件测试套件（当前共 247 项断言；有音频设备
+  时 245。本机 `--shots` 实测 245 PASS / 0 FAIL / 0 SKIP，`-SkipShots` 为 242 PASS+3 SKIP），
   一键 `powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-plugin-tests.ps1`。
   改插件/改插件接口/改部署后先跑它；产物在 `tests/build/`（已 gitignore）。
   不要再把测试写成只存在于 `.workbuddy/tmp` 的临时探针 —— 那类东西无法复现。
@@ -61,6 +62,9 @@
   正确做法：写脚本用 `Start-Process -RedirectStandardOutput/-RedirectStandardError -Wait -PassThru`
   启动 `powershell -File runner.ps1`，再读 `$p.ExitCode`（若遇 HTTPS_PROXY 大小写冲突，
   先清空 `$env:HTTPS_PROXY`/`$env:HTTP_PROXY`）。
+  **runner 自身**现在用 `System.Diagnostics.ProcessStartInfo` + `WaitForExit(ms)` +
+  `-TimeoutSec`（默认 600，超时杀进程树并返回 124）；不要改回裸 `& $TestExe`，
+  也不要依赖 PS 5.1 `Start-Process -NoNewWindow` 的 `ExitCode`（实测可能为空）。
 - **测试里加载插件只从 `<exe>/plugins`**（PluginManager 用的那一份），用
   `QPluginLoader` 取模板 + `createInstance()` 渲染 + 显式 `delete`；
   **绝不能从另一个路径再加载同一个 DLL** —— Windows 会当成两个模块，
@@ -84,6 +88,11 @@
 - **PluginWord 同时是 ODF 解析器**：ZIP 里的 `mimetype` 含 `opendocument.text` 即按
   ODT 解析（content.xml/styles.xml → 同一套 HTML 子集，支持标题/字符格式/列表/表格/
   内嵌图片/超链接），`.odt/.ott` 已在 pluginWord.json 里声明。
+  ODT 表格的 `table:number-rows/columns-repeated` 按 `kMaxOdtRepeatPreview=40`
+  物化（超限 markTruncated），不能直接按原始 repeat 循环（常见 16384 空行/列）。
+- **OPC Target 百分号解码有仓库内回归**：`tests/fixtures/opc_percent.docx/pptx/xlsx`
+  把主文档/幻灯片/工作表部件名写成 `%20`，V15a–c 断言三个插件都能读到正文；
+  改 `percentDecodeStrict()`/`resolvePart()`/`joinPath()` 必须重跑这三条。
 - **PluginWord 还带 RTF 子集解析器**（`rtfdocument.{h,cpp}`）：RTF 不是 ZIP/XML，是
   控制字 + 嵌套分组，单独解析成段落/字符模型再生成 HTML；支持 \par/\line/\tab、
   对齐与缩进、粗/斜/下划线/删除线/上下标/字号/颜色/字体、\'hh（本地编码）与 \uN；
@@ -207,8 +216,9 @@
   已加载归档时加载新归档会先确认"关闭所有标签页"。
 - **可运行打包**：`FileWrapper/deploy/package.ps1`（复制依赖后跑 windeployqt，
   产出可直接双击的目录；构建目录本身不可双击运行）。
-  ⚠️ 该脚本守卫缺 `OutDir==repoRoot` 判断：build 树在仓库外、`-OutDir` 指仓库根
-  并带 `-Overwrite` 时会递归删库（第三轮 P1，见下）。
+  守卫已禁止 `OutDir` 等于仓库根**或位于仓库内任意子目录**（`.git`/源码目录也会被
+  `Remove-Item -Recurse -Force` 删掉；第四轮补的包含检查），打包输出请放仓库外。
+  脚本同时复制 `translations/`，否则打包版缺少 `qtbase_zh_CN.qm`、插件诊断会误报缺依赖。
 - **全工程审计历史**：仓库根 `CODE_AUDIT_FINAL_2026-11-18.md`（43 项）、
   `CODE_AUDIT_CYCLE2_2026-11-18.md`（109 项）、`CODE_AUDIT_CYCLE3_2026-11-19.md`（16 项，
   HEAD=28dbbe5，P1 为 package.ps1 删库）。前两轮项已在 52 个 audit/audit2 提交中修复；
@@ -226,6 +236,8 @@
     回滚失败要把备份绝对路径告诉用户；
   - 跨进程锁是自实现的 `<输出>.fwdalock`（NewOnly+PID+30s 陈旧），**不要换回
     QLockFile**：受限权限/沙箱下它返回 PermissionError，会把正常保存全挡死；
+    30s 只是“可能已崩溃”的门槛，删锁前必须用 `isProcessAliveForLock()` 确认 PID
+    已退出——长保存超过 30s 时旧实现会被第二个实例抢锁；析构也只删自己 PID 的锁；
   - 墓碑式原地快速删除已停用（`markDeletedOnly` 保留但无调用）；大归档删除会重写内容区，
     若要恢复必须先做写前日志 + 启动恢复。
 - **标签/实例生命周期**：`MainWindow::ensureInstanceStopped()` 是唯一停止入口；
@@ -236,17 +248,38 @@
   解码任务签名是 `doDecodeRun(quint64 runId)`，与 `m_contextRunId`/`m_runId` 绑定，
   换文件/停止要 `invalidateDecodeRun()`；`AVIOInterruptCB` 通过 `m_ioInterrupt` 取消阻塞 I/O。
 - **插件资源预算**：`ZipReader` 自带 `ParseBudget`（单条 64 MiB/累计 256 MiB/提取次数），
-  stored 与 deflate 同入口并按 central CRC 校验；Word/Sheet/Slides 有 200 层 XML 深度 +
-  50 万节点 + 输出字符预算；图片先 `QImageReader::size()` 预算再解码。
+  stored 与 deflate 同入口并按 central CRC 校验；声明 `uncompSize=0` 却带压缩数据的条目
+  必须拒绝（否则预算记 0、可反复解压）；解压只按声明长度分配一次，输出超过即拒绝。
+  Word/Sheet/Slides/Book 有 200 层 XML 深度 + 50 万节点 + **单元素 4096 属性**上限
+  （属性放大是 QDom 的二次方成本，2MB/20 万属性可卡 60s）+ 输出字符预算；
+  图片先 `QImageReader::size()` 预算再解码。
+- **缩略图**：模型项会长期持有 QIcon，缓存 `clear()` 不释放它们；因此缩略图按
+  128px 解码，并且每次重建只生成前 1024 张（其余保留类型角标），否则大相册会线性吃内存。
+  读取/解码已移到单线程 `QThreadPool`（`ThumbnailDecodeTask`）：后台只产出 `QImage`，
+  GUI 线程才 `QPixmap::fromImage()`/`setIcon()`；用 `m_nThumbnailEpoch` +
+  `ThumbnailGate::generation` 作废旧结果。**保存/替换归档前必须调用
+  `prepareThumbnailsForArchiveWrite()`**，等后台归档句柄关闭，否则 Windows rename 会失败；
+  后台读的是路径+偏移快照，不要在新线程里调用 `FileManager::entryContent()`。
 - **构建**：`plugin_common.pri` 不再 touch 源码头文件 → 只读源码可构建；代价是
-  **改插件 JSON 后要重跑 qmake**（不会自动重嵌元数据）。
+  **改插件 JSON 后只重跑 qmake 不会重嵌元数据**：必须删除该插件的 `moc_*.cpp`/对象
+  或 `mingw32-make clean` 后再 qmake+make。
 - **测试**：新增 `AUDIT-2026-11` 组（11 条）与 `FW_TEST_SETTINGS_DIR` /
   `FW_TEST_SCRATCH_DIR` 覆盖入口。沙箱下 `QTemporaryDir` 会把目录 ACL 收成 owner-only，
   测试进程反而写不进去 → 受限环境必须用这两个环境变量指向预创建的可写目录。
   无音频设备时 V13 断言"纯音频明确失败并复位界面"；D6 在沙箱按环境 SKIP。
-- **验证基线**：全量构建 0 error；`plugin_tests --integrate` = 236 PASS / 0 FAIL / 0 SKIP
-  （`-SkipShots` 为 233 PASS + 3 SKIP；无音频输出设备时 V13b/c 会多 2 条 → 238）。
-  数字随用例增长，以 `tests/build/logs/plugin_tests.log` 为准。
+- **验证基线**：全量构建 0 error；本机（有音频设备、TEMP 可写）
+  `plugin_tests --integrate` = 245 PASS / 0 FAIL / 0 SKIP（`-SkipShots` 为
+  242 PASS + 3 SKIP）。测试共 247 项（无音频设备时），数字随用例增长，以实际日志为准。
+
+## 2026-11-20 停播超时恢复（接口 v7）
+- `PluginInterface::isPlaybackStopped()`（PLUGIN_API_VERSION 6→7，8 个插件 JSON 同步
+  `apiVersion:7`）：默认 `!hasBackgroundPlayback()`；PluginMedia 用
+  `VideoWorker::isDecodingActive()` 原子查询。
+- 宿主 `m_setStopUnsafe` 不再永久生效：`m_stopUnsafePoll` 每秒非阻塞复查，
+  `pollStopUnsafeInstances()` 成功后退还映射、销毁延期实例、恢复
+  `PluginManager::setUnloadEnabled(true)`，保存/重载随之恢复。
+- 保存/重载入口会先主动 `pollStopUnsafeInstances()` 一次；不要把它改成再次调用
+  `stopPlaybackAndWait()`（会重新阻塞 30 秒）。
 
 ## 2026-11-19 插件失败信息（接口 v6）
 - **起因（用户报的真实问题）**：打开 `1.dat` 里的 `audio.wav` 时提示「插件无法显示该文件：audio.wav」，

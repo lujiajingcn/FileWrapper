@@ -14,6 +14,8 @@
   sample.epub    最小合法 EPUB（PluginBook 冒烟素材，同时覆盖共享 ZipReader 的 inflate）
   sample.html    带标题/粗体/列表的 HTML（PluginText 走富文本渲染的冒烟素材）
   sample.odt     最小合法 ODT（PluginWord 的 OpenDocument 分支冒烟素材）
+  opc_percent.docx/pptx/xlsx
+                 OPC 部件名的 Target 写成 %20、ZIP 条目名是字面空格的回归素材
   sample.svg     简单矢量图（PluginPicture 的 SVG 解码冒烟素材）
   sample.webp    WebP 位图（PluginPicture 的 WebP 解码冒烟素材）
 
@@ -429,6 +431,116 @@ def make_odt():
     return path
 
 
+OPC_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _write_opc_zip(path, parts):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in parts:
+            z.writestr(name, data)
+    return path
+
+
+def make_opc_percent_docx():
+    """主文档部件名在 _rels/.rels 中写成 document%20main.xml。"""
+    path = os.path.join(WORK, "opc_percent.docx")
+    return _write_opc_zip(path, [
+        ("[Content_Types].xml",
+         '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+         '<Default Extension="xml" ContentType="application/xml"/></Types>'),
+        ("_rels/.rels",
+         '<?xml version="1.0"?><Relationships xmlns="%s">'
+         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+         'Target="word/document%%20main.xml"/></Relationships>' % OPC_RELS_NS),
+        ("word/document main.xml",
+         '<?xml version="1.0"?><w:document '
+         'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+         '<w:body><w:p><w:r><w:t>OPC percent word</w:t></w:r></w:p></w:body></w:document>'),
+    ])
+
+
+def make_opc_percent_pptx():
+    """幻灯片部件名在 presentation.xml.rels 中写成 slide%201.xml。"""
+    path = os.path.join(WORK, "opc_percent.pptx")
+    return _write_opc_zip(path, [
+        ("[Content_Types].xml",
+         '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+         '<Default Extension="xml" ContentType="application/xml"/></Types>'),
+        ("ppt/presentation.xml",
+         '<?xml version="1.0"?><p:presentation '
+         'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+         '<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>'),
+        ("ppt/_rels/presentation.xml.rels",
+         '<?xml version="1.0"?><Relationships xmlns="%s">'
+         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" '
+         'Target="slides/slide%%201.xml"/></Relationships>' % OPC_RELS_NS),
+        ("ppt/slides/slide 1.xml",
+         '<?xml version="1.0"?><p:sld '
+         'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+         '<p:cSld><p:spTree><p:sp><p:txBody><a:bodyPr/><a:p><a:r><a:t>OPC percent slide</a:t>'
+         '</a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>'),
+    ])
+
+
+def make_opc_percent_xlsx():
+    """工作表部件名在 workbook.xml.rels 中写成 sheet%201.xml。"""
+    path = os.path.join(WORK, "opc_percent.xlsx")
+    return _write_opc_zip(path, [
+        ("[Content_Types].xml",
+         '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+         '<Default Extension="xml" ContentType="application/xml"/></Types>'),
+        ("xl/workbook.xml",
+         '<?xml version="1.0"?><workbook '
+         'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+         '<sheets><sheet name="S 1" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+        ("xl/_rels/workbook.xml.rels",
+         '<?xml version="1.0"?><Relationships xmlns="%s">'
+         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+         'Target="worksheets/sheet%%201.xml"/></Relationships>' % OPC_RELS_NS),
+        ("xl/worksheets/sheet 1.xml",
+         '<?xml version="1.0"?><worksheet '
+         'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+         '<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>OPC percent sheet</t></is>'
+         '</c></row></sheetData></worksheet>'),
+    ])
+
+
+ODT_REPEAT_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ office:version="1.3">
+ <office:body>
+  <office:text>
+   <table:table>
+    <table:table-row table:number-rows-repeated="2">
+     <table:table-cell table:number-columns-repeated="3"><text:p>R</text:p></table:table-cell>
+     <table:table-cell><text:p>Z</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:text>
+ </office:body>
+</office:document-content>
+"""
+
+
+def make_odt_repeat():
+    """ODT 行/列 repeat：2 行 × (3 个 R + 1 个 Z)。"""
+    path = os.path.join(WORK, "sample_odt_repeat.odt")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"),
+                   b"application/vnd.oasis.opendocument.text",
+                   zipfile.ZIP_STORED)
+        z.writestr("META-INF/manifest.xml", ODT_MANIFEST, zipfile.ZIP_DEFLATED)
+        z.writestr("content.xml", ODT_REPEAT_CONTENT, zipfile.ZIP_DEFLATED)
+        z.writestr("styles.xml", ODT_STYLES, zipfile.ZIP_DEFLATED)
+    return path
+
+
 def make_svg():
     path = os.path.join(WORK, "sample.svg")
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -734,7 +846,8 @@ if __name__ == "__main__":
         print("wrote", path, os.path.getsize(path), "bytes")
     for fn in (make_html, make_odt, make_svg, make_webp, make_rtf,
                make_ods, make_odp, make_xlsx, make_pptx, make_rooted_dat,
-               make_dup_paths_dat):
+               make_dup_paths_dat, make_opc_percent_docx,
+               make_opc_percent_pptx, make_opc_percent_xlsx, make_odt_repeat):
         path = fn()
         print("wrote", path, os.path.getsize(path), "bytes")
     make_broken_files()

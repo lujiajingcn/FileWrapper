@@ -149,7 +149,7 @@ void VideoWorker::setContexts(AVFormatContext *fmtCtx,
                               AVPixelFormat srcPixFmt,
                               AVFrame *frame, AVFrame *audioFrame,
                               SwrContext *swr, uint8_t *aOutBuf,
-                              QMutex *aMutex, QByteArray *aByteBuf,
+                              std::shared_ptr<QMutex> aMutex, std::shared_ptr<QByteArray> aByteBuf,
                               int outSampleRate, int genId,
                               int audioOutBufCapacity,
                               quint64 runId)
@@ -419,7 +419,7 @@ void VideoWorker::doDecodeRun(quint64 runId)
                 const int bytes = av_samples_get_buffer_size(nullptr, AUDIO_OUT_CHANNELS,
                                                              nSamples, AUDIO_OUT_FORMAT, 1);
                 if (bytes <= 0) return;
-                QMutexLocker locker(m_audioMutex);
+                QMutexLocker locker(m_audioMutex.get());
                 const int buffered = m_audioByteBuf->size();
                 if (buffered + bytes <= AUDIO_BUFFER_LIMIT_BYTES
                     || (bytes > AUDIO_BUFFER_LIMIT_BYTES && buffered == 0))
@@ -710,7 +710,7 @@ void VideoWorker::doDecodeRun(quint64 runId)
                                 // 非阻塞追加：缓冲有空间则追加音频数据，否则丢弃当前块。
                                 // 不在此处 sleep——否则会阻塞同一循环中的视频包读取和解码，
                                 // 导致视频帧卡顿。音频 pacing 由主线程消费速率自然控制。
-                                QMutexLocker locker(m_audioMutex);
+                                QMutexLocker locker(m_audioMutex.get());
                                 int buffered = m_audioByteBuf->size();
                                 if (buffered + dst_bufsize <= AUDIO_BUFFER_LIMIT_BYTES
                                     // 单个音频块超过上限时，缓冲为空也允许写入（否则永远无法播放）
@@ -873,19 +873,19 @@ void MainWindow::timeCallback(void)
     if (audioOutput && streamOut && audioOutput->state() != QAudio::StoppedState
      && audioOutput->state() != QAudio::SuspendedState)
     {
-        QMutexLocker locker(&m_audioMutex);
-        int writeBytes = qMin(byteBuf.length(), audioOutput->bytesFree());
+        QMutexLocker locker(m_audioMutex.get());
+        int writeBytes = qMin(byteBuf->length(), audioOutput->bytesFree());
         if (writeBytes > 0)
         {
             // P1-20：只移除**实际写入**的字节。旧实现无视 write() 返回值，
             // 短写/零写入时也会把计划写入的整段 PCM 丢掉（表现为爆音、断音）。
-            const qint64 written = streamOut->write(byteBuf.constData(), writeBytes);
+            const qint64 written = streamOut->write(byteBuf->constData(), writeBytes);
             if (written > 0)
             {
-                if (written < byteBuf.size())
-                    byteBuf.remove(0, int(written));
+                if (written < byteBuf->size())
+                    byteBuf->remove(0, int(written));
                 else
-                    byteBuf.clear();
+                    byteBuf->clear();
             }
             // written <= 0：设备暂时写不进去（或出错），保留数据下一拍重试，
             // 不能丢弃；持续错误由设备状态/错误信号反映。
@@ -957,20 +957,20 @@ void MainWindow::onDecodingFinished(int genId)
             && audioOutput->state() != QAudio::StoppedState
             && audioOutput->state() != QAudio::SuspendedState)
         {
-            QMutexLocker locker(&m_audioMutex);
-            if (!byteBuf.isEmpty())
+            QMutexLocker locker(m_audioMutex.get());
+            if (!byteBuf->isEmpty())
             {
                 qint64 off = 0;
-                while (off < byteBuf.size())
+                while (off < byteBuf->size())
                 {
-                    const qint64 n = streamOut->write(byteBuf.constData() + off, byteBuf.size() - off);
+                    const qint64 n = streamOut->write(byteBuf->constData() + off, byteBuf->size() - off);
                     if (n <= 0) break;
                     off += n;
                 }
-                if (off > 0) byteBuf.remove(0, int(off));
+                if (off > 0) byteBuf->remove(0, int(off));
                 if (off < 0) qWarning() << "[EOF] 尾部 PCM 写入音频设备失败";
-                else if (!byteBuf.isEmpty())
-                    qWarning() << "[EOF] 尾部 PCM 部分未写入，丢弃" << byteBuf.size() << "字节";
+                else if (!byteBuf->isEmpty())
+                    qWarning() << "[EOF] 尾部 PCM 部分未写入，丢弃" << byteBuf->size() << "字节";
             }
         }
 
@@ -1375,6 +1375,13 @@ void MainWindow::stopPlayback()
     stopPlaybackAndWait();
 }
 
+bool MainWindow::isPlaybackStopped() const
+{
+    // 只读原子状态，不阻塞、不碰 FFmpeg 上下文；必须等 doDecode 真正退出才能
+    // 让宿主 unmap/delete。m_videoWorker 由窗口析构管理，宿主查询期间窗口仍存活。
+    return m_videoWorker == nullptr || !m_videoWorker->isDecodingActive();
+}
+
 void MainWindow::clearFFmpegResources(bool force)
 {
     // P0-4：先作废排队中的旧任务，再停止线程；否则 stop 确认后旧任务仍可能
@@ -1430,8 +1437,8 @@ void MainWindow::clearFFmpegResources(bool force)
     m_curVideoOutSize = QSize();   // 重置：下次播放时按新的画面区尺寸重算
 
     {
-        QMutexLocker locker(&m_audioMutex);
-        byteBuf.clear();
+        QMutexLocker locker(m_audioMutex.get());
+        byteBuf->clear();
     }
 }
 
@@ -1444,13 +1451,23 @@ MainWindow::~MainWindow()
     invalidateDecodeRun();
     bool safelyStopped = true;
     if (m_videoWorker)
+    {
+        // 析构也必须显式发出停止请求：invalidateDecodeRun() 只推进 runId/中断标志，
+        // 不会唤醒阻塞在暂停条件变量上的解码循环，也不能打断帧调度里的等待。
+        // 少了这一步时，暂停中析构会白等 3s 再落入“保留 worker”分支：
+        // 线程/上下文泄漏，且 worker 仍持有窗口侧音频锁/缓冲的指针。
+        // 等价于 stopWorkerAndWait() 的停止请求，但这里不再额外阻塞 2 秒。
+        QMetaObject::invokeMethod(m_videoWorker, "requestStop", Qt::DirectConnection);
         safelyStopped = m_videoWorker->waitForDecodingStopped(3000);
+    }
 
     if (!safelyStopped)
     {
         // worker 卡住且仍持有上下文的裸指针副本：释放上下文、delete worker、
         // delete QThread 三者都会 UAF / 导致进程终止。进程即将结束，全部保留
         // （脱离父子关系，避免 QObject 析构间接触发删除）。
+        // 音频互斥锁/PCM 缓冲已改为 shared_ptr（worker 持有一份所有权），
+        // 窗口析构后仍然有效，因此这条兜底路径不再留下悬空的 Qt 成员。
         qWarning() << "[Media] 解码线程未在 3s 内退出：保留 worker/线程/上下文，不删除";
         if (m_videoThread)
         {
@@ -1652,8 +1669,8 @@ void MainWindow::on_stopBtn_clicked(void)
         av_seek_frame(pFormatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
         if (pCodecCtx) avcodec_flush_buffers(pCodecCtx);
         if (aCodecCtx) avcodec_flush_buffers(aCodecCtx);
-        QMutexLocker locker(&m_audioMutex);
-        byteBuf.clear();
+        QMutexLocker locker(m_audioMutex.get());
+        byteBuf->clear();
     }
 
     m_nCurrentMs = 0;
@@ -1722,12 +1739,23 @@ void MainWindow::doSeek(qint64 ms)
     if (!stopWorkerAndWait(2000))
     {
         qWarning() << "[Seek] 解码线程未在 2s 内退出，放弃本次跳转";
+        // P1-18 残留：stopWorkerAndWait() 会先把中断标志置 1，让阻塞中的读尽快返回。
+        // worker 还没退出时必须复位，否则它下一次 av_read_frame 立即返回 AVERROR_EXIT，
+        // 被 doDecodeRun 当成 EOF → 播放静默结束，本函数的“恢复播放”不可能生效。
+        m_ioInterrupt.store(0, std::memory_order_relaxed);
         m_bSeekPending = false;
         m_nCurrentMs = previousMs;
         m_bPlaying = wasPlaying;   // 恢复 seek 前的播放状态，UI 不留在“已暂停”
         if (m_videoWorker)
         {
-            QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
+            // 停止标志只在 worker **确认已退出**（m_running==0）时才清：它仍在运行时
+            // 清掉会让这次停止请求凭空消失，worker 继续按旧位置读包，后续 seek 的
+            // 上下文归属也无法保证（P0-4 的教训）。未退出时保留停止请求，让它在下一次
+            // 检查点自行退出，UI 由随后的 decodingFinished 收尾。
+            if (m_videoWorker->waitForDecodingStopped(0))
+            {
+                QMetaObject::invokeMethod(m_videoWorker, "clearStopRequest", Qt::DirectConnection);
+            }
             QMetaObject::invokeMethod(m_videoWorker, "setPaused", Qt::DirectConnection, Q_ARG(bool, false));
         }
         updatePlayPauseIcon();
@@ -1783,8 +1811,8 @@ void MainWindow::doSeek(qint64 ms)
         if (pCodecCtx) avcodec_flush_buffers(pCodecCtx);
         if (aCodecCtx) avcodec_flush_buffers(aCodecCtx);
         {
-            QMutexLocker locker(&m_audioMutex);
-            byteBuf.clear();
+            QMutexLocker locker(m_audioMutex.get());
+            byteBuf->clear();
         }
 
         m_nCurrentMs = previousMs;
@@ -1808,8 +1836,8 @@ void MainWindow::doSeek(qint64 ms)
 
     // 清空音频缓存
     {
-        QMutexLocker locker(&m_audioMutex);
-        byteBuf.clear();
+        QMutexLocker locker(m_audioMutex.get());
+        byteBuf->clear();
     }
 
     m_nCurrentMs = ms;
@@ -2089,7 +2117,7 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
                                                                                          : audioCodec->name)));
     }
 
-    byteBuf.clear();
+    byteBuf->clear();
 
     // 创建帧（视频帧仅在有视频流时分配）
     if (videoindex >= 0)
@@ -2222,7 +2250,7 @@ int MainWindow::showVideo(char *szFileData, qint64 nFileLen)
                                (videoindex >= 0) ? pCodecCtx->pix_fmt : AV_PIX_FMT_NONE,
                                pFrame, pAudioFrame,
                                swr_ctx, audio_out_buffer,
-                               &m_audioMutex, &byteBuf, out_sample_rate,
+                               m_audioMutex, byteBuf, out_sample_rate,
                                m_genCounter,
                                audio_out_samples_max,
                                m_runId);

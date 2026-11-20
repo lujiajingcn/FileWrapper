@@ -17,6 +17,7 @@
 #include <QWaitCondition>
 #include <QAtomicInt>
 #include <atomic>
+#include <memory>
 
 extern "C"
 {
@@ -89,7 +90,7 @@ public:
                      AVPixelFormat srcPixFmt,
                      AVFrame *frame, AVFrame *audioFrame,
                      SwrContext *swr, uint8_t *aOutBuf,
-                     QMutex *aMutex, QByteArray *aByteBuf,
+                     std::shared_ptr<QMutex> aMutex, std::shared_ptr<QByteArray> aByteBuf,
                      int outSampleRate, int genId,
                      int audioOutBufCapacity,
                      quint64 runId);
@@ -170,8 +171,13 @@ private:
     SwrContext      *swr_ctx = nullptr;
     AVFrame         *pAudioFrame = nullptr;
     uint8_t         *audio_out_buffer = nullptr;
-    QMutex          *m_audioMutex = nullptr;
-    QByteArray      *m_audioByteBuf = nullptr;
+    // 音频缓存互斥锁与 PCM 缓冲改为 shared_ptr：解码线程持有一份所有权。
+    // 原因：P0-5 的“停播未确认”兜底分支会刻意保留 worker/线程，而 MainWindow 对象
+    // 仍会照常析构；若这里还是裸指针，worker 下一次写音频就会访问已销毁的成员
+    // （use-after-free）。shared_ptr 让锁与缓冲活到 worker 真正退出为止，
+    // 代价只是极端情况下随被保留的 worker 一起泄漏到进程退出。
+    std::shared_ptr<QMutex>    m_audioMutex;
+    std::shared_ptr<QByteArray> m_audioByteBuf;
     int m_outSampleRate = AUDIO_OUT_SAMPLE_RATE;
     int m_audioOutBufCapacity = 0;  // 音频输出缓冲区实际容量（样本数），用作 swr_convert 的 out_count
 
@@ -211,6 +217,8 @@ public:
     // 用于主程序切换文件时，确保被隐藏的旧视频 widget 不再在后台发声/解码。
     void stopPlayback();
     bool stopPlaybackAndWait();
+    // v7：非阻塞查询后台解码线程是否已退出（供宿主在 stop 超时后自动复查）。
+    bool isPlaybackStopped() const;
     // 打开失败 / 0 字节时停止后台播放并清空画面，避免残留上一个文件
     void clearContent();
 
@@ -317,7 +325,9 @@ private:
 
     int             audioindex = -1;
     AVCodecContext  *aCodecCtx  = nullptr;
-    QByteArray      byteBuf;
+    // PCM 缓存与互斥锁：shared_ptr，解码线程共享所有权（见 VideoWorker 同名成员的注释）。
+    // 不再作为裸成员被子窗口析构销毁，避免“保留 worker”分支留下悬空指针。
+    std::shared_ptr<QByteArray> byteBuf = std::make_shared<QByteArray>();
     AudioOutputDevice *audioOutput = nullptr;
     QIODevice       *streamOut = nullptr;
 
@@ -326,8 +336,8 @@ private:
     uint8_t           *audio_out_buffer = nullptr;
     AVChannelLayout    out_ch_layout;
 
-    // 音频缓存互斥锁
-    QMutex m_audioMutex;
+    // 音频缓存互斥锁（shared_ptr 理由同上）
+    std::shared_ptr<QMutex> m_audioMutex = std::make_shared<QMutex>();
 
     int    out_sample_rate = AUDIO_OUT_SAMPLE_RATE;
     bool   m_bPlaying = false;

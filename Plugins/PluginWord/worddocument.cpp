@@ -32,6 +32,10 @@ namespace {
 // ---- 限制（防御畸形 / 恶意文件）----
 constexpr int    kMaxBlockCount   = 100000;          // 段落 + 表格总量上限
 constexpr int    kMaxLookupDepth  = 6;               // 定点查找（findDescendant）深度上限
+// ODT 的 table:number-*-repeated 是布局填充（常见 repeat=16384 的空行/空列）。
+// 逻辑上必须按原始次数推进，但物化成 HTML 时只画前 40 份并标记截断，避免
+// 一个伪造的 repeat=2^31-1 直接打爆内存。与 ODS 的 kMaxRepeatPreview 同口径。
+constexpr int    kMaxOdtRepeatPreview = 40;
 // P1-13：递归遍历的结构深度上限。畸形文档可以用几万层 <w:sdt> 把调用栈打爆，
 // 这里统一在遍历函数入口拦截（比原来的 6 层宽松，真正兜住工作量的是下面的元素总数）。
 constexpr int    kMaxXmlDepth     = 200;
@@ -1171,7 +1175,11 @@ WordDocument::RenderResult WordDocument::render(double fontScale)
         m_stats.paragraphs = m_rtf.paragraphs().size();
         m_stats.chars      = m_rtf.charCount();
         m_stats.images     = 0;
-        rtfRes.truncated   = false;
+        // RTF 的段落/字符上限以前固定报 false，用户看到半篇文档却没有任何提示。
+        rtfRes.truncated   = m_rtf.isTruncated();
+        if (rtfRes.truncated)
+            rtfRes.html += QStringLiteral(
+                "<p><i>（RTF 内容超过预览上限，仅显示前一部分内容）</i></p>");
         return rtfRes;
     }
 
@@ -2277,16 +2285,34 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
         }
     };
     collectRows(table, nDepth);
+
+    // ODF 的 repeat 是“同一行/同一格重复 N 次”，不是合并。先按上限裁到预览份数，
+    // 原始值超限时记账：空行/空列常写成 16384，不能因此丢掉表格主体。
+    auto readRepeat = [](const QDomElement &e, const QString &sAttr) {
+        bool bOk = false;
+        const int n = e.attribute(sAttr).toInt(&bOk);
+        return (bOk && n > 0) ? n : 1;
+    };
+    auto previewCount = [](int nRaw) {
+        return qMin(nRaw, kMaxOdtRepeatPreview);
+    };
+
     for (const QDomElement &row : rows)
     {
         if (m_truncated) break;
-        out << QStringLiteral("<tr>");
 
+        const int nRowRepeatRaw = readRepeat(row, QStringLiteral("table:number-rows-repeated"));
+        const int nRowRepeat = previewCount(nRowRepeatRaw);
+        if (nRowRepeatRaw > kMaxOdtRepeatPreview)
+            markTruncated(QStringLiteral("ODT 表格重复行超过预览上限，已截断"));
+
+        QString sRow = QStringLiteral("<tr>");
         for (QDomElement cell = row.firstChildElement(); !cell.isNull();
              cell = cell.nextSiblingElement())
         {
             const QString cellTag = cell.tagName();
             // 被纵向合并覆盖的格子不输出；首格会带 rowspan 自动占位。
+            // covered-table-cell 的 repeat 只是占位，HTML 的 colspan 已经覆盖。
             if (cellTag == QLatin1String("table:covered-table-cell")) continue;
             if (cellTag != QLatin1String("table:table-cell")) continue;
 
@@ -2294,6 +2320,11 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
                 QStringLiteral("table:number-columns-spanned")).toInt(), 50);
             const int rowSpan = qBound(1, cell.attribute(
                 QStringLiteral("table:number-rows-spanned")).toInt(), 50);
+            const int nColRepeatRaw = readRepeat(
+                cell, QStringLiteral("table:number-columns-repeated"));
+            const int nColRepeat = previewCount(nColRepeatRaw);
+            if (nColRepeatRaw > kMaxOdtRepeatPreview)
+                markTruncated(QStringLiteral("ODT 表格重复列超过预览上限，已截断"));
 
             QStringList inner;
             for (QDomElement child = cell.firstChildElement(); !child.isNull();
@@ -2317,21 +2348,28 @@ void WordDocument::emitOdtTable(const QDomElement &table, QStringList &out, doub
                 }
             }
 
-            out << QStringLiteral("<td");
-            if (span > 1) out << QStringLiteral(" colspan=\"%1\"").arg(span);
-            if (rowSpan > 1) out << QStringLiteral(" rowspan=\"%1\"").arg(rowSpan);
-            out << QStringLiteral(">");
-            if (inner.isEmpty()) out << QStringLiteral("&#160;");
-            else                 out << inner.join(QString());
-            out << QStringLiteral("</td>");
+            QString sCell = QStringLiteral("<td");
+            if (span > 1) sCell += QStringLiteral(" colspan=\"%1\"").arg(span);
+            if (rowSpan > 1) sCell += QStringLiteral(" rowspan=\"%1\"").arg(rowSpan);
+            sCell += QStringLiteral(">");
+            if (inner.isEmpty()) sCell += QStringLiteral("&#160;");
+            else                 sCell += inner.join(QString());
+            sCell += QStringLiteral("</td>");
 
-            // P1-16：逐格记账（与 docx 表格同口径）
-            qint64 nOut = 32;
-            for (const QString &s : inner) nOut += s.size();
-            accountHtml(nOut);
+            for (int c = 0; c < nColRepeat; ++c)
+                sRow += sCell;
             if (m_truncated) break;
         }
-        out << QStringLiteral("</tr>");
+        sRow += QStringLiteral("</tr>");
+
+        // 行重复时把整行 HTML 复制 nRowRepeat 份；逐行记账，避免只在第一份上
+        // 消耗预算、复制出来的内容完全绕过 kMaxHtmlChars。
+        for (int r = 0; r < nRowRepeat; ++r)
+        {
+            out << sRow;
+            accountHtml(qint64(sRow.size()));
+            if (m_truncated) break;
+        }
     }
     out << QStringLiteral("</table>");
 }
