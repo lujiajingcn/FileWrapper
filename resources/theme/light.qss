@@ -298,6 +298,28 @@ QPushButton:default:hover {
     color: #FFFFFF;
 }
 
+/* 合并对话框的「确定」：保留默认按钮语义（Enter 直接确定），但不要 :default
+   的实心蓝底——它与右侧白底的「取消」并排时过于抢眼。这里只留文字和边框，
+   hover / pressed / disabled 显式补全，避免被上面的通用规则重新涂上颜色。 */
+QDialog#DlgMergeFile QPushButton#btnOk {
+    background-color: transparent;
+    border-color: #D6DEE9;
+    color: #374151;
+}
+QDialog#DlgMergeFile QPushButton#btnOk:hover {
+    background-color: #F7FBFF;
+    border-color: #2E8EF1;
+    color: #1F6FE0;
+}
+QDialog#DlgMergeFile QPushButton#btnOk:pressed {
+    background-color: #E8F2FE;
+}
+QDialog#DlgMergeFile QPushButton#btnOk:disabled {
+    background-color: transparent;
+    border-color: #E7EBF2;
+    color: #B6BECB;
+}
+
 /* 状态栏 ---------------------------------------------------------------- */
 QStatusBar {
     background-color: #FFFFFF;

@@ -87,7 +87,7 @@
         <layout class="QGridLayout" name="gridLayout">
          <item row="0" column="1">
           <widget class="QLineEdit" name="leMergedFilePath">
-           <property name="text">
+           <property name="placeholderText">
             <string>合并后的文件路径</string>
            </property>
           </widget>
