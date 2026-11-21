@@ -166,9 +166,11 @@ private slots:
     void onActionOutputFileTriggered();
     void onActionSaveFileTriggered();
     void onActionVerifyArchiveTriggered();
+    void onActionCompactArchiveTriggered();
     void onFileManagerWarning(const QString &sMsg);
     void on_actionAbout_triggered();
     void onActionPluginSettingsTriggered();
+    void onActionCryptoKeySettings();
     void on_actionUnloadFile_triggered();
 
     void onTabCloseRequested(int index);
@@ -197,7 +199,13 @@ protected:
     void refreshTabInfosFromManager();
     // 保存成功后的统一善后：作废缩略图缓存、回填标签页偏移、刷新列表与动作状态。
     // Ctrl+S 与“未保存改动”提示里的保存都必须走这里。
-    void afterArchiveSaved();
+    // bContentChanged=false：本次只重写了归档头部（快速保存），条目内容与偏移都没变，
+    // 缩略图缓存可以继续复用，不必重新解码。
+    void afterArchiveSaved(bool bContentChanged = true);
+    // 替换归档文件前的统一准备：等后台 CRC 线程、停播并释放映射、等缩略图读完。
+    // 返回 false 表示用户取消或环境不满足（已给出可读提示）。
+    // 只重写头部的快速保存不替换文件，因此不需要走这里。
+    bool prepareForArchiveReplacement();
     void populateFilePathList(bool bShowPath);
     void populateFilePathTree();
     void populateFilePathThumbnails(bool bShowPath);
@@ -321,6 +329,8 @@ private:
     QAction                 *m_acOutputFile;
     QAction                 *m_acSaveFile;
     QAction                 *m_acVerify = nullptr;
+    // 整理归档（回收“快速保存”留下的空洞；会重写整个归档）
+    QAction                 *m_acCompact = nullptr;
 
     // 文件列表的三种显示模式（树形 / 平铺 / 缩略图）
     enum FileViewMode

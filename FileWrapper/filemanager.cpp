@@ -1,5 +1,9 @@
 #include "filemanager.h"
 #include "filemetadata.h"
+#include "crypto/archivecrypto.h"
+#include "crypto/archiveindex.h"
+#include "crypto/cngcipher.h"
+#include "crypto/keyring.h"
 
 #include <QApplication>
 #include <QDebug>
@@ -12,6 +16,7 @@
 #include <QSet>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <new>
 
 #ifdef Q_OS_WIN
@@ -22,6 +27,7 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <io.h>          // _get_osfhandle：FlushFileBuffers 需要真实句柄
 #endif
 
 #define MAXBUFFERSIZE (1024 * 1024 * 16)
@@ -30,6 +36,25 @@ static const qint64 kCrcChunk  = 1024 * 1024;      // 头部区校验缓冲
 // 进度事件最多每 100 ms 泵一次：文件 I/O 期间仍能刷新进度/响应取消，
 // 但把 processEvents() 带来的重入窗口压到原来的十分之一（P1-1）。
 static const qint64 kProgressPumpIntervalMs = 100;
+
+namespace {
+// 前置声明：v5 头部字节构建（定义在合并写入段，供快速保存/追加保存复用）。
+bool buildV5HeaderBytes(const QVector<FwArc::Entry> &entries, const QString &root,
+                        qint64 capacity, const QByteArray &cmk, const QByteArray &uuid,
+                        const QByteArray &productKey, QByteArray *pOut, QString &sErr);
+
+// 归档条目的解密参数（新增未保存文件不适用）。
+FwArcV5::EntryCrypto cryptoForEntry(const FILEINFO &fi, const FwArc::Meta &meta)
+{
+    FwArcV5::EntryCrypto c;
+    c.cmk        = meta.cmk;
+    c.uuid       = meta.archiveUuid;
+    c.entryId    = fi.nEntryId;
+    c.fileNonce  = fi.fileNonce;
+    c.chunkCount = fi.nChunkCount;
+    return c;
+}
+}
 
 namespace {
 
@@ -277,6 +302,76 @@ private:
     bool    m_locked = false;
 };
 
+// 把 QFile 的内存缓冲与系统写缓存都刷到磁盘。
+// “只改头部”的保存是**原地覆盖**：如果不落盘就删回滚日志，掉电/蓝屏后可能留下
+// 半截头部而没有可回滚的副本。
+bool flushFileToDisk(QFile &f)
+{
+    if (!f.flush())
+        return false;
+#ifdef Q_OS_WIN
+    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(f.handle()));
+    if (h != INVALID_HANDLE_VALUE && h != reinterpret_cast<HANDLE>(-1))
+        return FlushFileBuffers(h) != 0;
+#endif
+    return true;
+}
+
+// 原地覆盖文件开头 n 字节并落盘（快速保存 / 回滚共用）。
+// 只用于长度固定的头部区：不改变文件长度，也不碰内容区。
+bool overwriteFileHead(const QString &sPath, const QByteArray &data, QString &sErr)
+{
+    QFile f(sPath);
+    if (!f.open(QIODevice::ReadWrite))
+    {
+        sErr = f.errorString();
+        return false;
+    }
+    if (!f.seek(0))
+    {
+        sErr = f.errorString();
+        return false;
+    }
+    const qint64 nWritten = f.write(data);
+    if (nWritten != data.size())
+    {
+        sErr = nWritten < 0 ? f.errorString()
+                            : QObject::tr("只写入了 %1/%2 字节").arg(nWritten).arg(data.size());
+        return false;
+    }
+    if (!flushFileToDisk(f))
+    {
+        sErr = f.errorString();
+        return false;
+    }
+    return true;
+}
+
+// 读出文件开头 nBytes 字节（旧头部，写回滚日志用）
+bool readFileHead(const QString &sPath, qint64 nBytes, QByteArray &out, QString &sErr)
+{
+    out.clear();
+    if (nBytes <= 0 || nBytes > qint64(FwArc::MAX_HDR_SIZE))
+    {
+        sErr = QObject::tr("头部长度异常: %1").arg(nBytes);
+        return false;
+    }
+    QFile f(sPath);
+    if (!f.open(QIODevice::ReadOnly))
+    {
+        sErr = f.errorString();
+        return false;
+    }
+    out.resize(qsizetype(nBytes));
+    if (f.read(out.data(), nBytes) != nBytes)
+    {
+        sErr = QObject::tr("读取归档头部失败");
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 
@@ -356,7 +451,13 @@ bool FileManager::needsSave() const
 {
     return isArchiveLoaded() && m_bDirty;
 }
-FwArc::Meta FileManager::archiveMeta() const { return m_meta; }
+FwArc::Meta FileManager::archiveMeta() const
+{
+    // CMK 只留在 FileManager 内存里，不随 Meta 交给 UI / 对话框。
+    FwArc::Meta m = m_meta;
+    m.cmk.clear();
+    return m;
+}
 QVector<FILEINFO> FileManager::getFileInfos() { return m_vtFileInfos; }
 
 QString FileManager::getFileName(QString sFilePath)
@@ -368,12 +469,110 @@ QString FileManager::getFileName(QString sFilePath)
 // ============================================================
 // 统一解析入口（P1-1 / P2-3）
 //
-// 头部 CRC、条目字段、区间越界/重叠、UTF-8 与路径安全全部在这里校验。
+// v5：64B 全局头 → wrappedKey（密钥环解 CMK）→ 解密索引 → 条目字段/区间校验。
 // validateMergedFile / QLoadMergedFile / QSplitFiles / verifyArchive 共用。
 // ============================================================
 
+static bool parseArchiveV5(QFile &f, FwArc::Meta &meta, QString &sErr)
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+
+    meta = FwArc::Meta();
+    if (!f.isOpen()) return fail(QStringLiteral("归档文件未打开"));
+
+    const quint64 fileSize = quint64(f.size());
+    meta.fileSize = fileSize;
+    if (fileSize < quint64(FwArc::GLOBAL_HDR) + FwArc::WRAPPED_KEY_LEN
+                       + FwArc::GCM_TAG_LEN)
+        return fail(QStringLiteral("文件过小，不是有效的归档"));
+
+    if (!f.seek(0)) return fail(QStringLiteral("定位文件头失败"));
+    const QByteArray ghBytes = f.read(qint64(FwArc::GLOBAL_HDR));
+    if (ghBytes.size() != int(FwArc::GLOBAL_HDR))
+        return fail(QStringLiteral("读取全局头失败"));
+
+    FwArcV5::GlobalHeader gh;
+    if (!FwArcV5::parseGlobalHeader(ghBytes, &gh, &sErr))
+        return false;
+
+    const quint64 headerSize = quint64(FwArc::GLOBAL_HDR) + quint64(FwArc::WRAPPED_KEY_LEN)
+                             + quint64(gh.indexCipherLen) + quint64(gh.extLen);
+    if (headerSize > fileSize || headerSize > FwArc::MAX_HDR_SIZE)
+        return fail(QStringLiteral("头部大小异常: %1").arg(qulonglong(headerSize)));
+    if (headerSize > quint64((std::numeric_limits<qint64>::max)()))
+        return fail(QStringLiteral("头部大小超出可表示范围"));
+
+    if (!f.seek(qint64(FwArc::GLOBAL_HDR)))
+        return fail(QStringLiteral("定位 wrappedKey 失败"));
+    const QByteArray wrappedKey = f.read(qint64(FwArc::WRAPPED_KEY_LEN));
+    if (wrappedKey.size() != int(FwArc::WRAPPED_KEY_LEN))
+        return fail(QStringLiteral("读取 wrappedKey 失败"));
+
+    if (!f.seek(qint64(FwArc::GLOBAL_HDR) + qint64(FwArc::WRAPPED_KEY_LEN)))
+        return fail(QStringLiteral("定位索引区失败"));
+    const QByteArray indexCipher = f.read(qint64(gh.indexCipherLen));
+    if (indexCipher.size() != int(gh.indexCipherLen))
+        return fail(QStringLiteral("读取索引区失败"));
+
+    // 用密钥环解出 CMK（当前密钥 → 历史密钥依次尝试）。
+    QByteArray cmk;
+    QString keyErr;
+    if (!FwCrypto::KeyRing::instance().unwrap(gh.uuid, wrappedKey, &cmk, &keyErr))
+        return fail(keyErr);
+
+    QByteArray indexPlain;
+    if (!FwArcV5::openIndex(cmk, gh.uuid, gh.indexIv, indexCipher, &indexPlain, &sErr))
+        return false;
+
+    FwArc::Meta m;
+    if (!FwArcIndex::parse(indexPlain, &m, &sErr))
+        return false;
+
+    m.version     = FwArc::CURRENT_VERSION;
+    m.headerSize  = headerSize;
+    m.fileSize    = fileSize;
+    m.archiveUuid = gh.uuid;
+    m.cmk         = cmk;
+
+    // —— 条目内容区：按密文长度校验范围与重叠 ——
+    //
+    // 零长度条目不占内容区（密文长度 0），不参与重叠检测；否则 [P,P) 与 [P,P+N)
+    // 的排序结果不稳定，会随文件数与排序实现误报（v4 已踩过）。
+    QVector<QPair<quint64, quint64>> ranges;
+    ranges.reserve(m.entries.size());
+    for (int i = 0; i < m.entries.size(); ++i)
+    {
+        const FwArc::Entry &e = m.entries.at(i);
+        const quint64 ctLen = FwArc::cipherLenFor(e.size, e.chunkCount);
+        if (e.contentPos < headerSize)
+            return fail(QStringLiteral("第 %1 条内容偏移落在头部区: %2")
+                            .arg(i).arg(qulonglong(e.contentPos)));
+        if (e.contentPos > fileSize || ctLen > fileSize - e.contentPos)
+            return fail(QStringLiteral("第 %1 条内容区越界（size=%2 pos=%3 文件=%4）")
+                            .arg(i)
+                            .arg(qulonglong(e.size))
+                            .arg(qulonglong(e.contentPos))
+                            .arg(qulonglong(fileSize)));
+        if (ctLen > 0)
+            ranges.append(qMakePair(e.contentPos, e.contentPos + ctLen));
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const QPair<quint64, quint64> &a, const QPair<quint64, quint64> &b) {
+                  return a.first < b.first;
+              });
+    for (int i = 1; i < ranges.size(); ++i)
+        if (ranges.at(i).first < ranges.at(i - 1).second)
+            return fail(QStringLiteral("条目内容区重叠（第 %1 条与前一区间冲突）").arg(i));
+
+    meta = m;
+    return true;
+}
+
 bool FileManager::parseFromDevice(QFile &f, FwArc::Meta &meta, QString &sErr)
 {
+    return parseArchiveV5(f, meta, sErr);
+
+    // —— 以下为 v4 明文解析器的残留实现，已不可达，随加密格式落地后删除 ——
     auto fail = [&sErr](const QString &m) { sErr = m; return false; };
 
     meta = FwArc::Meta();
@@ -665,9 +864,13 @@ bool FileManager::validateMergedFile(QString sFilePath, QString *psErrMsg)
 {
     FwArc::Meta meta;
     QString err;
-    const bool ok = parseFile(sFilePath, meta, err);
-    if (psErrMsg) *psErrMsg = ok ? QString() : err;
-    if (!ok) setError(QStringLiteral("归档校验失败: %1").arg(err));
+    // 上一次“只改头部”的保存被打断时，先回滚再校验（无日志时只是一次 stat）
+    QString sRecoverErr;
+    const bool bRecovered = recoverHeaderJournal(sFilePath, &sRecoverErr);
+    const bool ok = bRecovered && parseFile(sFilePath, meta, err);
+    if (psErrMsg) *psErrMsg = ok ? QString() : (bRecovered ? err : sRecoverErr);
+    if (!ok)
+        setError(QStringLiteral("归档校验失败: %1").arg(bRecovered ? err : sRecoverErr));
     return ok;
 }
 
@@ -676,10 +879,13 @@ bool FileManager::validateMergedFile(QString sFilePath, FwArc::Meta *pMeta, QStr
 {
     FwArc::Meta meta;
     QString err;
-    const bool ok = parseFile(sFilePath, meta, err);
+    QString sRecoverErr;
+    const bool bRecovered = recoverHeaderJournal(sFilePath, &sRecoverErr);
+    const bool ok = bRecovered && parseFile(sFilePath, meta, err);
     if (ok && pMeta != nullptr) *pMeta = meta;
-    if (psErrMsg) *psErrMsg = ok ? QString() : err;
-    if (!ok) setError(QStringLiteral("归档校验失败: %1").arg(err));
+    if (psErrMsg) *psErrMsg = ok ? QString() : (bRecovered ? err : sRecoverErr);
+    if (!ok)
+        setError(QStringLiteral("归档校验失败: %1").arg(bRecovered ? err : sRecoverErr));
     return ok;
 }
 
@@ -704,6 +910,13 @@ bool FileManager::hasFreeSpaceFor(const QString &dirPath, qint64 needBytes, qint
 
 bool FileManager::inspectArchive(const QString &sPath, FwArc::Meta &meta, QString &sErr)
 {
+    // 上一次“只改头部”的保存如果被打断，先修复再解析（没有日志时只做一次 stat）
+    QString sRecoverErr;
+    if (!recoverHeaderJournal(sPath, &sRecoverErr))
+    {
+        sErr = sRecoverErr;
+        return false;
+    }
     QFile f(sPath);
     if (!f.open(QIODevice::ReadOnly))
     {
@@ -711,6 +924,175 @@ bool FileManager::inspectArchive(const QString &sPath, FwArc::Meta &meta, QStrin
         return false;
     }
     return parseFromDevice(f, meta, sErr);
+}
+
+// ============================================================
+// 快速保存的写前日志（回滚日志）
+//
+// 布局：Magic "FWHJ"(4) / Version u32(4) / Pid u64(8) / HeaderSize u32(4) /
+//       HeaderCrc32 u32(4) / 旧头部字节[HeaderSize]
+//
+// 顺序是：先把旧头部完整写进日志并落盘，再覆盖归档头部，成功后才删日志。
+// 因此任何时刻崩溃都还有一份可回滚的旧头部；日志本身没写完整则说明头部还没动过。
+// 日志名固定（<归档>.hdrjournal）：同一归档的写者已由 OutputWriteLock 串行化。
+// ============================================================
+
+QString FileManager::headerJournalPath(const QString &sArchivePath)
+{
+    return sArchivePath + QStringLiteral(".hdrjournal");
+}
+
+bool FileManager::writeHeaderJournal(const QString &sArchivePath, const QByteArray &oldHeader,
+                                     QString &sErr)
+{
+    const QString sJournal = headerJournalPath(sArchivePath);
+    // Truncate：上一次崩溃残留的日志会被本次覆盖；此时归档头部还没被本次改动过，
+    // 旧日志丢掉不影响一致性（真要回滚也是回滚到本次的“保存前”状态）。
+    QFile j(sJournal);
+    if (!j.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    {
+        sErr = QObject::tr("%1 (%2)").arg(sJournal, j.errorString());
+        return false;
+    }
+
+    QByteArray head;
+    head.resize(24);
+    std::memcpy(head.data(), "FWHJ", 4);
+    const quint32 nVersion = 1;
+    for (int i = 0; i < 4; ++i) head[4 + i] = char((nVersion >> (i * 8)) & 0xFF);
+    const quint64 nPid = quint64(QCoreApplication::applicationPid());
+    for (int i = 0; i < 8; ++i) head[8 + i] = char((nPid >> (i * 8)) & 0xFF);
+    const quint32 nLen = quint32(oldHeader.size());
+    for (int i = 0; i < 4; ++i) head[16 + i] = char((nLen >> (i * 8)) & 0xFF);
+    FwArc::Crc32 crc;
+    crc.update(oldHeader);
+    for (int i = 0; i < 4; ++i) head[20 + i] = char((crc.value() >> (i * 8)) & 0xFF);
+
+    if (j.write(head) != head.size() || j.write(oldHeader) != oldHeader.size())
+    {
+        sErr = j.errorString();
+        return false;
+    }
+    if (!flushFileToDisk(j))
+    {
+        sErr = QObject::tr("刷新回滚日志失败：%1").arg(j.errorString());
+        return false;
+    }
+    j.close();
+    return true;
+}
+
+bool FileManager::recoverHeaderJournal(const QString &sArchivePath, QString *psErr)
+{
+    if (psErr) psErr->clear();
+    const QString sJournal = headerJournalPath(sArchivePath);
+    if (!QFileInfo::exists(sJournal))
+        return true;
+
+    QFile jf(sJournal);
+    if (!jf.open(QIODevice::ReadOnly))
+    {
+        if (psErr)
+            *psErr = QObject::tr("无法读取上次保存的回滚日志：%1").arg(jf.errorString());
+        return false;
+    }
+    const QByteArray all = jf.readAll();
+    jf.close();
+
+    bool bJournalOk = all.size() >= 24 && std::memcmp(all.constData(), "FWHJ", 4) == 0;
+    quint32 nVersion = 0, nHeaderLen = 0, nWantCrc = 0;
+    quint64 nPid = 0;
+    if (bJournalOk)
+    {
+        nVersion   = FwArc::readU32(all.constData() + 4);
+        nPid       = FwArc::readU64(all.constData() + 8);
+        nHeaderLen = FwArc::readU32(all.constData() + 16);
+        nWantCrc   = FwArc::readU32(all.constData() + 20);
+        bJournalOk = nVersion == 1
+                     && nHeaderLen >= FwArc::GLOBAL_HDR
+                     && qint64(nHeaderLen) <= qint64(FwArc::MAX_HDR_SIZE)
+                     && all.size() == 24 + qint64(nHeaderLen);
+    }
+    if (!bJournalOk)
+    {
+        // 日志没写完整 = 崩在“写日志”阶段，归档头部还没动过：直接丢掉即可
+        qWarning() << "[FileManager] 丢弃不完整的回滚日志:" << sJournal;
+        QFile::remove(sJournal);
+        return true;
+    }
+
+    const QByteArray oldHeader = all.mid(24);
+    FwArc::Crc32 crc;
+    crc.update(oldHeader);
+    if (crc.value() != nWantCrc)
+    {
+        qWarning() << "[FileManager] 回滚日志校验失败，已丢弃:" << sJournal;
+        QFile::remove(sJournal);
+        return true;
+    }
+
+    // 当前头部是否完好？
+    FwArc::Meta meta;
+    QString sParseErr;
+    bool bHeaderOk = false;
+    {
+        QFile f(sArchivePath);
+        if (f.open(QIODevice::ReadOnly))
+            bHeaderOk = parseFromDevice(f, meta, sParseErr);
+        else
+            sParseErr = f.errorString();
+    }
+
+    // 日志很新 + 记录的 PID 还活着 = 另一个实例正在写这个头部：
+    // 这时回滚会覆盖对方的写入，只能让调用方稍后重试。
+    const QFileInfo jfi(sJournal);
+    const qint64 nAgeMs = jfi.lastModified().isValid()
+                              ? jfi.lastModified().msecsTo(QDateTime::currentDateTime())
+                              : (qint64(1) << 40);
+    const bool bWriterActive = nPid > 0 && nAgeMs >= 0 && nAgeMs < 60000
+                               && isProcessAliveForLock(qint64(nPid));
+
+    if (bHeaderOk)
+    {
+        // 头部有效：写入已经完成（崩溃点在“删日志”之前），或崩在“写日志之后、
+        // 改头部之前”。两种情况的最终状态都以头部为准，日志只是崩溃残留。
+        if (!bWriterActive)
+            QFile::remove(sJournal);
+        return true;
+    }
+
+    if (bWriterActive)
+    {
+        if (psErr) *psErr = QObject::tr("另一个实例正在保存该归档，请稍后重试");
+        return false;
+    }
+
+    QString sRestoreErr;
+    if (!overwriteFileHead(sArchivePath, oldHeader, sRestoreErr))
+    {
+        if (psErr)
+            *psErr = QObject::tr("上次保存被中断，回滚归档头部失败：%1\n回滚日志保留在：%2")
+                         .arg(sRestoreErr, sJournal);
+        return false;
+    }
+
+    // 恢复后再解析一次，确认归档真的可用
+    FwArc::Meta meta2;
+    QString sErr2;
+    {
+        QFile f(sArchivePath);
+        if (f.open(QIODevice::ReadOnly) && parseFromDevice(f, meta2, sErr2))
+        {
+            qWarning() << "[FileManager] 检测到上次保存被中断，已用回滚日志恢复归档头部:"
+                       << sArchivePath;
+            QFile::remove(sJournal);
+            return true;
+        }
+    }
+    if (psErr)
+        *psErr = QObject::tr("已用回滚日志恢复头部，但归档仍无法解析：%1\n回滚日志保留在：%2")
+                     .arg(sErr2, sJournal);
+    return false;
 }
 
 bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
@@ -750,9 +1132,17 @@ bool FileManager::extractEntryToTempFile(const QString &sDisplayName,
 
     FwArc::Crc32 crc;
     qint64 copiedTotal = 0;
+    FwArcV5::EntryCrypto inCrypto;
+    const FwArcV5::EntryCrypto *pIn = nullptr;
+    if (!m_setPendingFiles.contains(sDisplayName))
+    {
+        inCrypto = cryptoForEntry(fi, m_meta);
+        pIn = &inCrypto;
+    }
     const bool bOk = streamCopy(localSrc, srcPos, fi.nFileLen, fOut, crc,
                                 copiedTotal, qMax<qint64>(fi.nFileLen, 1),
-                                QStringLiteral("正在准备: ") + fi.sFileName, sErr);
+                                QStringLiteral("正在准备: ") + fi.sFileName, sErr,
+                                pIn, nullptr);
     localSrc.close();
     fOut.close();
     if (!bOk)
@@ -781,6 +1171,13 @@ bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPrePars
     // P1-9：调用方已经 validate 过时直接复用解析结果，避免头部与条目区解析两遍。
     FwArc::Meta meta;
     QString err;
+    // 上一次“只改头部”的保存被打断时，先回滚再加载（无日志时只是一次 stat）
+    QString sRecoverErr;
+    if (!recoverHeaderJournal(sFilePath, &sRecoverErr))
+    {
+        setError(QStringLiteral("加载失败: %1").arg(sRecoverErr));
+        return false;
+    }
     if (pPreParsed != nullptr)
     {
         meta = *pPreParsed;
@@ -867,6 +1264,10 @@ bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPrePars
         fi.nAccessedTime    = qint64(e.accessedMs);
         fi.nAttributes      = e.attributes;
         fi.listTags         = e.tags;
+        fi.nEntryId         = e.entryId;
+        fi.fileNonce        = e.fileNonce;
+        fi.nChunkCount      = e.chunkCount;
+        fi.nContentCrc      = e.contentCrc;
         m_vtFileInfos.push_back(fi);
         m_mapFileInfos[fi.sFilePath] = fi;
         m_mapContentCrc.insert(fi.sFilePath, e.contentCrc);
@@ -877,6 +1278,14 @@ bool FileManager::QLoadMergedFile(QString sFilePath, const FwArc::Meta *pPrePars
     m_bDirty            = false;
     m_bCancelRequested  = false;
     m_sLastError.clear();
+
+    // 内容区空洞 = 文件里没被任何条目引用、也读不到的字节（快速删除留下的）。
+    // 这里算一次存起来：动作状态刷新会高频读取。
+    qint64 nUsed = qint64(meta.headerSize);
+    for (const FwArc::Entry &e : meta.entries)
+        nUsed += qint64(FwArc::cipherLenFor(e.size, e.chunkCount));
+    const qint64 nWaste = qint64(meta.fileSize) - nUsed;
+    m_nReclaimable = nWaste > 0 ? nWaste : 0;
     return true;
 }
 
@@ -889,6 +1298,7 @@ void FileManager::unLoadMergedFile()
     m_setPendingFiles.clear();
     m_mapContentCrc.clear();
     m_meta = FwArc::Meta();
+    m_nReclaimable     = 0;
     m_bDirty           = false;
     m_bCancelRequested = false;
     m_sLastError.clear();
@@ -1057,9 +1467,864 @@ bool FileManager::save()
         return false;   // m_bDirty 保持 true，改动仍在内存中
     }
 
+    // 删除条目 / 改标记不会移动任何内容偏移：只重写头部即可（不再重写内容区）。
+    if (canSaveHeaderOnly())
+    {
+        const bool bOk = saveHeaderOnly();
+        if (bOk) m_bDirty = false;
+        return bOk;     // 失败时保持 dirty：改动仍在内存中，用户可重试
+    }
+
+    // 新增文件：现有条目一个字节都不搬，新内容追加到内容区末尾，头部在预留区原地重写。
+    if (canSaveByAppend())
+    {
+        const bool bOk = saveAppendOnly();
+        if (bOk) m_bDirty = false;
+        return bOk;
+    }
+
+    // 头部预留区放不下 / 有新增文件但路径规划不允许：整包重写。
     const bool bOk = rewriteArchive();
     if (bOk) m_bDirty = false;
     // 失败时保持 dirty：改动仍在内存中，用户可重试
+    return bOk;
+}
+
+// ============================================================
+// 快速保存：只重写归档头部（内容区不动，允许留下空洞）
+//
+// 适用：删除条目、修改标记、以及“加了又删”这种最终没有新增条目的改动。
+// 不适用：新增文件（内容要追加/重排）、条目标记变大到头部放不下。
+// 归档体积不会因此变小（被删内容变成空洞），由 compactArchive() 回收。
+// ============================================================
+
+qint64 FileManager::reclaimableBytes() const
+{
+    return isArchiveLoaded() ? m_nReclaimable : 0;
+}
+
+bool FileManager::canSaveHeaderOnly(QString *psWhy) const
+{
+    auto fail = [psWhy](const QString &m) {
+        if (psWhy) *psWhy = m;
+        return false;
+    };
+    if (psWhy) psWhy->clear();
+
+    if (!isArchiveLoaded())  return fail(tr("没有已加载的归档"));
+    if (isBusy())            return fail(tr("另有文件操作正在进行"));
+    if (!m_bDirty)           return fail(tr("没有未保存的改动"));
+    if (m_vtFileInfos.isEmpty()) return fail(tr("归档内已无条目"));
+    // 新增条目没有归档内偏移，必须整包重写（追加内容）
+    if (!m_setPendingFiles.isEmpty())
+        return fail(tr("本次改动包含新增文件"));
+    // 每个剩余条目都必须来自加载时的快照，其 ContentPos 才保证仍然有效
+    QSet<QString> setLoaded;
+    setLoaded.reserve(m_meta.entries.size());
+    for (const FwArc::Entry &e : m_meta.entries)
+        setLoaded.insert(e.displayPath);
+    for (const FILEINFO &fi : m_vtFileInfos)
+        if (!setLoaded.contains(fi.sFilePath))
+            return fail(tr("本次改动包含新增文件"));
+
+    // v5：索引精确大小必须放得进现有头部容量。
+    const qint64 nCapacity = qint64(m_meta.headerSize) - qint64(FwArc::GLOBAL_HDR)
+                           - qint64(FwArc::WRAPPED_KEY_LEN) - qint64(FwArc::GCM_TAG_LEN);
+    if (nCapacity <= 0)
+        return fail(tr("归档头部大小异常"));
+
+    QHash<QString, int> mapLoadedEntry;
+    mapLoadedEntry.reserve(m_meta.entries.size());
+    for (int i = 0; i < m_meta.entries.size(); ++i)
+        mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+
+    QVector<FwArc::Entry> entries;
+    entries.reserve(m_vtFileInfos.size());
+    for (const FILEINFO &fi : m_vtFileInfos)
+    {
+        const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+        if (it == mapLoadedEntry.constEnd())
+            return fail(tr("条目不是来自当前归档：%1").arg(fi.sFilePath));
+        FwArc::Entry e = m_meta.entries.at(it.value());
+        QString sTagErr;
+        e.tags = FwArc::normalizeTags(fi.listTags, &sTagErr);
+        if (!sTagErr.isEmpty())
+            return fail(tr("第 %1 条标记无效：%2").arg(entries.size()).arg(sTagErr));
+        entries.append(e);
+    }
+    QString sErr;
+    const qint64 nExact = FwArcIndex::exactBytes(entries, m_meta.root, &sErr);
+    if (nExact < 0 || nExact > nCapacity)
+        return fail(tr("头部放不下（需要 %1 B，预留 %2 B）").arg(nExact).arg(nCapacity));
+    return true;
+}
+
+// 头部序列化：删除保存与追加保存共用这一份实现，避免两处口径漂移。
+// 先按 append 累加（不会越界写），再校验是否放得进 nHeaderSize，最后补零到
+// nHeaderSize 并计算头部 CRC（覆盖整段 [24, nHeaderSize)，与 finalize 完全一致）。
+bool FileManager::buildHeaderBuffer(const QVector<HeaderSpec> &specs, const QByteArray &root,
+                                    qint64 nHeaderSize, QByteArray &out, QString &sErr) const
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+
+    if (nHeaderSize < FwArc::GLOBAL_HDR + 4
+        || quint64(nHeaderSize) > FwArc::MAX_HDR_SIZE)
+        return fail(tr("归档头部大小异常"));
+    if (root.size() > int(FwArc::MAX_ROOT_LEN))
+        return fail(tr("原始根过长"));
+
+    QByteArray buf;
+    buf.reserve(int(qMin<qint64>(nHeaderSize, 1 << 20)));
+    buf.append(FwArc::MAGIC, 4);
+    FwArc::appendU32(buf, FwArc::CURRENT_VERSION);
+    FwArc::appendU32(buf, quint32(nHeaderSize));
+    FwArc::appendU32(buf, quint32(specs.size()));
+    FwArc::appendU32(buf, 0);                    // HeaderChecksum 占位
+    FwArc::appendU32(buf, 0);                    // Reserved
+    FwArc::appendU32(buf, quint32(root.size()));
+    if (!root.isEmpty())
+        buf.append(root);
+
+    for (const HeaderSpec &enc : specs)
+    {
+        if (enc.rel.isEmpty() || enc.rel.size() > int(FwArc::MAX_PATH_LEN))
+            return fail(tr("条目路径长度异常"));
+        QVector<QByteArray> tagBytes;
+        tagBytes.reserve(enc.tags.size());
+        for (const QString &tag : enc.tags)
+        {
+            const QByteArray tb = tag.toUtf8();
+            if (tb.isEmpty() || tb.size() > int(FwArc::MAX_TAG_LEN))
+                return fail(tr("条目标记长度异常：%1").arg(tag));
+            tagBytes.append(tb);
+        }
+
+        FwArc::appendU32(buf, quint32(enc.rel.size()));
+        FwArc::appendU64(buf, enc.size);
+        FwArc::appendU64(buf, enc.pos);
+        FwArc::appendU32(buf, enc.crc);
+        FwArc::appendU64(buf, enc.created);
+        FwArc::appendU64(buf, enc.modified);
+        FwArc::appendU64(buf, enc.accessed);
+        FwArc::appendU32(buf, enc.attrs);
+        FwArc::appendU32(buf, quint32(tagBytes.size()));
+        buf.append(enc.rel);
+        for (const QByteArray &tb : tagBytes)
+        {
+            FwArc::appendU32(buf, quint32(tb.size()));
+            buf.append(tb);
+        }
+        // 边写边判：头部放不下就立刻失败，绝不写越界（大标记/很多条目时最容易踩）
+        if (buf.size() > qsizetype(nHeaderSize))
+            return fail(tr("头部放不下：需要至少 %1 B，只有 %2 B")
+                            .arg(buf.size()).arg(nHeaderSize));
+    }
+
+    // 条目区之后的余量保持填零：头部 CRC 覆盖整段，将来新增条目可以直接占用
+    buf.append(QByteArray(qsizetype(nHeaderSize) - buf.size(), '\0'));
+    Q_ASSERT(buf.size() == qsizetype(nHeaderSize));
+
+    FwArc::Crc32 crc;
+    crc.update(buf.constData(), 16);
+    crc.update(buf.constData() + 20, 4);
+    crc.update(buf.constData() + FwArc::GLOBAL_HDR,
+               nHeaderSize - qint64(FwArc::GLOBAL_HDR));
+    const quint32 nCrc = crc.value();
+    for (int i = 0; i < 4; ++i)
+        buf[16 + i] = char((nCrc >> (i * 8)) & 0xFF);
+
+    out = buf;
+    return true;
+}
+
+bool FileManager::buildHeaderOnlyBuffer(const QVector<FILEINFO> &infos, QByteArray &out,
+                                        QString &sErr) const
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+
+    if (m_meta.headerSize < FwArc::GLOBAL_HDR + 4)
+        return fail(tr("归档头部大小异常"));
+    const qint64 nHeaderSize = qint64(m_meta.headerSize);
+
+    const QByteArray rootBytes = m_meta.root.toUtf8();
+    if (rootBytes.size() > int(FwArc::MAX_ROOT_LEN))
+        return fail(tr("原始根过长"));
+
+    // 展示路径 -> 加载时的条目：ContentPos / 内容 CRC 必须原样沿用（内容区没动）
+    QHash<QString, int> mapLoadedEntry;
+    mapLoadedEntry.reserve(m_meta.entries.size());
+    for (int i = 0; i < m_meta.entries.size(); ++i)
+        mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+
+    QVector<HeaderSpec> specs;
+    specs.reserve(infos.size());
+    for (const FILEINFO &fi : infos)
+    {
+        const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+        if (it == mapLoadedEntry.constEnd())
+            return fail(tr("条目不是来自当前归档：%1").arg(fi.sFilePath));
+        const FwArc::Entry &e = m_meta.entries.at(it.value());
+
+        HeaderSpec enc;
+        enc.rel = e.relPath.toUtf8();
+        if (enc.rel.isEmpty() || enc.rel.size() > int(FwArc::MAX_PATH_LEN))
+            return fail(tr("条目路径长度异常：%1").arg(fi.sFilePath));
+
+        QString sTagErr;
+        enc.tags = FwArc::normalizeTags(fi.listTags, &sTagErr);
+        if (!sTagErr.isEmpty())
+            return fail(tr("第 %1 条标记无效：%2").arg(specs.size()).arg(sTagErr));
+
+        // 内容位置/长度/CRC 全部沿用加载时的值：这正是“不搬数据”的前提
+        enc.size = quint64(e.size);
+        enc.pos  = quint64(e.contentPos);
+        enc.crc  = e.contentCrc;
+        // 时间与属性用内存里的值（与写整包时同一套收敛规则）
+        enc.created  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                           ? quint64(fi.nCreatedTime) : 0;
+        enc.modified = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                           ? quint64(fi.nModifiedTime) : 0;
+        enc.accessed = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                           ? quint64(fi.nAccessedTime) : 0;
+        enc.attrs    = fi.nAttributes & FwMeta::ATTR_MASK;
+        specs.append(enc);
+    }
+    return buildHeaderBuffer(specs, rootBytes, nHeaderSize, out, sErr);
+}
+
+// 追加保存用的条目描述：现有条目沿用加载快照里的 ContentPos/CRC，新条目从
+// pNewPositions 取位置（为空时按 0 占位，仅用于估算头部大小与追加字节数）。
+bool FileManager::buildAppendSpecs(const QVector<FILEINFO> &infos,
+                                   const QStringList &storedPaths,
+                                   const QHash<QString, qint64> *pNewPositions,
+                                   QVector<HeaderSpec> &out, qint64 &outExactHeader,
+                                   qint64 &outAppendBytes, QString &sErr) const
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+
+    if (storedPaths.size() != infos.size())
+        return fail(tr("内部错误：条目路径数量不一致"));
+    const QByteArray rootBytes = m_meta.root.toUtf8();
+    if (rootBytes.size() > int(FwArc::MAX_ROOT_LEN))
+        return fail(tr("原始根过长"));
+
+    QHash<QString, int> mapLoadedEntry;
+    mapLoadedEntry.reserve(m_meta.entries.size());
+    for (int i = 0; i < m_meta.entries.size(); ++i)
+        mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+
+    out.clear();
+    out.reserve(infos.size());
+    outExactHeader = qint64(FwArc::GLOBAL_HDR) + 4 + rootBytes.size();
+    outAppendBytes = 0;
+    for (int i = 0; i < infos.size(); ++i)
+    {
+        const FILEINFO &fi = infos.at(i);
+        HeaderSpec enc;
+        enc.rel = FwArc::sanitizeRelativePath(storedPaths.at(i)).toUtf8();
+        if (enc.rel.isEmpty() || enc.rel.size() > int(FwArc::MAX_PATH_LEN))
+            return fail(tr("条目路径长度异常：%1").arg(fi.sFilePath));
+
+        QString sTagErr;
+        enc.tags = FwArc::normalizeTags(fi.listTags, &sTagErr);
+        if (!sTagErr.isEmpty())
+            return fail(tr("第 %1 条标记无效：%2").arg(i).arg(sTagErr));
+
+        enc.created  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                           ? quint64(fi.nCreatedTime) : 0;
+        enc.modified = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                           ? quint64(fi.nModifiedTime) : 0;
+        enc.accessed = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                           ? quint64(fi.nAccessedTime) : 0;
+        enc.attrs    = fi.nAttributes & FwMeta::ATTR_MASK;
+
+        if (m_setPendingFiles.contains(fi.sFilePath))
+        {
+            // 新增条目：位置由追加游标给出，CRC 在复制时算出来后再填
+            enc.size = quint64(fi.nFileLen);
+            enc.pos  = pNewPositions != nullptr
+                           ? quint64(pNewPositions->value(fi.sFilePath, 0)) : 0;
+            enc.crc  = 0;
+            outAppendBytes += fi.nFileLen;
+        }
+        else
+        {
+            const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+            if (it == mapLoadedEntry.constEnd())
+                return fail(tr("条目不是来自当前归档：%1").arg(fi.sFilePath));
+            const FwArc::Entry &e = m_meta.entries.at(it.value());
+            enc.size = quint64(e.size);
+            enc.pos  = quint64(e.contentPos);
+            enc.crc  = e.contentCrc;
+        }
+        outExactHeader += qint64(FwArc::ENTRY_FIXED) + qint64(enc.rel.size())
+                          + qint64(FwArc::tagPayloadBytes(enc.tags));
+        out.append(enc);
+    }
+    return true;
+}
+
+bool FileManager::saveHeaderOnly()
+{
+    QString sWhy;
+    if (!canSaveHeaderOnly(&sWhy))
+    {
+        setError(sWhy);
+        return false;
+    }
+    BusyGuard guard(this);
+
+    const QString sArchivePath = m_qFile.fileName();
+    // 与整包重写同样的外部改动检查：大小变了说明偏移不再可信
+    const qint64 nArchiveSizeNow = QFileInfo(sArchivePath).size();
+    if (nArchiveSizeNow < 0 || quint64(nArchiveSizeNow) != m_meta.fileSize)
+    {
+        setError(tr("归档文件在加载后被外部修改（加载时 %1 B，当前 %2 B），"
+                    "为避免写入错误内容已中止保存。请重新加载归档后重试。")
+                     .arg(m_meta.fileSize).arg(nArchiveSizeNow));
+        return false;
+    }
+
+    // 同一归档的跨进程写锁（与整包重写共用）
+    OutputWriteLock outputLock;
+    QString sLockErr;
+    if (!outputLock.acquire(QFileInfo(sArchivePath).absoluteFilePath(), sLockErr))
+    {
+        setError(sLockErr);
+        return false;
+    }
+
+    const QByteArray productKey = FwCrypto::KeyRing::instance().currentKey();
+    if (productKey.isEmpty())
+    {
+        setError(tr("尚未配置归档密钥，无法保存：请先在“设置 → 归档加密密钥”中配置"));
+        return false;
+    }
+    if (m_meta.headerSize <= quint64(FwArc::GLOBAL_HDR) + FwArc::WRAPPED_KEY_LEN
+                                 + FwArc::GCM_TAG_LEN)
+    {
+        setError(tr("归档头部大小异常"));
+        return false;
+    }
+    const qint64 nCapacity = qint64(m_meta.headerSize) - qint64(FwArc::GLOBAL_HDR)
+                           - qint64(FwArc::WRAPPED_KEY_LEN) - qint64(FwArc::GCM_TAG_LEN);
+
+    // 展示路径 -> 加载时的条目：ContentPos / 内容 CRC / 加密参数必须原样沿用。
+    QHash<QString, int> mapLoadedEntry;
+    mapLoadedEntry.reserve(m_meta.entries.size());
+    for (int i = 0; i < m_meta.entries.size(); ++i)
+        mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+
+    QVector<FwArc::Entry> entries;
+    entries.reserve(m_vtFileInfos.size());
+    QString err;
+    for (const FILEINFO &fi : m_vtFileInfos)
+    {
+        const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+        if (it == mapLoadedEntry.constEnd())
+        {
+            setError(tr("快速保存失败：条目不是来自当前归档：%1").arg(fi.sFilePath));
+            return false;
+        }
+        FwArc::Entry e = m_meta.entries.at(it.value());
+        QString sTagErr;
+        e.tags = FwArc::normalizeTags(fi.listTags, &sTagErr);
+        if (!sTagErr.isEmpty())
+        {
+            setError(tr("快速保存失败：第 %1 条标记无效：%2").arg(entries.size()).arg(sTagErr));
+            return false;
+        }
+        e.createdMs  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                           ? quint64(fi.nCreatedTime) : 0;
+        e.modifiedMs = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                           ? quint64(fi.nModifiedTime) : 0;
+        e.accessedMs = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                           ? quint64(fi.nAccessedTime) : 0;
+        e.attributes = fi.nAttributes & FwMeta::ATTR_MASK;
+        entries.append(e);
+    }
+
+    QByteArray newHeader;
+    if (!buildV5HeaderBytes(entries, m_meta.root, nCapacity, m_meta.cmk, m_meta.archiveUuid,
+                            productKey, &newHeader, err))
+    {
+        setError(tr("快速保存失败：%1").arg(err));
+        return false;
+    }
+
+    // 旧头部：回滚用。读不到就不动文件（宁可这次慢一点，也不能拿不完整的备份去改）
+    QByteArray oldHeader;
+    if (!readFileHead(sArchivePath, qint64(m_meta.headerSize), oldHeader, err))
+    {
+        setError(tr("快速保存失败（读取原头部）：%1").arg(err));
+        return false;
+    }
+
+    const QString sJournal = headerJournalPath(sArchivePath);
+    if (!writeHeaderJournal(sArchivePath, oldHeader, err))
+    {
+        setError(tr("快速保存失败（无法写回滚日志）：%1").arg(err));
+        return false;
+    }
+
+    bool bOk = overwriteFileHead(sArchivePath, newHeader, err);
+
+    // 立刻用真实解析器验收：条目数必须与内存一致（偏移/CRC 都按原值写回）
+    if (bOk)
+    {
+        FwArc::Meta meta;
+        QString sParseErr;
+        if (!parseFile(sArchivePath, meta, sParseErr))
+        {
+            err = sParseErr;
+            bOk = false;
+        }
+        else if (meta.entries.size() != m_vtFileInfos.size())
+        {
+            err = tr("验收解析出的条目数不一致");
+            bOk = false;
+        }
+    }
+
+    if (!bOk)
+    {
+        // 回滚：把旧头部原样写回；回滚失败时保留日志供手工恢复
+        QString sRestoreErr;
+        const bool bRestored = overwriteFileHead(sArchivePath, oldHeader, sRestoreErr);
+        if (bRestored)
+        {
+            QFile::remove(sJournal);
+            setError(tr("快速保存失败：%1\n归档已还原为保存前状态，改动仍保留在内存中，可重试。")
+                         .arg(err));
+        }
+        else
+        {
+            setError(tr("快速保存失败：%1\n回滚也失败：%2\n回滚日志保留在：%3")
+                         .arg(err, sRestoreErr, sJournal));
+        }
+        return false;
+    }
+
+    QFile::remove(sJournal);
+
+    // 重新解析归档：刷新内存里的条目偏移/CRC 表（同时也验证了文件可正常加载）
+    if (!QLoadMergedFile(sArchivePath))
+    {
+        setError(tr("快速保存后重新加载失败：%1").arg(lastError()));
+        return false;
+    }
+    return true;
+}
+
+bool FileManager::canSaveByAppend(QString *psWhy) const
+{
+    auto fail = [psWhy](const QString &m) {
+        if (psWhy) *psWhy = m;
+        return false;
+    };
+    if (psWhy) psWhy->clear();
+
+    if (!isArchiveLoaded())      return fail(tr("没有已加载的归档"));
+    if (isBusy())                return fail(tr("另有文件操作正在进行"));
+    if (!m_bDirty)               return fail(tr("没有未保存的改动"));
+    if (m_vtFileInfos.isEmpty()) return fail(tr("归档内已无条目"));
+    // 没有新增文件时走“只改头部”，没必要写内容
+    if (m_setPendingFiles.isEmpty())
+        return fail(tr("本次改动没有新增文件"));
+
+    // 现有条目必须都来自加载快照：只有它们的内容偏移可以原样沿用
+    QSet<QString> setLoaded;
+    setLoaded.reserve(m_meta.entries.size());
+    for (const FwArc::Entry &e : m_meta.entries)
+        setLoaded.insert(e.displayPath);
+    for (const FILEINFO &fi : m_vtFileInfos)
+        if (!m_setPendingFiles.contains(fi.sFilePath) && !setLoaded.contains(fi.sFilePath))
+            return fail(tr("条目不是来自当前归档：%1").arg(fi.sFilePath));
+
+    // 新增文件必须仍然存在、大小未变（真正复制时 openEntrySource 还会再核一次）
+    for (const FILEINFO &fi : m_vtFileInfos)
+    {
+        if (!m_setPendingFiles.contains(fi.sFilePath))
+            continue;
+        const QFileInfo qfi(fi.sFilePath);
+        if (!qfi.isFile())
+            return fail(tr("新增文件已不存在：%1").arg(fi.sFilePath));
+        if (qfi.size() != fi.nFileLen)
+            return fail(tr("新增文件在加入归档后已发生变化：%1").arg(fi.sFilePath));
+    }
+
+    // 存储路径与整包重写用同一套规则（同时拦下撞名）
+    QString sRoot, sPathErr;
+    QStringList storedPaths;
+    if (!computeStoredPaths(m_vtFileInfos, sRoot, storedPaths, sPathErr))
+        return fail(sPathErr);
+
+    // 追加保存不改变 root：新增文件必须仍落在当前归档的根目录下，否则只能整包重写。
+    // （否则头部会写成「旧 root + 按新 root 计算的相对路径」，条目显示路径会错位。）
+    if (sRoot != m_meta.root)
+        return fail(tr("新增文件不在当前归档根目录下，需要整包重写"));
+
+    QHash<QString, int> mapLoadedEntry;
+    mapLoadedEntry.reserve(m_meta.entries.size());
+    for (int i = 0; i < m_meta.entries.size(); ++i)
+        mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+    for (int i = 0; i < m_vtFileInfos.size(); ++i)
+    {
+        const FILEINFO &fi = m_vtFileInfos.at(i);
+        if (m_setPendingFiles.contains(fi.sFilePath))
+            continue;
+        const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+        if (it == mapLoadedEntry.constEnd())
+            return fail(tr("条目不是来自当前归档：%1").arg(fi.sFilePath));
+        if (storedPaths.at(i) != m_meta.entries.at(it.value()).relPath)
+            return fail(tr("条目存储路径发生变化，需要整包重写：%1").arg(fi.sFilePath));
+    }
+
+    // v5：索引精确大小必须放得进现有头部容量（新条目也需要参与计算）。
+    QVector<FwArc::Entry> entries;
+    entries.reserve(m_vtFileInfos.size());
+    for (int i = 0; i < m_vtFileInfos.size(); ++i)
+    {
+        FwArc::Entry e;
+        e.relPath = FwArc::sanitizeRelativePath(storedPaths.at(i));
+        QString sTagErr;
+        e.tags = FwArc::normalizeTags(m_vtFileInfos.at(i).listTags, &sTagErr);
+        if (!sTagErr.isEmpty())
+            return fail(tr("第 %1 条标记无效：%2").arg(i).arg(sTagErr));
+        entries.append(e);
+    }
+    const qint64 nCapacity = qint64(m_meta.headerSize) - qint64(FwArc::GLOBAL_HDR)
+                           - qint64(FwArc::WRAPPED_KEY_LEN) - qint64(FwArc::GCM_TAG_LEN);
+    QString sErr;
+    const qint64 nExact = FwArcIndex::exactBytes(entries, m_meta.root, &sErr);
+    if (nCapacity <= 0 || nExact < 0 || nExact > nCapacity)
+        return fail(tr("头部放不下（需要 %1 B，预留 %2 B）").arg(nExact).arg(nCapacity));
+    return true;
+}
+
+// 追加保存：现有条目一个字节都不搬，新内容写到原内容区末尾（顺带用掉末尾空洞），
+// 头部在预留区内原地重写。写盘顺序：内容 -> 落盘 -> 头部 -> 落盘 -> 验收。
+bool FileManager::saveAppendOnly()
+{
+    QString sWhy;
+    if (!canSaveByAppend(&sWhy))
+    {
+        setError(sWhy);
+        return false;
+    }
+    BusyGuard guard(this);
+
+    const QString sArchivePath = m_qFile.fileName();
+    const qint64 nArchiveSizeNow = QFileInfo(sArchivePath).size();
+    if (nArchiveSizeNow < 0 || quint64(nArchiveSizeNow) != m_meta.fileSize)
+    {
+        setError(tr("归档文件在加载后被外部修改（加载时 %1 B，当前 %2 B），"
+                    "为避免写入错误内容已中止保存。请重新加载归档后重试。")
+                     .arg(m_meta.fileSize).arg(nArchiveSizeNow));
+        return false;
+    }
+
+    OutputWriteLock outputLock;
+    QString sLockErr;
+    if (!outputLock.acquire(QFileInfo(sArchivePath).absoluteFilePath(), sLockErr))
+    {
+        setError(sLockErr);
+        return false;
+    }
+
+    QString sRoot, sPathErr;
+    QStringList storedPaths;
+    if (!computeStoredPaths(m_vtFileInfos, sRoot, storedPaths, sPathErr))
+    {
+        setError(tr("保存失败：%1").arg(sPathErr));
+        return false;
+    }
+
+    const QByteArray productKey = FwCrypto::KeyRing::instance().currentKey();
+    if (productKey.isEmpty())
+    {
+        setError(tr("尚未配置归档密钥，无法保存：请先在“设置 → 归档加密密钥”中配置"));
+        return false;
+    }
+
+    // 新增条目先生成加密参数，后续追加密文与写头部共用。
+    for (FILEINFO &info : m_vtFileInfos)
+    {
+        if (!m_setPendingFiles.contains(info.sFilePath))
+            continue;
+        info.nEntryId    = FwArcV5::newEntryId();
+        info.fileNonce   = FwArcV5::newFileNonce();
+        info.nChunkCount = FwArc::chunkCountFor(quint64(qMax<qint64>(info.nFileLen, 0)));
+        info.nContentCrc = 0;
+    }
+
+    // 追加基点 = 磁盘上最后一个条目的密文末尾（而不是文件末尾）：
+    // 末尾的空洞没有任何布局引用，直接覆盖它是安全的，还能顺手回收这段空间。
+    qint64 nAppendBase = qint64(m_meta.headerSize);
+    for (const FwArc::Entry &e : m_meta.entries)
+    {
+        const qint64 nEnd = qint64(e.contentPos)
+                          + qint64(FwArc::cipherLenFor(e.size, e.chunkCount));
+        if (nEnd > nAppendBase) nAppendBase = nEnd;
+    }
+    if (nAppendBase > nArchiveSizeNow)
+    {
+        setError(tr("归档内部状态不一致（追加基点 %1 > 文件大小 %2），已中止保存")
+                     .arg(nAppendBase).arg(nArchiveSizeNow));
+        return false;
+    }
+
+    // 新条目位置从追加基点起依次排布
+    QHash<QString, qint64> mapNewPositions;
+    qint64 nCursor = nAppendBase;
+    qint64 nAppendBytes = 0;
+    for (const FILEINFO &fi : m_vtFileInfos)
+    {
+        if (!m_setPendingFiles.contains(fi.sFilePath))
+            continue;
+        mapNewPositions.insert(fi.sFilePath, nCursor);
+        const qint64 ctLen = qint64(FwArc::cipherLenFor(
+            quint64(qMax<qint64>(fi.nFileLen, 0)), fi.nChunkCount));
+        nCursor += ctLen;
+        nAppendBytes += ctLen;
+    }
+
+    const qint64 nFreeBytes = FwArc::availableBytes(sArchivePath);
+    if (nFreeBytes >= 0 && nFreeBytes < nAppendBytes)
+    {
+        setError(tr("磁盘空间不足，无法保存：需要 %1，可用 %2")
+                     .arg(FwArc::formatSize(nAppendBytes), FwArc::formatSize(nFreeBytes)));
+        return false;
+    }
+
+    QVector<HeaderSpec> specs;
+    qint64 nExactHeader = 0, nAppendBytesCheck = 0;
+    QString err;
+    if (!buildAppendSpecs(m_vtFileInfos, storedPaths, &mapNewPositions, specs,
+                          nExactHeader, nAppendBytesCheck, err))
+    {
+        setError(tr("追加保存失败：%1").arg(err));
+        return false;
+    }
+
+    // 旧头部（回滚用）+ 写前日志
+    QByteArray oldHeader;
+    if (!readFileHead(sArchivePath, qint64(m_meta.headerSize), oldHeader, err))
+    {
+        setError(tr("追加保存失败（读取原头部）：%1").arg(err));
+        return false;
+    }
+    if (!writeHeaderJournal(sArchivePath, oldHeader, err))
+    {
+        setError(tr("追加保存失败（无法写回滚日志）：%1").arg(err));
+        return false;
+    }
+    const QString sJournal = headerJournalPath(sArchivePath);
+
+    // —— 第一步：把新内容写到追加基点之后，并算出每条的内容 CRC ——
+    bool bOk = true;
+    qint64 nCopied = 0;
+    {
+        QFile arc(sArchivePath);
+        if (!arc.open(QIODevice::ReadWrite) || !arc.seek(nAppendBase))
+        {
+            err = tr("%1 (%2)").arg(sArchivePath, arc.errorString());
+            bOk = false;
+        }
+        else
+        {
+            for (int i = 0; i < m_vtFileInfos.size() && bOk; ++i)
+            {
+                const FILEINFO &fi = m_vtFileInfos.at(i);
+                if (!m_setPendingFiles.contains(fi.sFilePath))
+                    continue;
+                QFile src;
+                qint64 srcPos = 0;
+                QString sSrcErr;
+                if (!openEntrySource(fi.sFilePath, fi, src, srcPos, sSrcErr))
+                {
+                    err = sSrcErr;
+                    bOk = false;
+                    break;
+                }
+                FwArc::Crc32 eCrc;
+                FwArcV5::EntryCrypto outCrypto;
+                outCrypto.cmk        = m_meta.cmk;
+                outCrypto.uuid       = m_meta.archiveUuid;
+                outCrypto.entryId    = fi.nEntryId;
+                outCrypto.fileNonce  = fi.fileNonce;
+                outCrypto.chunkCount = fi.nChunkCount;
+                bOk = streamCopy(src, srcPos, fi.nFileLen, arc, eCrc, nCopied,
+                                 nAppendBytes, tr("正在追加: %1").arg(fi.sFileName), err,
+                                 nullptr, &outCrypto);
+                if (bOk && src.size() != fi.nFileLen)
+                {
+                    err = tr("文件在保存过程中被修改：%1").arg(fi.sFilePath);
+                    bOk = false;
+                }
+                // 新条目的 CRC 只能在复制时算出来：buildAppendSpecs 里按同一顺序排列
+                if (bOk && i < specs.size())
+                    specs[i].crc = eCrc.value();
+            }
+            // 内容必须先落盘，再写“引用这些内容”的头部
+            if (bOk && !flushFileToDisk(arc))
+            {
+                err = arc.errorString();
+                bOk = false;
+            }
+        }
+    }
+
+    // —— 第二步：头部在预留区内原地重写（位置不变，CRC 已就绪）——
+    if (bOk)
+    {
+        const qint64 nCapacity = qint64(m_meta.headerSize) - qint64(FwArc::GLOBAL_HDR)
+                               - qint64(FwArc::WRAPPED_KEY_LEN) - qint64(FwArc::GCM_TAG_LEN);
+        QHash<QString, int> mapLoadedEntry;
+        for (int i = 0; i < m_meta.entries.size(); ++i)
+            mapLoadedEntry.insert(m_meta.entries.at(i).displayPath, i);
+
+        QVector<FwArc::Entry> entries;
+        entries.reserve(m_vtFileInfos.size());
+        for (int i = 0; i < m_vtFileInfos.size() && bOk; ++i)
+        {
+            const FILEINFO &fi = m_vtFileInfos.at(i);
+            FwArc::Entry e;
+            if (m_setPendingFiles.contains(fi.sFilePath))
+            {
+                e.relPath    = FwArc::sanitizeRelativePath(storedPaths.at(i));
+                e.size       = quint64(qMax<qint64>(fi.nFileLen, 0));
+                e.contentPos = quint64(mapNewPositions.value(fi.sFilePath, 0));
+                e.contentCrc = specs.at(i).crc;
+                e.entryId    = fi.nEntryId;
+                e.fileNonce  = fi.fileNonce;
+                e.chunkCount = fi.nChunkCount;
+                e.tags       = specs.at(i).tags;
+            }
+            else
+            {
+                const auto it = mapLoadedEntry.constFind(fi.sFilePath);
+                if (it == mapLoadedEntry.constEnd())
+                {
+                    err = tr("条目不是来自当前归档：%1").arg(fi.sFilePath);
+                    bOk = false;
+                    break;
+                }
+                e = m_meta.entries.at(it.value());
+                e.tags = specs.at(i).tags;
+            }
+            e.createdMs  = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                               ? quint64(fi.nCreatedTime) : 0;
+            e.modifiedMs = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                               ? quint64(fi.nModifiedTime) : 0;
+            e.accessedMs = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                               ? quint64(fi.nAccessedTime) : 0;
+            e.attributes = fi.nAttributes & FwMeta::ATTR_MASK;
+            entries.append(e);
+        }
+
+        QByteArray newHeader;
+        if (bOk && !buildV5HeaderBytes(entries, m_meta.root, nCapacity, m_meta.cmk,
+                                       m_meta.archiveUuid, productKey, &newHeader, err))
+            bOk = false;
+        else if (bOk && !overwriteFileHead(sArchivePath, newHeader, err))
+            bOk = false;
+    }
+
+    // —— 第三步：用真实解析器验收 ——
+    if (bOk)
+    {
+        FwArc::Meta meta;
+        QString sParseErr;
+        if (!parseFile(sArchivePath, meta, sParseErr))
+        {
+            err = sParseErr;
+            bOk = false;
+        }
+        else if (meta.entries.size() != m_vtFileInfos.size())
+        {
+            err = tr("验收解析出的条目数不一致");
+            bOk = false;
+        }
+    }
+
+    if (!bOk)
+    {
+        // 回滚：恢复旧头部 -> 把文件截回原长度（新追加的内容全部作废）
+        QString sRestoreErr;
+        bool bRestored = overwriteFileHead(sArchivePath, oldHeader, sRestoreErr);
+        if (bRestored)
+        {
+            QFile f(sArchivePath);
+            if (f.open(QIODevice::ReadWrite))
+            {
+                if (!f.resize(m_meta.fileSize))
+                {
+                    sRestoreErr = f.errorString();
+                    bRestored = false;
+                }
+                else
+                {
+                    flushFileToDisk(f);
+                }
+                f.close();
+            }
+            else
+            {
+                sRestoreErr = f.errorString();
+                bRestored = false;
+            }
+        }
+
+        if (bRestored)
+        {
+            QFile::remove(sJournal);
+            setError(tr("追加保存失败：%1\n归档已还原为保存前状态，改动仍保留在内存中，可重试。")
+                         .arg(err));
+        }
+        else
+        {
+            setError(tr("追加保存失败：%1\n回滚也失败：%2\n回滚日志保留在：%3")
+                         .arg(err, sRestoreErr, sJournal));
+        }
+        return false;
+    }
+
+    QFile::remove(sJournal);
+
+    // 重新解析归档：刷新偏移/CRC 表
+    if (!QLoadMergedFile(sArchivePath))
+    {
+        setError(tr("追加保存后重新加载失败：%1").arg(lastError()));
+        return false;
+    }
+    return true;
+}
+
+bool FileManager::compactArchive()
+{
+    if (!isArchiveLoaded())
+    {
+        setError(QStringLiteral("没有已加载的归档文件，无法整理"));
+        return false;
+    }
+    if (isBusy())
+    {
+        setError(QStringLiteral("另有文件操作正在进行，请稍后重试"));
+        return false;
+    }
+    if (m_vtFileInfos.isEmpty())
+    {
+        setError(QStringLiteral("归档内已无条目，无法整理"));
+        return false;
+    }
+    // 没有空洞、也没有未保存改动：无需重写
+    if (!m_bDirty && reclaimableBytes() == 0)
+        return true;
+
+    BusyGuard guard(this);
+    const bool bOk = rewriteArchive();
+    if (bOk) m_bDirty = false;
     return bOk;
 }
 
@@ -1110,10 +2375,19 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
         || quint64(hs) > 0xFFFFFFFFULL)
         return fail(QStringLiteral("归档头部过大: %1 B").arg(hs));
 
+    // 头部预留：条目区之后补零到 capacity。解析器不要求条目区被填满，
+    // 多出来的余量就是“后续新增条目可以原地重写头部”的空间。
+    const qint64 nExactHeader = hs;
+    const qint64 nCapacity = nExactHeader
+                             + qint64(FwArc::headerReserveFor(quint64(nExactHeader)));
+    if (nCapacity < nExactHeader || quint64(nCapacity) > FwArc::MAX_HDR_SIZE
+        || quint64(nCapacity) > 0xFFFFFFFFULL)
+        return fail(QStringLiteral("归档头部过大: %1 B").arg(nCapacity));
+
     if (!fOut.seek(0)) return fail(QStringLiteral("定位输出文件失败"));
     if (fOut.write(FwArc::MAGIC, 4) != 4) return fail(QStringLiteral("写入魔数失败"));
     bool ok = FwArc::writeU32(fOut, FwArc::CURRENT_VERSION)
-           && FwArc::writeU32(fOut, quint32(hs))
+           && FwArc::writeU32(fOut, quint32(nCapacity))
            && FwArc::writeU32(fOut, quint32(infos.size()))
            && FwArc::writeU32(fOut, 0)      // HeaderChecksum 占位
            && FwArc::writeU32(fOut, 0)      // Reserved
@@ -1122,7 +2396,7 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
     if (!rootBytes.isEmpty() && fOut.write(rootBytes) != rootBytes.size())
         return fail(QStringLiteral("写入原始根失败: %1").arg(fOut.errorString()));
 
-    qint64 cp = hs;
+    qint64 cp = nCapacity;
     outCrcFieldPos.clear();
     outContentPos.clear();
     for (int i = 0; i < infos.size(); ++i)
@@ -1164,7 +2438,25 @@ bool FileManager::writeArchiveHeader(QFile &fOut, const QVector<FILEINFO> &infos
         outContentPos.append(cp);
         cp += infos.at(i).nFileLen;
     }
-    outHeaderSize = hs;
+
+    // 补零到 capacity：头部 CRC 覆盖整段 [24, capacity)，这里必须把余量写出来
+    // （否则 finalizeArchiveHeader 回读到文件末尾之外会失败）
+    const qint64 nPadding = nCapacity - nExactHeader;
+    if (nPadding > 0)
+    {
+        if (!fOut.seek(nExactHeader))
+            return fail(QStringLiteral("定位头部预留区失败"));
+        QByteArray zeros(int(qMin<qint64>(nPadding, kCrcChunk)), '\0');
+        qint64 nLeft = nPadding;
+        while (nLeft > 0)
+        {
+            const qint64 n = qMin<qint64>(nLeft, zeros.size());
+            if (fOut.write(zeros.constData(), n) != n)
+                return fail(QStringLiteral("写入头部预留区失败: %1").arg(fOut.errorString()));
+            nLeft -= n;
+        }
+    }
+    outHeaderSize = nCapacity;
     return true;
 }
 
@@ -1217,14 +2509,18 @@ bool FileManager::finalizeArchiveHeader(QFile &fOut, qint64 headerSize,
 // processEvents() 期间被 entryHead()/entryContent() 再次 seek，导致错位读取。
 bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst,
                              FwArc::Crc32 &crc, qint64 &copiedTotal, qint64 totalBytes,
-                             const QString &sStatusPrefix, QString &sErr)
+                             const QString &sStatusPrefix, QString &sErr,
+                             const FwArcV5::EntryCrypto *pIn,
+                             const FwArcV5::EntryCrypto *pOut)
 {
     auto fail = [&sErr](const QString &m) { sErr = m; return false; };
-    if (!fSrc.seek(srcPos)) return fail(QStringLiteral("定位源内容失败: %1").arg(fSrc.errorString()));
 
-    QByteArray buf;
-    buf.resize(int(kCopyChunk));
+    // 明文来源：只需定位一次；加密来源按块各自 seek。
+    if (pIn == nullptr && !fSrc.seek(srcPos))
+        return fail(QStringLiteral("定位源内容失败: %1").arg(fSrc.errorString()));
+
     qint64 done = 0;
+    quint32 chunkIndex = 0;
     int nLastPercent = -1;
     QElapsedTimer pumpTimer;
     pumpTimer.start();
@@ -1232,16 +2528,53 @@ bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst
     {
         if (m_bCancelRequested) return fail(QStringLiteral("操作已取消"));
         const qint64 n = qMin(len - done, kCopyChunk);
-        const qint64 got = fSrc.read(buf.data(), n);
-        if (got <= 0)
-            return fail(QStringLiteral("读取源内容不完整 (%1): %2")
-                        .arg(fSrc.fileName(), fSrc.errorString()));
-        if (fDst.write(buf.data(), got) != got)
+
+        QByteArray plain;
+        if (pIn != nullptr)
+        {
+            // 来源是加密归档条目：按 1 MiB 块读取密文并解密。
+            const qint64 ctOff = srcPos
+                               + qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE + FwArc::GCM_TAG_LEN);
+            if (!fSrc.seek(ctOff))
+                return fail(QStringLiteral("定位源内容失败: %1").arg(fSrc.errorString()));
+            const qint64 ctLen = n + qint64(FwArc::GCM_TAG_LEN);
+            const QByteArray ct = fSrc.read(ctLen);
+            if (ct.size() != int(ctLen))
+                return fail(QStringLiteral("读取源内容不完整 (%1): %2")
+                                .arg(fSrc.fileName(), fSrc.errorString()));
+            if (!FwArcV5::openChunk(pIn->cmk, pIn->uuid, pIn->entryId, pIn->fileNonce,
+                                    chunkIndex, pIn->chunkCount, ct, &plain, &sErr))
+                return false;
+        }
+        else
+        {
+            plain = fSrc.read(n);
+            if (plain.size() != int(n))
+                return fail(QStringLiteral("读取源内容不完整 (%1): %2")
+                                .arg(fSrc.fileName(), fSrc.errorString()));
+        }
+
+        // 内容 CRC 始终按明文计算（写入索引后用于快速损坏定位）。
+        crc.update(plain);
+
+        QByteArray out;
+        if (pOut != nullptr)
+        {
+            if (!FwArcV5::sealChunk(pOut->cmk, pOut->uuid, pOut->entryId, pOut->fileNonce,
+                                    chunkIndex, pOut->chunkCount, plain, &out, &sErr))
+                return false;
+        }
+        else
+        {
+            out = plain;
+        }
+        if (fDst.write(out) != out.size())
             return fail(QStringLiteral("写入目标失败 (%1): %2")
-                        .arg(fDst.fileName(), fDst.errorString()));
-        crc.update(buf.data(), got);
-        done += got;
-        copiedTotal += got;
+                            .arg(fDst.fileName(), fDst.errorString()));
+
+        done += n;
+        ++chunkIndex;
+        copiedTotal += n;
 
         const int pct = (totalBytes > 0) ? int(100 * copiedTotal / totalBytes) : 100;
         if (pct != nLastPercent)
@@ -1262,6 +2595,212 @@ bool FileManager::streamCopy(QFile &fSrc, qint64 srcPos, qint64 len, QFile &fDst
     }
     return true;
 }
+
+// ============================================================
+// FWDA v5 头部写入（合并 / 整包重写共用）
+// ============================================================
+
+namespace {
+
+// 索引容量 = 精确大小 + 预留（沿用 headerReserveFor 策略）。
+bool v5IndexCapacity(const QVector<FwArc::Entry> &entries, const QString &root,
+                     qint64 *pExact, qint64 *pCapacity, QString &sErr)
+{
+    sErr.clear();
+    const qint64 exact = FwArcIndex::exactBytes(entries, root, &sErr);
+    if (exact < 0)
+        return false;
+    const qint64 cap = exact + qint64(FwArc::headerReserveFor(quint64(exact)));
+    if (cap < exact || quint64(cap) > FwArc::MAX_HDR_SIZE
+        || quint64(cap) + FwArc::GLOBAL_HDR + FwArc::WRAPPED_KEY_LEN + FwArc::GCM_TAG_LEN
+               > 0xFFFFFFFFULL)
+    {
+        sErr = QStringLiteral("归档头部过大");
+        return false;
+    }
+    if (pExact) *pExact = exact;
+    if (pCapacity) *pCapacity = cap;
+    return true;
+}
+
+// FILEINFO + 存储路径/标记 → 索引条目；条目里的 entryId/fileNonce/chunkCount
+// 必须已由调用方填好（合并前会生成）。
+bool entriesFromInfos(const QVector<FILEINFO> &infos, const QString &root,
+                      const QStringList *pStoredPaths,
+                      const QVector<quint32> *pCrcs,
+                      QVector<FwArc::Entry> *pOut, QString &sErr)
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+    QVector<FwArc::Entry> entries;
+    entries.reserve(infos.size());
+
+    for (int i = 0; i < infos.size(); ++i)
+    {
+        const FILEINFO &fi = infos.at(i);
+        QString rel = (pStoredPaths != nullptr && pStoredPaths->size() == infos.size())
+                          ? pStoredPaths->at(i)
+                          : FwArc::makeRelative(fi.sFilePath, root);
+        rel = FwArc::sanitizeRelativePath(rel);
+        const QByteArray rb = rel.toUtf8();
+        if (rb.isEmpty() || rb.size() > int(FwArc::MAX_PATH_LEN))
+            return fail(QStringLiteral("条目路径过长: %1").arg(fi.sFilePath));
+
+        QString tagErr;
+        const QStringList tags = FwArc::normalizeTags(fi.listTags, &tagErr);
+        if (!tagErr.isEmpty())
+            return fail(QStringLiteral("第 %1 条标记无效：%2").arg(i).arg(tagErr));
+
+        if (fi.nEntryId == 0 || fi.fileNonce.size() != 8)
+            return fail(QStringLiteral("第 %1 条缺少加密参数").arg(i));
+
+        FwArc::Entry e;
+        e.relPath     = rel;
+        e.displayPath = FwArc::displayPathFor(root, rel);
+        e.size        = quint64(fi.nFileLen);
+        e.entryId     = fi.nEntryId;
+        e.fileNonce   = fi.fileNonce;
+        e.chunkCount  = fi.nChunkCount;
+        e.contentCrc  = (pCrcs != nullptr && pCrcs->size() == infos.size())
+                            ? pCrcs->at(i) : fi.nContentCrc;
+        e.createdMs   = FwMeta::isPlausibleTimestamp(fi.nCreatedTime)
+                            ? quint64(fi.nCreatedTime) : 0;
+        e.modifiedMs  = FwMeta::isPlausibleTimestamp(fi.nModifiedTime)
+                            ? quint64(fi.nModifiedTime) : 0;
+        e.accessedMs  = FwMeta::isPlausibleTimestamp(fi.nAccessedTime)
+                            ? quint64(fi.nAccessedTime) : 0;
+        e.attributes  = fi.nAttributes & FwMeta::ATTR_MASK;
+        e.tags        = tags;
+        entries.append(e);
+    }
+    *pOut = entries;
+    return true;
+}
+
+// 生成完整 v5 头部字节：64B 全局头 + wrappedKey + 加密索引。
+bool buildV5HeaderBytes(const QVector<FwArc::Entry> &entries, const QString &root,
+                        qint64 capacity, const QByteArray &cmk, const QByteArray &uuid,
+                        const QByteArray &productKey, QByteArray *pOut, QString &sErr)
+{
+    auto fail = [&sErr](const QString &m) { sErr = m; return false; };
+
+    QByteArray indexPlain;
+    if (!FwArcIndex::build(entries, root, capacity, &indexPlain, &sErr))
+        return false;
+
+    QByteArray indexIv(int(FwArc::INDEX_IV_LEN), '\0');
+    if (!FwCrypto::randomBytes(indexIv.data(), int(indexIv.size())))
+        return fail(QStringLiteral("生成索引 IV 失败"));
+
+    QByteArray indexCipher;
+    if (!FwArcV5::sealIndex(cmk, uuid, indexIv, indexPlain, &indexCipher, &sErr))
+        return false;
+
+    FwArcV5::GlobalHeader gh;
+    gh.indexCipherLen = quint32(indexCipher.size());
+    gh.uuid    = uuid;
+    gh.indexIv = indexIv;
+    QByteArray ghBytes;
+    if (!FwArcV5::buildGlobalHeader(gh, &ghBytes, &sErr))
+        return false;
+
+    QByteArray wrappedKey;
+    if (!FwArcV5::sealWrappedKey(productKey, cmk, uuid, &wrappedKey, &sErr))
+        return false;
+
+    QByteArray out = ghBytes;
+    out.append(wrappedKey);
+    out.append(indexCipher);
+    *pOut = out;
+    return true;
+}
+
+// 写完整 v5 头部：64B 全局头 + wrappedKey + 加密索引。
+bool writeV5Header(QFile &fOut, const QVector<FwArc::Entry> &entries, const QString &root,
+                   qint64 capacity, const QByteArray &cmk, const QByteArray &uuid,
+                   const QByteArray &productKey, QString &sErr)
+{
+    QByteArray header;
+    if (!buildV5HeaderBytes(entries, root, capacity, cmk, uuid, productKey, &header, sErr))
+        return false;
+    if (!fOut.seek(0))
+    {
+        sErr = QStringLiteral("定位输出文件失败");
+        return false;
+    }
+    if (fOut.write(header) != header.size())
+    {
+        sErr = QStringLiteral("写入归档头部失败: %1").arg(fOut.errorString());
+        return false;
+    }
+    return true;
+}
+
+// 合并/整包重写：生成条目加密参数、计算内容偏移、写头。
+bool writeArchiveHeaderV5(QFile &fOut, QVector<FILEINFO> &infos, const QString &sRoot,
+                          const QByteArray &cmk, const QByteArray &uuid,
+                          const QByteArray &productKey,
+                          QVector<qint64> *pContentPos, qint64 *pHeaderSize,
+                          QString &sErr, const QStringList *pStoredPaths)
+{
+    QVector<FwArc::Entry> entries;
+    if (!entriesFromInfos(infos, sRoot, pStoredPaths, nullptr, &entries, sErr))
+        return false;
+
+    qint64 exact = 0, capacity = 0;
+    if (!v5IndexCapacity(entries, sRoot, &exact, &capacity, sErr))
+        return false;
+
+    const qint64 headerSize = qint64(FwArc::GLOBAL_HDR) + FwArc::WRAPPED_KEY_LEN
+                            + capacity + FwArc::GCM_TAG_LEN;
+    qint64 cp = headerSize;
+    if (pContentPos) pContentPos->clear();
+    for (int i = 0; i < entries.size(); ++i)
+    {
+        entries[i].contentPos = quint64(cp);
+        if (pContentPos) pContentPos->append(cp);
+        cp += qint64(FwArc::cipherLenFor(entries.at(i).size, entries.at(i).chunkCount));
+    }
+
+    if (!writeV5Header(fOut, entries, sRoot, capacity, cmk, uuid, productKey, sErr))
+        return false;
+    *pHeaderSize = headerSize;
+    return true;
+}
+
+// 内容写完后回填 CRC：重建同布局索引（同一容量/偏移），重新加密并覆盖头部。
+bool finalizeArchiveHeaderV5(QFile &fOut, const QVector<FILEINFO> &infos, const QString &sRoot,
+                             const QVector<quint32> &contentCrcs, qint64 headerSize,
+                             const QByteArray &cmk, const QByteArray &uuid,
+                             const QByteArray &productKey, QString &sErr,
+                             const QStringList *pStoredPaths)
+{
+    if (contentCrcs.size() != infos.size())
+    {
+        sErr = QStringLiteral("内部错误：内容 CRC 数量不匹配");
+        return false;
+    }
+    const qint64 capacity = headerSize - qint64(FwArc::GLOBAL_HDR)
+                          - qint64(FwArc::WRAPPED_KEY_LEN) - qint64(FwArc::GCM_TAG_LEN);
+    if (capacity <= 0)
+    {
+        sErr = QStringLiteral("内部错误：头部容量异常");
+        return false;
+    }
+
+    QVector<FwArc::Entry> entries;
+    if (!entriesFromInfos(infos, sRoot, pStoredPaths, &contentCrcs, &entries, sErr))
+        return false;
+
+    qint64 cp = headerSize;
+    for (int i = 0; i < entries.size(); ++i)
+    {
+        entries[i].contentPos = quint64(cp);
+        cp += qint64(FwArc::cipherLenFor(entries.at(i).size, entries.at(i).chunkCount));
+    }
+    return writeV5Header(fOut, entries, sRoot, capacity, cmk, uuid, productKey, sErr);
+}
+
+} // namespace
 
 // ============================================================
 // 合并（P0-1 / P1-7 / P2-4 / P3-2）
@@ -1353,6 +2892,10 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         // P1-2：来源归档条目的内容 CRC。复制完必须与它比对，否则「结构完好但
         // 内容已损坏」的输入会在二次合并后被重新算出 CRC、变成看似完好的归档。
         quint32 nContentCrc = 0;
+        // 来源归档的加密参数（bFromArchive 时用于解密条目内容）
+        QByteArray srcCmk, srcUuid, srcFileNonce;
+        quint64    nSrcEntryId    = 0;
+        quint32    nSrcChunkCount = 0;
         // P1-6：收集时记录来源大小，复制前后各核对一次，防止静默保存旧长度前缀。
         qint64  nSourceSize = -1;
     };
@@ -1410,6 +2953,11 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
                 s.sDisplayName = QFileInfo(e.relPath).fileName();
                 s.bFromArchive = true;
                 s.nContentCrc = e.contentCrc;
+                s.srcCmk         = meta.cmk;
+                s.srcUuid        = meta.archiveUuid;
+                s.srcFileNonce   = e.fileNonce;
+                s.nSrcEntryId    = e.entryId;
+                s.nSrcChunkCount = e.chunkCount;
                 s.nSourceSize = qint64(meta.fileSize);
                 s.fsMeta.valid      = true;
                 s.fsMeta.createdMs  = qint64(e.createdMs);
@@ -1562,19 +3110,50 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         totalBytes += s.nLength;
     }
 
-    const qint64 rootBytes = qint64(sRoot.toUtf8().size());
-    qint64 needBytes = FwArc::GLOBAL_HDR + 4 + rootBytes
-                     + qint64(FwArc::ENTRY_FIXED) * qint64(infos.size()) + totalBytes;
-    for (int i = 0; i < storedPaths.size(); ++i)
+    // v5：每条内容独立密钥参数（entryId/fileNonce/块数），写入前先生成。
+    for (FILEINFO &info : infos)
     {
-        const qint64 one = qint64(storedPaths.at(i).toUtf8().size())
-                         + qint64(FwArc::tagPayloadBytes(infos.at(i).listTags));
-        if (!FwArc::checkedAdd64(needBytes, one, &needBytes))
+        info.nEntryId    = FwArcV5::newEntryId();
+        info.fileNonce   = FwArcV5::newFileNonce();
+        info.nChunkCount = FwArc::chunkCountFor(quint64(qMax<qint64>(info.nFileLen, 0)));
+        info.nContentCrc = 0;
+    }
+
+    const QByteArray productKey = FwCrypto::KeyRing::instance().currentKey();
+    if (productKey.isEmpty())
+    {
+        finish(false, tr("尚未配置归档密钥：请先在“设置 → 归档加密密钥”中输入密钥字符串，再执行合并。"));
+        return;
+    }
+    QByteArray cmk, uuid;
+    QString secretErr;
+    if (!FwArcV5::newArchiveSecrets(&cmk, &uuid, &secretErr))
+    {
+        finish(false, tr("生成归档密钥失败：%1").arg(secretErr));
+        return;
+    }
+
+    // 磁盘空间：头部（64B + wrappedKey + 索引容量 + tag）+ 内容密文（每块 +16B）。
+    qint64 indexExact = 4 + qint64(sRoot.toUtf8().size()) + 4;
+    qint64 needBytes = 0;
+    for (int i = 0; i < infos.size(); ++i)
+    {
+        const qint64 entryBytes = qint64(FwArc::ENTRY_FIXED)
+                                + qint64(storedPaths.at(i).toUtf8().size())
+                                + qint64(FwArc::tagPayloadBytes(infos.at(i).listTags));
+        const qint64 ctBytes = qint64(FwArc::cipherLenFor(
+            quint64(qMax<qint64>(infos.at(i).nFileLen, 0)), infos.at(i).nChunkCount));
+        if (!FwArc::checkedAdd64(indexExact, entryBytes, &indexExact)
+            || !FwArc::checkedAdd64(needBytes, ctBytes, &needBytes))
         {
             finish(false, tr("输出规模超出可表示范围"));
             return;
         }
     }
+    const qint64 indexPathCapacity =
+        indexExact + qint64(FwArc::headerReserveFor(quint64(indexExact)));
+    needBytes += qint64(FwArc::GLOBAL_HDR) + FwArc::WRAPPED_KEY_LEN
+               + indexPathCapacity + FwArc::GCM_TAG_LEN;
 
     // 磁盘空间预检（P3-2）
     const qint64 freeBytes = FwArc::availableBytes(sOutputFile);
@@ -1616,11 +3195,11 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         return;
     }
 
-    QVector<qint64> crcFieldPos, contentPos;
+    QVector<qint64> contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeArchiveHeader(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
-                            &storedPaths))
+    if (!writeArchiveHeaderV5(fTmp, infos, sRoot, cmk, uuid, productKey,
+                              &contentPos, &headerSize, err, &storedPaths))
     {
         fTmp.close();
         finish(false, tr("写入归档头部失败：%1").arg(err));
@@ -1649,9 +3228,27 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
             bOk = false; break;
         }
         FwArc::Crc32 eCrc;
+        FwArcV5::EntryCrypto inCrypto;
+        const FwArcV5::EntryCrypto *pIn = nullptr;
+        if (s.bFromArchive)
+        {
+            inCrypto.cmk         = s.srcCmk;
+            inCrypto.uuid        = s.srcUuid;
+            inCrypto.entryId     = s.nSrcEntryId;
+            inCrypto.fileNonce   = s.srcFileNonce;
+            inCrypto.chunkCount  = s.nSrcChunkCount;
+            pIn = &inCrypto;
+        }
+        FwArcV5::EntryCrypto outCrypto;
+        outCrypto.cmk        = cmk;
+        outCrypto.uuid       = uuid;
+        outCrypto.entryId    = infos.at(i).nEntryId;
+        outCrypto.fileNonce  = infos.at(i).fileNonce;
+        outCrypto.chunkCount = infos.at(i).nChunkCount;
         bOk = streamCopy(src, s.nOffset, s.nLength, fTmp, eCrc,
                          copiedTotal, totalBytes,
-                         tr("正在合并: %1\n").arg(s.sOriginPath), err);
+                         tr("正在合并: %1\n").arg(s.sOriginPath), err,
+                         pIn, &outCrypto);
         if (!bOk) break;
         // 复制期间来源不能变化（以文件大小作为低成本检查；内容 CRC 另算）
         if (s.nSourceSize >= 0 && src.size() != s.nSourceSize)
@@ -1672,7 +3269,8 @@ void FileManager::QMergeFiles(QVector<QString> vtInputFiles, QString sOutputFile
         contentCrcs.append(eCrc.value());
         src.close();
     }
-    if (bOk) bOk = finalizeArchiveHeader(fTmp, headerSize, crcFieldPos, contentCrcs, err);
+    if (bOk) bOk = finalizeArchiveHeaderV5(fTmp, infos, sRoot, contentCrcs, headerSize,
+                                           cmk, uuid, productKey, err, &storedPaths);
     fTmp.close();
 
     if (bOk)
@@ -1960,11 +3558,38 @@ bool FileManager::rewriteArchive()
         return false;
     }
 
-    QVector<qint64> crcFieldPos, contentPos;
+    const QByteArray productKey = FwCrypto::KeyRing::instance().currentKey();
+    if (productKey.isEmpty())
+    {
+        fTmp.close();
+        setError(tr("尚未配置归档密钥，无法保存：请先在“设置 → 归档加密密钥”中配置"));
+        return false;
+    }
+    const QByteArray cmk  = m_meta.cmk;
+    const QByteArray uuid = m_meta.archiveUuid;
+    if (cmk.isEmpty() || uuid.size() != int(FwArc::ARCHIVE_UUID_LEN))
+    {
+        fTmp.close();
+        setError(tr("归档密钥状态异常，无法保存"));
+        return false;
+    }
+
+    // 新增条目生成加密参数；已有条目沿用加载时的参数（同钥同 nonce 重加密结果一致）。
+    for (FILEINFO &info : infos)
+    {
+        if (info.nEntryId == 0 || info.fileNonce.size() != 8)
+        {
+            info.nEntryId    = FwArcV5::newEntryId();
+            info.fileNonce   = FwArcV5::newFileNonce();
+            info.nChunkCount = FwArc::chunkCountFor(quint64(qMax<qint64>(info.nFileLen, 0)));
+        }
+    }
+
+    QVector<qint64> contentPos;
     qint64 headerSize = 0;
     QString err;
-    if (!writeArchiveHeader(fTmp, infos, sRoot, crcFieldPos, contentPos, headerSize, err,
-                            &storedPaths))
+    if (!writeArchiveHeaderV5(fTmp, infos, sRoot, cmk, uuid, productKey,
+                              &contentPos, &headerSize, err, &storedPaths))
     {
         fTmp.close();
         setError(tr("写入归档头部失败：%1").arg(err));
@@ -2007,8 +3632,26 @@ bool FileManager::rewriteArchive()
             srcPos = fi.nContentPositon;
         }
 
+        FwArcV5::EntryCrypto inCrypto;
+        const FwArcV5::EntryCrypto *pIn = nullptr;
+        if (!m_setPendingFiles.contains(fi.sFilePath))
+        {
+            inCrypto.cmk        = m_meta.cmk;
+            inCrypto.uuid       = m_meta.archiveUuid;
+            inCrypto.entryId    = fi.nEntryId;
+            inCrypto.fileNonce  = fi.fileNonce;
+            inCrypto.chunkCount = fi.nChunkCount;
+            pIn = &inCrypto;
+        }
+        FwArcV5::EntryCrypto outCrypto;
+        outCrypto.cmk        = cmk;
+        outCrypto.uuid       = uuid;
+        outCrypto.entryId    = fi.nEntryId;
+        outCrypto.fileNonce  = fi.fileNonce;
+        outCrypto.chunkCount = fi.nChunkCount;
+
         bOk = streamCopy(*pSrc, srcPos, fi.nFileLen, fTmp, eCrc, copiedTotal, totalBytes,
-                         tr("正在保存: %1").arg(fi.sFileName), err);
+                         tr("正在保存: %1").arg(fi.sFileName), err, pIn, &outCrypto);
         // 复制期间新增文件被外部改写：不能把「读到的半截内容」当成完整条目
         if (bOk && pSrc == &pendingSrc && pendingSrc.size() != fi.nFileLen)
         {
@@ -2029,7 +3672,8 @@ bool FileManager::rewriteArchive()
         contentCrcs.append(eCrc.value());
     }
     srcArc.close();
-    if (bOk) bOk = finalizeArchiveHeader(fTmp, headerSize, crcFieldPos, contentCrcs, err);
+    if (bOk) bOk = finalizeArchiveHeaderV5(fTmp, infos, sRoot, contentCrcs, headerSize,
+                                           cmk, uuid, productKey, err, &storedPaths);
     fTmp.close();
 
     if (bOk)
@@ -2189,6 +3833,15 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
 
     FwArc::Meta meta;
     QString err;
+    // 上一次“只改头部”的保存被打断时先回滚，否则分割会因为头部 CRC 失败而拒绝
+    {
+        QString sRecoverErr;
+        if (!recoverHeaderJournal(sInputFile, &sRecoverErr))
+        {
+            finish(false, tr("归档不可用：%1").arg(sRecoverErr));
+            return;
+        }
+    }
     if (!parseFile(sInputFile, meta, err))
     {
         finish(false, tr("归档无效，已取消分割：%1").arg(err));
@@ -2291,15 +3944,9 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         }
         const QString sOutFinal = sOutTry;
 
-        if (!fIn.seek(qint64(e.contentPos)))
-        {
-            fOut.close(); QFile::remove(sOutFinal);
-            if (sFirstError.isEmpty()) sFirstError = tr("定位归档内容失败：%1").arg(e.relPath);
-            ++nFailed; continue;
-        }
-
         FwArc::Crc32 crc;
         qint64 done = 0;
+        quint32 chunkIndex = 0;
         bool bOk = true;
         int nLastPercent = -1;
         QElapsedTimer splitPump;
@@ -2308,11 +3955,30 @@ void FileManager::QSplitFiles(QString sInputFile, bool bIsSaveAsOldPath, QString
         {
             if (m_bCancelRequested) { bOk = false; break; }
             const qint64 n = qMin<qint64>(qint64(e.size) - done, kCopyChunk);
-            const qint64 got = fIn.read(buf.data(), n);
-            if (got <= 0) { bOk = false; break; }
-            if (fOut.write(buf.data(), got) != got) { bOk = false; break; }
-            crc.update(buf.data(), got);
+            const qint64 chunkPlain = qMin<qint64>(
+                qint64(FwArc::CHUNK_SIZE),
+                qint64(e.size) - qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE));
+            const qint64 ctOff = qint64(e.contentPos)
+                               + qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE + FwArc::GCM_TAG_LEN);
+            const qint64 ctLen = chunkPlain + qint64(FwArc::GCM_TAG_LEN);
+            if (!fIn.seek(ctOff)) { bOk = false; break; }
+            const QByteArray ct = fIn.read(ctLen);
+            QByteArray plain;
+            QString sDecErr;
+            if (ct.size() != int(ctLen)
+                || !FwArcV5::openChunk(meta.cmk, meta.archiveUuid, e.entryId, e.fileNonce,
+                                       chunkIndex, e.chunkCount, ct, &plain, &sDecErr))
+            {
+                if (sFirstError.isEmpty()) sFirstError = sDecErr;
+                bOk = false;
+                break;
+            }
+            const qint64 got = plain.size();
+            if (got != n) { bOk = false; break; }
+            if (fOut.write(plain) != got) { bOk = false; break; }
+            crc.update(plain);
             done += got;
+            ++chunkIndex;
             copiedTotal += got;
 
             const int pct = (totalBytes > 0) ? int(100 * copiedTotal / totalBytes) : 100;
@@ -2402,6 +4068,98 @@ bool FileManager::contentCrcFor(const QString &sFilePath, quint32 *pCrc) const
 }
 
 // 只读条目开头若干字节：格式嗅探只需要文件头，不必把整块内容读进内存。
+QByteArray FileManager::readEntryPlain(const FILEINFO &fi, qint64 nOffset, qint64 nLen,
+                                       QString *psErr) const
+{
+    if (psErr) psErr->clear();
+    if (nLen <= 0) return QByteArray();
+    if (nOffset < 0 || nLen > fi.nFileLen || nOffset > fi.nFileLen - nLen)
+    {
+        if (psErr) *psErr = tr("读取范围越界：%1").arg(fi.sFilePath);
+        return QByteArray();
+    }
+    if (!FwArc::fitsInQsizetype(quint64(nLen)))
+    {
+        if (psErr) *psErr = tr("读取长度超出可处理范围：%1").arg(fi.sFilePath);
+        return QByteArray();
+    }
+
+    // 新增未保存文件：直接读源文件。
+    if (m_setPendingFiles.contains(fi.sFilePath))
+    {
+        QFile src(fi.sFilePath);
+        if (!src.open(QIODevice::ReadOnly) || !src.seek(nOffset))
+        {
+            if (psErr) *psErr = tr("读取新增文件失败：%1 (%2)")
+                                    .arg(fi.sFilePath, src.errorString());
+            return QByteArray();
+        }
+        QByteArray out(qsizetype(nLen), '\0');
+        qint64 done = 0;
+        while (done < nLen)
+        {
+            const qint64 got = src.read(out.data() + done, nLen - done);
+            if (got <= 0) break;
+            done += got;
+        }
+        out.resize(qsizetype(done));
+        return out;
+    }
+
+    // 归档条目：按 1 MiB 块解密。
+    QFile src(m_qFile.fileName());
+    if (!src.open(QIODevice::ReadOnly))
+    {
+        if (psErr) *psErr = tr("打开归档失败：%1 (%2)")
+                                .arg(src.fileName(), src.errorString());
+        return QByteArray();
+    }
+
+    QByteArray out;
+    try
+    {
+        out.resize(qsizetype(nLen));
+    }
+    catch (const std::bad_alloc &)
+    {
+        if (psErr) *psErr = tr("内存不足，无法一次性读取 %1（%2）。请改用导出或分割功能。")
+                                .arg(fi.sFileName, FwArc::formatSize(nLen));
+        return QByteArray();
+    }
+    qint64 done = 0;
+    QString err;
+    while (done < nLen)
+    {
+        const qint64 abs = nOffset + done;
+        const quint32 chunkIndex = quint32(abs / qint64(FwArc::CHUNK_SIZE));
+        const qint64 within = abs % qint64(FwArc::CHUNK_SIZE);
+        const qint64 take = qMin<qint64>(qint64(FwArc::CHUNK_SIZE) - within, nLen - done);
+
+        const qint64 chunkPlain = qMin<qint64>(qint64(FwArc::CHUNK_SIZE),
+                                               fi.nFileLen - qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE));
+        const qint64 ctLen = chunkPlain + qint64(FwArc::GCM_TAG_LEN);
+        const qint64 ctOff = fi.nContentPositon
+                           + qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE + FwArc::GCM_TAG_LEN);
+        if (!src.seek(ctOff))
+        {
+            if (psErr) *psErr = tr("定位内容失败：%1").arg(fi.sFilePath);
+            return QByteArray();
+        }
+        const QByteArray ct = src.read(ctLen);
+        QByteArray plain;
+        if (ct.size() != int(ctLen)
+            || !FwArcV5::openChunk(m_meta.cmk, m_meta.archiveUuid, fi.nEntryId,
+                                   fi.fileNonce, chunkIndex, fi.nChunkCount, ct, &plain, &err))
+        {
+            if (psErr) *psErr = tr("读取内容失败：%1\n%2").arg(fi.sFilePath, err);
+            return QByteArray();
+        }
+        std::memcpy(out.data() + done, plain.constData() + within, size_t(take));
+        done += take;
+    }
+    return out;
+}
+
 QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QString *psErr)
 {
     if (psErr) psErr->clear();
@@ -2416,40 +4174,8 @@ QByteArray FileManager::entryHead(const QString &sFilePath, qint64 nMaxBytes, QS
 
     const FILEINFO fi = it.value();
     if (fi.nFileLen <= 0) return QByteArray();
-
-    QFile localSrc;
-    qint64 srcPos = 0;
-    QString sOpenErr;
-    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
-    {
-        if (psErr) *psErr = sOpenErr;
-        return QByteArray();
-    }
-
     const qint64 nWant = qMin<qint64>(fi.nFileLen, nMaxBytes);
-    if (!FwArc::fitsInQsizetype(quint64(nWant)))
-    {
-        if (psErr) *psErr = tr("读取长度超出可处理范围：%1").arg(sFilePath);
-        return QByteArray();
-    }
-    if (!localSrc.seek(srcPos))
-    {
-        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString());
-        return QByteArray();
-    }
-
-    QByteArray out;
-    out.resize(qsizetype(nWant));
-    qint64 done = 0;
-    while (done < nWant)
-    {
-        const qint64 n = qMin<qint64>(nWant - done, MAXBUFFERSIZE);
-        const qint64 got = localSrc.read(out.data() + done, n);
-        if (got <= 0) break;
-        done += got;
-    }
-    out.resize(qsizetype(done));
-    return out;
+    return readEntryPlain(fi, 0, nWant, psErr);
 }
 
 // C2：直接读出条目内容到 QByteArray，省掉"new char[] -> 插件再复制一份"的中转。
@@ -2479,45 +4205,16 @@ QByteArray FileManager::entryContent(const QString &sFilePath, QString *psErr)
         return QByteArray();
     }
 
-    QFile localSrc;
-    qint64 srcPos = 0;
-    QString sOpenErr;
-    if (!openEntrySource(sFilePath, fi, localSrc, srcPos, sOpenErr))
+    QString sReadErr;
+    QByteArray out = readEntryPlain(fi, 0, fi.nFileLen, &sReadErr);
+    if (!sReadErr.isEmpty() || out.size() != fi.nFileLen)
     {
-        if (psErr) *psErr = sOpenErr;
+        if (psErr)
+            *psErr = sReadErr.isEmpty()
+                         ? tr("读取文件内容不完整：%1（期望 %2 B，实际 %3 B）")
+                               .arg(sFilePath).arg(fi.nFileLen).arg(out.size())
+                         : sReadErr;
         return QByteArray();
-    }
-
-    QByteArray out;
-    try
-    {
-        out.resize(qsizetype(fi.nFileLen));
-    }
-    catch (const std::bad_alloc &)
-    {
-        if (psErr) *psErr = tr("内存不足，无法一次性读取 %1（%2）。请改用导出或分割功能。")
-                                .arg(fi.sFileName, FwArc::formatSize(fi.nFileLen));
-        return QByteArray();
-    }
-
-    if (!localSrc.seek(srcPos))
-    {
-        if (psErr) *psErr = tr("定位文件内容失败：%1 (%2)").arg(sFilePath, localSrc.errorString());
-        return QByteArray();
-    }
-
-    qint64 done = 0;
-    while (done < fi.nFileLen)
-    {
-        const qint64 n = qMin<qint64>(fi.nFileLen - done, MAXBUFFERSIZE);
-        const qint64 got = localSrc.read(out.data() + done, n);
-        if (got <= 0)
-        {
-            if (psErr) *psErr = tr("读取文件内容不完整：%1（期望 %2 B，实际 %3 B）")
-                                    .arg(sFilePath).arg(fi.nFileLen).arg(done);
-            return QByteArray();
-        }
-        done += got;
     }
 
     if (m_mapContentCrc.contains(sFilePath))
@@ -2619,10 +4316,18 @@ void FileManager::outputFile(QString sFilePath, QString sOutputDir)
 
     FwArc::Crc32 crc;
     qint64 copiedTotal = 0;
+    FwArcV5::EntryCrypto inCrypto;
+    const FwArcV5::EntryCrypto *pIn = nullptr;
+    if (!m_setPendingFiles.contains(sFilePath))
+    {
+        inCrypto = cryptoForEntry(fi, m_meta);
+        pIn = &inCrypto;
+    }
     QString err;
     const bool bOk = streamCopy(localSrc, srcPos, fi.nFileLen, fOut, crc,
                                 copiedTotal, qMax<qint64>(fi.nFileLen, 1),
-                                tr("正在导出: %1").arg(fi.sFileName), err);
+                                tr("正在导出: %1").arg(fi.sFileName), err,
+                                pIn, nullptr);
     localSrc.close();
     fOut.close();
 
@@ -2692,30 +4397,42 @@ bool FileManager::verifyArchive(QString *psReport)
     {
         if (m_bCancelRequested) break;
         const FwArc::Entry &e = m_meta.entries.at(i);
-        if (!f.seek(qint64(e.contentPos)))
-        {
-            ++nBad;
-            badList << tr("第 %1 条（定位失败）：%2").arg(i + 1).arg(entryPathOf(e));
-            continue;
-        }
         FwArc::Crc32 c;
         qint64 done = 0;
+        quint32 chunkIndex = 0;
+        bool bReadOk = true;
+        QString sDecErr;
         while (done < qint64(e.size))
         {
             if (m_bCancelRequested) break;
-            const qint64 n = qMin<qint64>(qint64(e.size) - done, kCopyChunk);
-            const qint64 got = f.read(buf.data(), n);
-            if (got <= 0) break;
-            c.update(buf.data(), got);
-            done += got;
-            copiedTotal += got;
+            const qint64 chunkPlain = qMin<qint64>(
+                qint64(FwArc::CHUNK_SIZE),
+                qint64(e.size) - qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE));
+            const qint64 ctOff = qint64(e.contentPos)
+                               + qint64(chunkIndex) * qint64(FwArc::CHUNK_SIZE + FwArc::GCM_TAG_LEN);
+            const qint64 ctLen = chunkPlain + qint64(FwArc::GCM_TAG_LEN);
+            if (!f.seek(ctOff)) { bReadOk = false; sDecErr = tr("定位失败"); break; }
+            const QByteArray ct = f.read(ctLen);
+            QByteArray plain;
+            if (ct.size() != int(ctLen)
+                || !FwArcV5::openChunk(m_meta.cmk, m_meta.archiveUuid, e.entryId,
+                                       e.fileNonce, chunkIndex, e.chunkCount, ct,
+                                       &plain, &sDecErr))
+            {
+                bReadOk = false;
+                break;
+            }
+            c.update(plain);
+            done += plain.size();
+            ++chunkIndex;
+            copiedTotal += plain.size();
             emit progressChanged(copiedTotal, totalBytes,
                 tr("正在校验: %1  (%2 / %3)")
                    .arg(QFileInfo(e.displayPath).fileName(),
                         FwArc::formatSize(copiedTotal), FwArc::formatSize(totalBytes)));
             QApplication::processEvents();
         }
-        if (done != qint64(e.size) || c.value() != e.contentCrc)
+        if (!bReadOk || done != qint64(e.size) || c.value() != e.contentCrc)
         {
             ++nBad;
             badList << tr("第 %1 条：%2").arg(i + 1).arg(entryPathOf(e));

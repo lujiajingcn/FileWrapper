@@ -43,6 +43,12 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
+
+#include "crypto/argonderive.h"
+#include "crypto/archivecrypto.h"
+#include "crypto/archiveindex.h"
+#include "crypto/cngcipher.h"
+#include "crypto/keyring.h"
 #include <QJsonValue>
 #include <QModelIndex>
 #include <QPixmap>
@@ -812,6 +818,10 @@ static void verifyExtensionRegistry(const QString &appPluginsDir)
     for (const QString &sFile : QDir(appPluginsDir).entryList(QStringList() << QStringLiteral("*.json"),
                                                               QDir::Files))
     {
+        // 测试自己安装的“坏插件”sidecar 故意是 apiVersion=2，不参与本项统计。
+        if (sFile.startsWith(QStringLiteral("ZZBroken"))
+            || sFile.startsWith(QStringLiteral("ZZStillBad")))
+            continue;
         QFile f(QDir(appPluginsDir).filePath(sFile));
         if (!f.open(QIODevice::ReadOnly)) continue;
         const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
@@ -2699,6 +2709,91 @@ static void verifyMergeDialog()
     QDir(sChainDir).removeRecursively();
 }
 
+// 用进程内测试密钥程序化生成 v5 归档（替代旧版手工拼字节的 v4 夹具）。
+// 只给测试用：entries 的 size/chunkCount/entryId/fileNonce/contentPos 由本函数补齐。
+static bool writeTestV5Archive(const QString &sPath, const QString &sRoot,
+                               const QVector<FwArc::Entry> &entries,
+                               const QVector<QByteArray> &contents)
+{
+    if (entries.size() != contents.size())
+        return false;
+    const QByteArray productKey = FwCrypto::KeyRing::instance().currentKey();
+    if (productKey.isEmpty())
+        return false;
+
+    QByteArray cmk, uuid;
+    if (!FwArcV5::newArchiveSecrets(&cmk, &uuid))
+        return false;
+
+    QVector<FwArc::Entry> es = entries;
+    QString err;
+    const qint64 exact = FwArcIndex::exactBytes(es, sRoot, &err);
+    if (exact < 0)
+        return false;
+    const qint64 capacity = exact + qint64(FwArc::headerReserveFor(quint64(exact)));
+    const qint64 headerSize = qint64(FwArc::GLOBAL_HDR) + qint64(FwArc::WRAPPED_KEY_LEN)
+                            + capacity + qint64(FwArc::GCM_TAG_LEN);
+
+    qint64 cp = headerSize;
+    for (int i = 0; i < es.size(); ++i)
+    {
+        es[i].size       = quint64(contents.at(i).size());
+        es[i].chunkCount = FwArc::chunkCountFor(es[i].size);
+        es[i].contentCrc = FwArc::crc32Of(contents.at(i));
+        if (es[i].entryId == 0)
+            es[i].entryId = FwArcV5::newEntryId();
+        if (es[i].fileNonce.size() != 8)
+            es[i].fileNonce = FwArcV5::newFileNonce();
+        es[i].contentPos = quint64(cp);
+        cp += qint64(FwArc::cipherLenFor(es[i].size, es[i].chunkCount));
+    }
+
+    QByteArray indexPlain;
+    if (!FwArcIndex::build(es, sRoot, capacity, &indexPlain, &err))
+        return false;
+    QByteArray indexIv(int(FwArc::INDEX_IV_LEN), '\0');
+    if (!FwCrypto::randomBytes(indexIv.data(), int(indexIv.size())))
+        return false;
+    QByteArray indexCipher;
+    if (!FwArcV5::sealIndex(cmk, uuid, indexIv, indexPlain, &indexCipher, &err))
+        return false;
+
+    FwArcV5::GlobalHeader gh;
+    gh.indexCipherLen = quint32(indexCipher.size());
+    gh.uuid    = uuid;
+    gh.indexIv = indexIv;
+    QByteArray ghBytes;
+    if (!FwArcV5::buildGlobalHeader(gh, &ghBytes, &err))
+        return false;
+    QByteArray wrapped;
+    if (!FwArcV5::sealWrappedKey(productKey, cmk, uuid, &wrapped, &err))
+        return false;
+
+    QFile f(sPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    if (f.write(ghBytes) != ghBytes.size() || f.write(wrapped) != wrapped.size()
+        || f.write(indexCipher) != indexCipher.size())
+        return false;
+
+    for (int i = 0; i < es.size(); ++i)
+    {
+        const QByteArray &data = contents.at(i);
+        for (quint32 c = 0; c < es.at(i).chunkCount; ++c)
+        {
+            const qint64 off = qint64(c) * qint64(FwArc::CHUNK_SIZE);
+            const QByteArray block = data.mid(int(off), int(FwArc::CHUNK_SIZE));
+            QByteArray ct;
+            if (!FwArcV5::sealChunk(cmk, uuid, es.at(i).entryId, es.at(i).fileNonce,
+                                    c, es.at(i).chunkCount, block, &ct, &err))
+                return false;
+            if (f.write(ct) != ct.size())
+                return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // K: 保存时的路径规划（添加文件后保存不得拍平目录 / 不得产生重复路径）
 // ---------------------------------------------------------------------------
@@ -2752,8 +2847,10 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         || (!crossPaths.contains(QStringLiteral("basic.docx")) && bHasSlash);
     report(bSaved1 && bMeta1 && bRootShape && bFlatShape && crossPaths.size() == 3
                && !hasDup(crossPaths),
-           QStringLiteral("K1: cross-drive save keeps drive-prefixed paths (%1)")
-               .arg(crossPaths.join(QStringLiteral(", "))));
+           QStringLiteral("K1: cross-drive save keeps drive-prefixed paths (%1) [saved=%2 meta=%3 root=%4 expected=%5 n=%6]")
+               .arg(crossPaths.join(QStringLiteral(", ")))
+               .arg(bSaved1).arg(bMeta1)
+               .arg(crossMeta.root, expectedRoot).arg(crossPaths.size()));
 
     // K4: archivePath 返回当前加载的归档路径（供分割对话框预填）
     report(fm2.archivePath().endsWith(QStringLiteral("save_cross.dat")),
@@ -2801,22 +2898,23 @@ static void verifySavePathPreservation(const QString &work, const QString &scrat
         QFile::remove(sUp);   // 不把临时来源文件留进 fixtures 上级目录
     }
 
-    // K3: 归档内已有重复路径时，保存必须被拒绝并给出可读原因（不能静默拍平/覆盖）
-    const QString sDup = work + QStringLiteral("/dup_paths.fwda");
-    if (QFileInfo::exists(sDup))
+    // K3: 归档内已有重复路径时，加载必须被拒绝并给出可读原因。
+    // v5 头部是 GCM 密文，无法再靠手工补字节造夹具，改用测试密钥程序化生成。
+    const QString sDup = scratchDir + QStringLiteral("/dup_paths.fwda");
     {
+        FwArc::Entry e1;
+        e1.relPath     = QStringLiteral("dup.txt");
+        e1.displayPath = QStringLiteral("dup.txt");
+        FwArc::Entry e2 = e1;
+        const bool bMade = writeTestV5Archive(sDup, QString(), { e1, e2 },
+                                              { QByteArray("a"), QByteArray("b") });
         FileManager fm5;
         // A-03 后改为在加载阶段直接拒绝重复路径，避免 QMap 单值覆盖后两行同内容、
         // 删一条让幸存条目变成“归档内未找到”。
-        const bool bLoad3 = fm5.QLoadMergedFile(sDup);
-        const QString sErr3 = fm5.lastError();
-        report(!bLoad3 && sErr3.contains(QStringLiteral("重复路径")),
+        const bool bLoad3 = bMade && fm5.QLoadMergedFile(sDup);
+        const QString sErr3 = bMade ? fm5.lastError() : QStringLiteral("生成夹具失败");
+        report(bMade && !bLoad3 && sErr3.contains(QStringLiteral("重复路径")),
                QStringLiteral("K3: duplicate stored paths reject load (%1)").arg(sErr3));
-    }
-    else
-    {
-        // 缺素材时不能把整条断言静默吞掉（否则退出码仍可能为 0）
-        report(false, QStringLiteral("K3: missing fixture dup_paths.fwda"));
     }
 
     // K5: 取消标志复位：上一次"取消"不应让后续导出/大文件打开立刻失败
@@ -3526,10 +3624,488 @@ static void verifyArchiveTags(const QString &work, const QString &scratchDir)
     QDir(sDir).removeRecursively();
 }
 
+// ---------------------------------------------------------------------------
+// R: 删除后的快速保存（只重写头部）+ 整理归档 + 写前日志回滚
+//
+// 语义：删除条目/改标记不会移动其它条目的内容偏移，因此只需把新头部写回原位
+// （HeaderSize 不变、尾部填零），内容区留下“空洞”。归档在磁盘上不变小，
+// 由 compactArchive() 压实。这里逐条守住：不搬数据、偏移不变、仍可读、
+// 可整理回收、崩溃后可回滚、新增文件仍走整包重写。
+// ---------------------------------------------------------------------------
+static void verifyFastSaveAndCompact(const QString &work, const QString &scratchDir)
+{
+    Q_UNUSED(work);
+    Q_UNUSED(scratchDir);
+    const QString sDir = makeWritableTestDir(QStringLiteral("fast_save"));
+    report(QDir(sDir).exists(), QStringLiteral("R0: fast-save test dir"));
+    if (!QDir(sDir).exists())
+        return;
+
+    auto writeFile = [](const QString &sPath, const QByteArray &data) {
+        QFile f(sPath);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate)
+               && f.write(data) == data.size();
+    };
+    auto fileSize = [](const QString &sPath) { return QFileInfo(sPath).size(); };
+    auto findInfo = [](const QVector<FILEINFO> &infos, const QString &sSuffix) {
+        for (const FILEINFO &fi : infos)
+            if (fi.sFilePath.endsWith(sSuffix, Qt::CaseInsensitive))
+                return fi;
+        return FILEINFO();
+    };
+
+    const QString sA = sDir + QStringLiteral("/a.txt");
+    const QString sB = sDir + QStringLiteral("/b.txt");
+    const QString sC = sDir + QStringLiteral("/c.txt");
+    // b 故意做大一点：删除后“可回收空间”必须精确等于它的长度
+    const bool bSources = writeFile(sA, QByteArray(64, 'a'))
+                          && writeFile(sB, QByteArray(4096, 'b'))
+                          && writeFile(sC, QByteArray(64, 'c'));
+    report(bSources, QStringLiteral("R1: fast-save sources ready"));
+    if (!bSources)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    const QString sArc = sDir + QStringLiteral("/fast.fwda");
+    FileManager fm;
+    bool bMergeOk = false;
+    QObject::connect(&fm, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bMergeOk = ok; });
+    fm.QMergeFiles(QVector<QString>{ sA, sB, sC }, sArc);
+
+    FwArc::Meta metaBefore;
+    QString sErr;
+    const bool bInspectBefore = FileManager::inspectArchive(sArc, metaBefore, sErr);
+    const qint64 nSizeBefore = fileSize(sArc);
+    const bool bLoaded = fm.QLoadMergedFile(sArc);
+    report(bMergeOk && bInspectBefore && bLoaded && metaBefore.entries.size() == 3,
+           QStringLiteral("R2: archive with 3 entries (n=%1, %2 B)")
+               .arg(metaBefore.entries.size()).arg(nSizeBefore));
+    if (!bLoaded)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    // 记下 a/c 的内容偏移：快速保存必须原样保留（这就是“不搬数据”）
+    qint64 nPosA = -1, nPosC = -1;
+    for (const FwArc::Entry &e : metaBefore.entries)
+    {
+        if (e.displayPath.endsWith(QStringLiteral("a.txt"), Qt::CaseInsensitive))
+            nPosA = qint64(e.contentPos);
+        if (e.displayPath.endsWith(QStringLiteral("c.txt"), Qt::CaseInsensitive))
+            nPosC = qint64(e.contentPos);
+    }
+
+    const FILEINFO fiB = findInfo(fm.getFileInfos(), QStringLiteral("b.txt"));
+    const bool bDeleted = !fiB.sFilePath.isEmpty() && fm.deleteFile(fiB.sFilePath);
+    QString sWhy;
+    const bool bCanFast = fm.canSaveHeaderOnly(&sWhy);
+    report(bDeleted && bCanFast && fm.isDirty(),
+           QStringLiteral("R3: delete one entry allows header-only save (%1)").arg(sWhy));
+
+    QElapsedTimer fastTimer;
+    fastTimer.start();
+    const bool bFastOk = fm.save();
+    const qint64 nFastMs = fastTimer.elapsed();
+    report(bFastOk, QStringLiteral("R4: header-only save succeeded (%1 ms)").arg(nFastMs));
+
+    // 文件大小不变（内容区没动），空洞 == 被删条目的密文长度（明文 + 每块 16B tag）
+    report(fileSize(sArc) == nSizeBefore
+               && fm.reclaimableBytes()
+                      == qint64(FwArc::cipherLenFor(quint64(fiB.nFileLen), fiB.nChunkCount)),
+           QStringLiteral("R5: archive size unchanged (%1 B), reclaimable=%2")
+               .arg(fileSize(sArc)).arg(fm.reclaimableBytes()));
+
+    // 重新解析：2 个条目、被删的没了、a/c 偏移不变
+    FwArc::Meta metaAfter;
+    const bool bInspectAfter = FileManager::inspectArchive(sArc, metaAfter, sErr);
+    bool bPosSame = bInspectAfter && metaAfter.entries.size() == 2;
+    for (const FwArc::Entry &e : metaAfter.entries)
+    {
+        if (e.displayPath.endsWith(QStringLiteral("a.txt"), Qt::CaseInsensitive)
+            && nPosA >= 0 && qint64(e.contentPos) != nPosA)
+            bPosSame = false;
+        if (e.displayPath.endsWith(QStringLiteral("c.txt"), Qt::CaseInsensitive)
+            && nPosC >= 0 && qint64(e.contentPos) != nPosC)
+            bPosSame = false;
+    }
+    const QVector<FILEINFO> infosAfter = fm.getFileInfos();
+    const bool bNoB = findInfo(infosAfter, QStringLiteral("b.txt")).sFilePath.isEmpty();
+    report(bInspectAfter && bPosSame && bNoB,
+           QStringLiteral("R6: entries/offsets preserved (n=%1)")
+               .arg(metaAfter.entries.size()));
+
+    // 空洞之后的内容仍然可读（按原偏移定位），CRC 也在加载时被校验过
+    QString sReadErr;
+    const QByteArray dataA = fm.entryContent(
+        findInfo(infosAfter, QStringLiteral("a.txt")).sFilePath, &sReadErr);
+    report(dataA == QByteArray(64, 'a') && sReadErr.isEmpty(),
+           QStringLiteral("R7: remaining entry readable (%1 B, err=%2)")
+               .arg(dataA.size()).arg(sReadErr));
+
+    // 连续删除：仍然走快速保存，不会退化成整包重写
+    const FILEINFO fiA = findInfo(fm.getFileInfos(), QStringLiteral("a.txt"));
+    const bool bSecond = !fiA.sFilePath.isEmpty() && fm.deleteFile(fiA.sFilePath)
+                         && fm.canSaveHeaderOnly() && fm.save();
+    report(bSecond && fileSize(sArc) == nSizeBefore && fm.getFileInfos().size() == 1,
+           QStringLiteral("R8: second delete also saved in place (%1 B)")
+               .arg(fileSize(sArc)));
+
+    // 整理归档：压实空洞，文件体积回到「头部 + 内容」
+    const qint64 nWaste = fm.reclaimableBytes();
+    const bool bCompact = fm.compactArchive();
+    const FwArc::Meta metaCompact = fm.archiveMeta();
+    qint64 nExpected = qint64(metaCompact.headerSize);
+    for (const FwArc::Entry &e : metaCompact.entries)
+        nExpected += qint64(FwArc::cipherLenFor(e.size, e.chunkCount));
+    const qint64 nWasteExpected = qint64(FwArc::cipherLenFor(4096, 1))
+                                + qint64(FwArc::cipherLenFor(64, 1));
+    report(nWaste == nWasteExpected && bCompact && fm.reclaimableBytes() == 0
+               && fileSize(sArc) == nExpected,
+           QStringLiteral("R9: compact recycles %1 B (size %2, expected %3)")
+               .arg(nWaste).arg(fileSize(sArc)).arg(nExpected));
+
+    // 整理后仍可正常加载与读取
+    const bool bReload = fm.QLoadMergedFile(sArc);
+    const QByteArray dataC = fm.entryContent(
+        findInfo(fm.getFileInfos(), QStringLiteral("c.txt")).sFilePath, &sReadErr);
+    report(bReload && dataC == QByteArray(64, 'c') && fm.getFileInfos().size() == 1,
+           QStringLiteral("R10: archive valid after compact (%1 B)").arg(dataC.size()));
+
+    // 新增文件：没有归档内偏移，走“追加保存”（不搬现有内容）
+    const QString sD = sDir + QStringLiteral("/d.txt");
+    const bool bAdded = writeFile(sD, QByteArray(256, 'd'));
+    if (bAdded)
+        fm.addFiles(QVector<QString>{ sD });
+    QString sWhyAdd;
+    const bool bCanFastAdd = fm.canSaveHeaderOnly(&sWhyAdd);
+    const bool bCanAppendAdd = fm.canSaveByAppend();
+    const qint64 nSizeBeforeAdd = fileSize(sArc);
+    const bool bAddSave = bAdded && fm.save();
+    report(bAdded && !bCanFastAdd && bCanAppendAdd && bAddSave
+               && fm.getFileInfos().size() == 2
+               && fileSize(sArc) == nSizeBeforeAdd + qint64(FwArc::cipherLenFor(256, 1)),
+           QStringLiteral("R11: add appended instead of full rewrite (%1)").arg(sWhyAdd));
+
+    // 标记撑大到头部预留也放不下：回落到整包重写。
+    // 每条 32 个约 116 B 的标记（38 汉字 + 序号 = 39/40 字），两条合计约 7.7 KB，
+    // 远超 4 KiB 预留。
+    QString sTagErr;
+    QStringList manyTags;
+    const QString sPad(38, QChar(0x4E2D));   // 38 个汉字 + 1~2 位序号 <= 40 字
+    for (int i = 0; i < 32; ++i)
+        manyTags << sPad + QString::number(i);
+    bool bTagsSet = true;
+    for (const FILEINFO &fi : fm.getFileInfos())
+        bTagsSet = bTagsSet && !fi.sFilePath.isEmpty()
+                   && fm.setEntryTags(fi.sFilePath, manyTags, &sTagErr);
+    QString sWhyTags;
+    const bool bCanFastTags = fm.canSaveHeaderOnly(&sWhyTags);
+    const bool bTagSave = bTagsSet && fm.save();
+    const FILEINFO fiD2 = findInfo(fm.getFileInfos(), QStringLiteral("d.txt"));
+    report(bTagsSet && !bCanFastTags && bTagSave && fiD2.listTags == manyTags,
+           QStringLiteral("R12: oversized header falls back to rewrite (%1, tagErr=%2, tags=%3)")
+               .arg(sWhyTags, sTagErr).arg(fiD2.listTags.size()));
+
+    // —— 写前日志：模拟“头部写到一半崩溃” ——
+    QFile arcRead(sArc);
+    QByteArray whole;
+    if (arcRead.open(QIODevice::ReadOnly))
+    {
+        whole = arcRead.readAll();
+        arcRead.close();
+    }
+    const quint32 nIndexCipherLen =
+        whole.size() >= qint64(FwArc::GLOBAL_HDR + 20)
+            ? FwArc::readU32(whole.constData() + 16) : 0;
+    const qint64 nHdrLen = qint64(FwArc::GLOBAL_HDR) + qint64(FwArc::WRAPPED_KEY_LEN)
+                         + qint64(nIndexCipherLen);
+    const int nEntriesBeforeCrash = fm.getFileInfos().size();
+    const bool bRawOk = whole.size() >= nHdrLen
+                        && qint64(nIndexCipherLen) >= qint64(FwArc::GCM_TAG_LEN)
+                        && std::memcmp(whole.constData(), FwArc::MAGIC, 4) == 0;
+    report(bRawOk, QStringLiteral("R13: raw archive readable (hdr=%1, file=%2 B)")
+                       .arg(nHdrLen).arg(whole.size()));
+    if (!bRawOk)
+    {
+        fm.unLoadMergedFile();
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    const QByteArray goodHeader = whole.left(int(nHdrLen));
+    const QString sJournal = sArc + QStringLiteral(".hdrjournal");
+    bool bJournalWritten = false;
+    {
+        // 与 FileManager 内部的日志格式一致：Magic/Version/Pid/HeaderSize/Crc + 旧头部
+        const quint64 nDeadPid = 0x7FFFFFF0ULL;   // 无效 PID：判定为“写入者已退出”
+        QByteArray head(24, '\0');
+        std::memcpy(head.data(), "FWHJ", 4);
+        head[4] = 1;
+        for (int i = 0; i < 8; ++i)
+            head[8 + i] = char((nDeadPid >> (i * 8)) & 0xFF);
+        for (int i = 0; i < 4; ++i)
+            head[16 + i] = char((quint32(nHdrLen) >> (i * 8)) & 0xFF);
+        FwArc::Crc32 crc;
+        crc.update(goodHeader);
+        for (int i = 0; i < 4; ++i)
+            head[20 + i] = char((crc.value() >> (i * 8)) & 0xFF);
+
+        QFile jf(sJournal);
+        bJournalWritten = jf.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                          && jf.write(head) == head.size()
+                          && jf.write(goodHeader) == goodHeader.size();
+        // 日志时间改老：即使 PID 被系统复用也不会被当成“正在写”
+        if (bJournalWritten)
+            jf.setFileTime(QDateTime::currentDateTime().addSecs(-120),
+                           QFileDevice::FileModificationTime);
+        jf.close();
+    }
+    // 破坏头部最后一个字节 = 写了一半
+    QByteArray broken = whole;
+    broken[int(nHdrLen) - 1] = char(broken.at(int(nHdrLen) - 1) ^ 0xFF);
+    bool bBroken = false;
+    {
+        QFile f(sArc);
+        bBroken = f.open(QIODevice::ReadWrite) && f.seek(0)
+                  && f.write(broken) == broken.size();
+        f.close();
+    }
+
+    FwArc::Meta metaRecovered;
+    QString sRecoverErr;
+    const bool bRecovered = bJournalWritten && bBroken
+                            && FileManager::inspectArchive(sArc, metaRecovered, sRecoverErr);
+    report(bRecovered && metaRecovered.entries.size() == nEntriesBeforeCrash
+               && !QFileInfo::exists(sJournal),
+           QStringLiteral("R14: interrupted header write rolled back (%1 entries, err=%2)")
+               .arg(metaRecovered.entries.size()).arg(sRecoverErr));
+
+    // 没有日志时不允许把真实损坏“修好”：损坏归档必须继续被拒绝
+    QFile::remove(sJournal);
+    bool bBroken2 = false;
+    {
+        QFile f(sArc);
+        bBroken2 = f.open(QIODevice::ReadWrite) && f.seek(0)
+                   && f.write(broken) == broken.size();
+        f.close();
+    }
+    FwArc::Meta metaBad;
+    QString sBadErr;
+    const bool bRejected = bBroken2 && !FileManager::inspectArchive(sArc, metaBad, sBadErr);
+    report(bRejected, QStringLiteral("R15: corrupt header without journal still rejected (%1)")
+                          .arg(sBadErr));
+
+    fm.unLoadMergedFile();
+    QFile::remove(sJournal);
+    QDir(sDir).removeRecursively();
+}
+
+// ---------------------------------------------------------------------------
+// T: 新增文件的「追加保存」——内容追加到末尾，头部在预留区内原地重写
+// ---------------------------------------------------------------------------
+static void verifyAppendSave(const QString &work, const QString &scratchDir)
+{
+    Q_UNUSED(work);
+    Q_UNUSED(scratchDir);
+    const QString sDir = makeWritableTestDir(QStringLiteral("append_save"));
+    report(QDir(sDir).exists(), QStringLiteral("T0: append test dir"));
+    if (!QDir(sDir).exists())
+        return;
+
+    auto writeFile = [](const QString &sPath, const QByteArray &data) {
+        QFile f(sPath);
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate)
+               && f.write(data) == data.size();
+    };
+    auto fileSize = [](const QString &sPath) { return QFileInfo(sPath).size(); };
+    auto findInfo = [](const QVector<FILEINFO> &infos, const QString &sSuffix) {
+        for (const FILEINFO &fi : infos)
+            if (fi.sFilePath.endsWith(sSuffix, Qt::CaseInsensitive))
+                return fi;
+        return FILEINFO();
+    };
+    // 头部的“精确大小”（不含预留）：全局头 + wrappedKey + 索引精确大小 + tag
+    auto exactHeaderBytes = [](const FwArc::Meta &m) {
+        qint64 n = 4 + qint64(m.root.toUtf8().size()) + 4;
+        for (const FwArc::Entry &e : m.entries)
+            n += qint64(FwArc::ENTRY_FIXED) + e.relPath.toUtf8().size()
+                 + qint64(FwArc::tagPayloadBytes(e.tags));
+        return qint64(FwArc::GLOBAL_HDR) + qint64(FwArc::WRAPPED_KEY_LEN) + n
+               + qint64(FwArc::GCM_TAG_LEN);
+    };
+
+    const QString sA = sDir + QStringLiteral("/a.txt");
+    const QString sB = sDir + QStringLiteral("/b.txt");
+    const QString sC = sDir + QStringLiteral("/c.txt");
+    const bool bSources = writeFile(sA, QByteArray(64, 'a'))
+                          && writeFile(sB, QByteArray(128, 'b'))
+                          && writeFile(sC, QByteArray(64, 'c'));
+    report(bSources, QStringLiteral("T1: append sources ready"));
+    if (!bSources)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    const QString sArc = sDir + QStringLiteral("/append.fwda");
+    FileManager fm;
+    bool bMergeOk = false;
+    QObject::connect(&fm, &FileManager::operationFinished,
+                     [&](bool ok, const QString &) { bMergeOk = ok; });
+    fm.QMergeFiles(QVector<QString>{ sA, sB, sC }, sArc);
+
+    FwArc::Meta meta0;
+    QString sErr;
+    const bool bInspect0 = FileManager::inspectArchive(sArc, meta0, sErr);
+    const qint64 nExact0 = exactHeaderBytes(meta0);
+    const qint64 nSize0 = fileSize(sArc);
+    report(bMergeOk && bInspect0 && meta0.entries.size() == 3
+               && qint64(meta0.headerSize) >= nExact0 + qint64(FwArc::HDR_RESERVE_MIN),
+           QStringLiteral("T2: merged archive reserves header slack (exact=%1, capacity=%2)")
+               .arg(nExact0).arg(meta0.headerSize));
+    if (!bInspect0)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    const bool bLoaded = fm.QLoadMergedFile(sArc);
+    report(bLoaded, QStringLiteral("T3: archive loaded"));
+    if (!bLoaded)
+    {
+        QDir(sDir).removeRecursively();
+        return;
+    }
+
+    qint64 nPosA = -1, nPosC = -1;
+    for (const FwArc::Entry &e : meta0.entries)
+    {
+        if (e.displayPath.endsWith(QStringLiteral("a.txt"), Qt::CaseInsensitive))
+            nPosA = qint64(e.contentPos);
+        if (e.displayPath.endsWith(QStringLiteral("c.txt"), Qt::CaseInsensitive))
+            nPosC = qint64(e.contentPos);
+    }
+
+    // —— 第一次追加 ——
+    const QString sD = sDir + QStringLiteral("/d.txt");
+    const bool bAddedD = writeFile(sD, QByteArray(256, 'd'));
+    if (bAddedD)
+        fm.addFiles(QVector<QString>{ sD });
+    QString sWhy;
+    const bool bCanAppend = fm.canSaveByAppend(&sWhy);
+    const qint64 nSizeBeforeAdd = fileSize(sArc);
+    const bool bSave1 = bAddedD && fm.save();
+    report(bAddedD && bCanAppend && bSave1,
+           QStringLiteral("T4: add saved by append (%1)").arg(sWhy));
+
+    FwArc::Meta meta1;
+    const bool bInspect1 = FileManager::inspectArchive(sArc, meta1, sErr);
+    report(bInspect1 && meta1.entries.size() == 4
+               && fileSize(sArc) == nSizeBeforeAdd + qint64(FwArc::cipherLenFor(256, 1))
+               && qint64(meta1.headerSize) == qint64(meta0.headerSize),
+           QStringLiteral("T5: only new bytes written (size %1 -> %2, header %3 -> %4)")
+               .arg(nSizeBeforeAdd).arg(fileSize(sArc))
+               .arg(meta0.headerSize).arg(meta1.headerSize));
+
+    bool bPosSame = bInspect1;
+    for (const FwArc::Entry &e : meta1.entries)
+    {
+        if (e.displayPath.endsWith(QStringLiteral("a.txt"), Qt::CaseInsensitive)
+            && nPosA >= 0 && qint64(e.contentPos) != nPosA)
+            bPosSame = false;
+        if (e.displayPath.endsWith(QStringLiteral("c.txt"), Qt::CaseInsensitive)
+            && nPosC >= 0 && qint64(e.contentPos) != nPosC)
+            bPosSame = false;
+    }
+    report(bPosSame, QStringLiteral("T6: existing offsets unchanged after append"));
+
+    const FILEINFO fiD = findInfo(fm.getFileInfos(), QStringLiteral("d.txt"));
+    QString sReadErr;
+    const QByteArray dataD = fm.entryContent(fiD.sFilePath, &sReadErr);
+    report(dataD == QByteArray(256, 'd') && fiD.nContentPositon == nSizeBeforeAdd
+               && sReadErr.isEmpty(),
+           QStringLiteral("T7: appended entry readable at EOF offset (%1)")
+               .arg(fiD.nContentPositon));
+    report(fm.reclaimableBytes() == 0, QStringLiteral("T8: no waste after append"));
+
+    // —— 第二次追加：连续新增仍然只写新增字节 ——
+    const QString sE = sDir + QStringLiteral("/e.txt");
+    const bool bAddedE = writeFile(sE, QByteArray(1024, 'e'));
+    if (bAddedE)
+        fm.addFiles(QVector<QString>{ sE });
+    const qint64 nSizeBeforeE = fileSize(sArc);
+    const bool bCanAppend2 = bAddedE && fm.canSaveByAppend();
+    const bool bSave2 = bAddedE && fm.save();
+    report(bCanAppend2 && bSave2
+               && fileSize(sArc) == nSizeBeforeE + qint64(FwArc::cipherLenFor(1024, 1))
+               && findInfo(fm.getFileInfos(), QStringLiteral("e.txt")).nFileLen == 1024,
+           QStringLiteral("T9: second append also writes only new bytes (%1 -> %2)")
+               .arg(nSizeBeforeE).arg(fileSize(sArc)));
+
+    // —— 删除 + 新增混在一起：删除的条目变成空洞，新内容照样追加 ——
+    const FILEINFO fiB = findInfo(fm.getFileInfos(), QStringLiteral("b.txt"));
+    const bool bDeletedB = !fiB.sFilePath.isEmpty() && fm.deleteFile(fiB.sFilePath);
+    const QString sF = sDir + QStringLiteral("/f.txt");
+    const bool bAddedF = writeFile(sF, QByteArray(512, 'f'));
+    if (bAddedF)
+        fm.addFiles(QVector<QString>{ sF });
+    const qint64 nSizeBeforeMix = fileSize(sArc);
+    const bool bCanAppendMix = bDeletedB && bAddedF && fm.canSaveByAppend();
+    const bool bSaveMix = bDeletedB && bAddedF && fm.save();
+    report(bCanAppendMix && bSaveMix
+               && fileSize(sArc) == nSizeBeforeMix + qint64(FwArc::cipherLenFor(512, 1))
+               && fm.reclaimableBytes()
+                      == qint64(FwArc::cipherLenFor(quint64(fiB.nFileLen), fiB.nChunkCount)),
+           QStringLiteral("T10: delete+add appends and leaves %1 B reclaimable")
+               .arg(fm.reclaimableBytes()));
+
+    // —— 头部预留放不下：自动回落整包重写，且重写后重新预留 ——
+    QVector<QString> manyFiles;
+    for (int i = 0; i < 80; ++i)
+    {
+        const QString sPath = sDir + QStringLiteral("/extra_%1.txt")
+                                        .arg(i, 2, 10, QLatin1Char('0'));
+        if (writeFile(sPath, QByteArray(16, 'x')))
+            manyFiles << sPath;
+    }
+    fm.addFiles(manyFiles);
+    const int nBeforeFill = fm.getFileInfos().size();
+    QString sWhyFill;
+    const bool bCanAppendFill = fm.canSaveByAppend(&sWhyFill);
+    const bool bSaveFill = fm.save();
+    FwArc::Meta metaFill;
+    const bool bInspectFill = FileManager::inspectArchive(sArc, metaFill, sErr);
+    const qint64 nExactFill = exactHeaderBytes(metaFill);
+    report(manyFiles.size() == 80 && !bCanAppendFill && bSaveFill && bInspectFill
+               && fm.getFileInfos().size() == nBeforeFill
+               && qint64(metaFill.headerSize) >= nExactFill + qint64(FwArc::HDR_RESERVE_MIN),
+           QStringLiteral("T11: header-full falls back to rewrite and reserves again (%1)")
+               .arg(sWhyFill));
+
+    // 整包重写之后所有条目都还在、还能读
+    int nReadOk = 0, nReadCount = 0;
+    for (const FILEINFO &fi : fm.getFileInfos())
+    {
+        ++nReadCount;
+        QString sOneErr;
+        const QByteArray one = fm.entryContent(fi.sFilePath, &sOneErr);
+        if (sOneErr.isEmpty() && qint64(one.size()) == fi.nFileLen)
+            ++nReadOk;
+    }
+    report(nReadCount > 0 && nReadOk == nReadCount,
+           QStringLiteral("T12: all %1 entries readable after fallback rewrite").arg(nReadCount));
+
+    fm.unLoadMergedFile();
+    QDir(sDir).removeRecursively();
+}
+
 static void verifyMergeFlattening(const QString &work, const QString &scratchDir)
 {
-    auto hasSuffix = [](const QStringList &paths, const QString &suffix) {
-        for (const QString &p : paths)
+    auto hasSuffix = [](const QStringList &paths, const QString &suffix) {        for (const QString &p : paths)
             if (p.endsWith(suffix)) return true;
         return false;
     };
@@ -3596,8 +4172,20 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
 
     // G4: 来源归档的 root 与当前盘符不同（rooted.fwda 的 root = D:/testfiles_copy）：
     //     展开后必须保留它原来的归属，不能被改挂到另一个盘下（用户实际报过的问题）
+    const QString sRootedArc = scratchDir + QStringLiteral("/rooted.fwda");
+    {
+        FwArc::Entry e;
+        e.relPath     = QStringLiteral("a/file1.txt");
+        e.displayPath = QStringLiteral("D:/testfiles_copy/a/file1.txt");
+        writeTestV5Archive(sRootedArc, QStringLiteral("D:/testfiles_copy"), { e },
+                           { QByteArray("rooted fixture") });
+    }
     FileManager fm4;
-    fm4.QMergeFiles(QVector<QString>{ work + QStringLiteral("/rooted.fwda"),
+    bool bG4Done = false, bG4Ok = false;
+    QString sG4Msg;
+    QObject::connect(&fm4, &FileManager::operationFinished,
+                     [&](bool o, const QString &m) { bG4Done = true; bG4Ok = o; sG4Msg = m; });
+    fm4.QMergeFiles(QVector<QString>{ sRootedArc,
                                       work + QStringLiteral("/basic.docx") }, sArcRoot);
     FwArc::Meta rooted;
     QString err4;
@@ -3612,8 +4200,9 @@ static void verifyMergeFlattening(const QString &work, const QString &scratchDir
         : rootedPaths.contains(QStringLiteral("testfiles_copy/a/file1.txt"));
     report(bG4 && bG4Root && bG4Paths
                && hasSuffix(rootedPaths, QStringLiteral("basic.docx")),
-           QStringLiteral("G4: archived origin preserved cross-drive (%1)")
-               .arg(rootedPaths.join(QStringLiteral(", "))));
+           QStringLiteral("G4: archived origin preserved cross-drive (ok=%1 done=%2 root=[%3/%4] paths=[%5] msg=%6)")
+               .arg(bG4Ok).arg(bG4Done)
+               .arg(rooted.root, g4Root, rootedPaths.join(QStringLiteral(", ")), sG4Msg));
 }
 
 static void verifyAppIntegration(const QString &work, const QString &scratchDir)
@@ -3939,7 +4528,10 @@ static void verifyAudit2026Fixes(const QString &work, const QString &scratchDir)
                          [&](bool o, const QString &m) { bDone = true; bOk = o; sMsg = m; });
         fm2.QMergeFiles(QVector<QString>{arc}, out);
         report(bMeta && bDone && !bOk && !QFileInfo::exists(out)
-               && sMsg.contains(QStringLiteral("CRC")),
+               && (sMsg.contains(QStringLiteral("CRC"))
+                   || sMsg.contains(QStringLiteral("篡改"))
+                   || sMsg.contains(QStringLiteral("损坏"))
+                   || sMsg.contains(QStringLiteral("认证失败"))),
                QStringLiteral("AUDIT-P1-2: merge rejects corrupted source content (%1)").arg(sMsg));
     }
 
@@ -4168,6 +4760,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // FWDA v5：测试使用固定的进程内测试密钥（不读写用户密钥环）。
+    {
+        QByteArray testKey;
+        QString sKeyErr;
+        if (!FwCrypto::deriveProductKey(QStringLiteral("FWDA-GOLDEN-v5"), &testKey, &sKeyErr))
+        {
+            report(false, QStringLiteral("test key derivation failed: ") + sKeyErr);
+            return 1;
+        }
+        FwCrypto::KeyRing::instance().setTestKey(testKey);
+    }
+
     const QString work = (argc > 1) ? QString::fromLocal8Bit(argv[1])
                                     : QDir::currentPath() + QStringLiteral("/fixtures");
     const QString plug = (argc > 2) ? QString::fromLocal8Bit(argv[2])
@@ -4363,6 +4967,12 @@ int main(int argc, char **argv)
     // ---------- P: 元数据与标记（合并保存 / 导出恢复） ----------
     verifyArchiveMetadata(work, scratchDir);
     verifyArchiveTags(work, scratchDir);
+
+    // ---------- R: 删除后的快速保存（只改头部）+ 整理归档 + 写前日志回滚 ----------
+    verifyFastSaveAndCompact(work, scratchDir);
+
+    // ---------- T: 新增文件的追加保存（内容追加 + 头部预留区内重写） ----------
+    verifyAppendSave(work, scratchDir);
 
     // ---------- AUDIT-2026-11: 本轮审查修复的回归 ----------
     verifyAudit2026Fixes(work, scratchDir);

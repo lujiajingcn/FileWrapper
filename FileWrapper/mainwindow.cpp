@@ -19,6 +19,7 @@
 #include "dlgabout.h"
 #include <QVariant>
 #include "dlgoutputfile.h"
+#include "dlgsettings.h"
 #include <QMessageBox>
 #include <QPushButton>
 #include <QAbstractButton>
@@ -629,6 +630,9 @@ MainWindow::MainWindow(QWidget *parent) :
     // 绘制时却把图标画在文字位置，结果「插件设置」会只剩一个图标、文字被挤没
     // （2026-11-19 实测，150% DPI 同样复现）。菜单项（QAction）的图标不受影响。
 
+    // 「整理归档」加入文件菜单：只有归档里存在可回收空间时才可用
+    ui->menu->addAction(m_acCompact);
+
     // 「校验归档」加入文件菜单（不改 .ui，避免影响已有布局）
     m_acVerify = new QAction(QStringLiteral("校验归档内容"), ui->menu);
     // 只说「损坏」不说「篡改」：CRC32 不是签名，改过内容再重算 CRC 一样能通过，
@@ -648,6 +652,12 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(actPluginSettings, &QAction::triggered, this,
             &MainWindow::onActionPluginSettingsTriggered);
     ui->menu_2->addAction(actPluginSettings);
+
+    // 设置：归档加密密钥（FWDA v5）。程序本身不保存密钥，配置保存在当前用户设置里。
+    QMenu *pSettingsMenu = menuBar()->addMenu(tr("设置"));
+    QAction *actCryptoKeys = pSettingsMenu->addAction(tr("归档加密密钥…"));
+    actCryptoKeys->setToolTip(tr("配置用于加密/解密的密钥字符串（当前 + 历史，最多 8 条）"));
+    connect(actCryptoKeys, &QAction::triggered, this, &MainWindow::onActionCryptoKeySettings);
 
     // 所有动作创建完毕后统一进入初始状态（启动时未加载归档）
     syncActionStates();
@@ -853,6 +863,8 @@ void MainWindow::initWidgetFilePath()
     m_acOutputFile = new QAction("导出文件", m_tbFilePath);
     m_acSaveFile = new QAction("保存文件", m_tbFilePath);
     m_acSaveFile->setEnabled(false);
+    m_acCompact = new QAction("整理归档", m_tbFilePath);
+    m_acCompact->setEnabled(false);
 
     m_acViewTree->setToolTip(tr("树形显示：按合并前的目录层级展示"));
     m_acViewFlat->setToolTip(tr("平铺显示：不显示层级，每个文件一行"));
@@ -863,6 +875,7 @@ void MainWindow::initWidgetFilePath()
     m_acDelFile->setToolTip(tr("从归档中删除选中的文件"));
     m_acOutputFile->setToolTip(tr("把选中的文件导出到磁盘"));
     m_acSaveFile->setToolTip(tr("保存对归档的改动（Ctrl+S）"));
+    m_acCompact->setToolTip(tr("整理归档：把空洞压实并回收空间（会重写整个归档）"));
 
     // 视图（树/平铺/缩略图）｜显示（路径/名称）｜文件（增删导出保存）
     m_tbFilePath->addAction(m_acViewTree);
@@ -876,6 +889,7 @@ void MainWindow::initWidgetFilePath()
     m_tbFilePath->addAction(m_acDelFile);
     m_tbFilePath->addAction(m_acOutputFile);
     m_tbFilePath->addAction(m_acSaveFile);
+    m_tbFilePath->addAction(m_acCompact);
 
     // 文件列表 dock 可关闭且 saveState() 会持久化隐藏态；必须提供恢复入口，
     // 否则用户关掉后再启动就再也看不到列表（只能删 ini）。
@@ -929,6 +943,7 @@ void MainWindow::initWidgetFilePath()
     connect(m_acDelFile, &QAction::triggered, this, &MainWindow::onActionDelFileTriggered);
     connect(m_acOutputFile, &QAction::triggered, this, &MainWindow::onActionOutputFileTriggered);
     connect(m_acSaveFile, &QAction::triggered, this, &MainWindow::onActionSaveFileTriggered);
+    connect(m_acCompact, &QAction::triggered, this, &MainWindow::onActionCompactArchiveTriggered);
     // 删除/导出依赖“当前是否选中具体文件”，选中变化后立即刷新可用状态
     connect(m_tvFilePath->selectionModel(), &QItemSelectionModel::currentChanged,
             this, [this](const QModelIndex &, const QModelIndex &) { syncActionStates(); });
@@ -955,6 +970,7 @@ void MainWindow::initWidgetFilePath()
     m_acDelFile->setIcon(FwIcons::get(QStringLiteral("delete")));
     m_acOutputFile->setIcon(FwIcons::get(QStringLiteral("export")));
     m_acSaveFile->setIcon(FwIcons::get(QStringLiteral("save")));
+    m_acCompact->setIcon(FwIcons::get(QStringLiteral("merge")));
 
     // 主工具栏：只保留最常用文件操作，且**只显示图标**——文字放在 tooltip 里，
     // 鼠标悬停时才出现。菜单「文件处理」里仍是「图标 + 文字」，可发现性不受影响；
@@ -2167,7 +2183,12 @@ void MainWindow::renderFile(const FILEINFO &info, PluginInterface *iface)
         // v4：先尝试零拷贝内存映射（媒体插件支持）：直接把归档内容区映射为只读内存，
         // FFmpeg 按需读页，不必先复制出一整份临时文件（1.59GB 视频不再"准备"1.59GB）。
         // 注意：新增未保存的文件没有归档内偏移，不能映射。
-        if (!m_fileManager->archivePath().isEmpty()
+        // v5：归档内容是 AES-GCM 密文，不能再把内容区映射给插件（插件会读到密文）。
+        // 大文件统一走下面的「解密到临时文件 + 路径」通道；≤256 MiB 的小文件
+        // 由 entryContent() 解密到内存（见下方 else 分支）。
+        constexpr bool kAllowArchiveMmap = false;
+        if (kAllowArchiveMmap
+            && !m_fileManager->archivePath().isEmpty()
             && !m_fileManager->isPendingEntry(info.sFilePath))
         {
             auto *pArc = new QFile(m_fileManager->archivePath());
@@ -3099,36 +3120,44 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
 
     if (btn == QMessageBox::Save)
     {
-        // 后台 CRC 仍持有归档句柄时 rename 会失败：先等它结束（超时则明确提示）。
-        if (!waitForMappedCrc(15000))
+        // 只改头部（删除/改标记）或只追加内容（新增文件）都不替换归档文件，
+        // 也就不需要等后台句柄、不需要停播。
+        const bool bHeaderOnly = m_fileManager->canSaveHeaderOnly();
+        const bool bAppend = !bHeaderOnly && m_fileManager->canSaveByAppend();
+        const bool bNoReplace = bHeaderOnly || bAppend;
+        if (!bNoReplace)
         {
-            QMessageBox::warning(this, tr("保存失败"),
-                tr("后台仍在校验归档内容，暂时无法保存。请稍等几秒后重试。"));
-            return false;
-        }
-        // 保存会重写归档：先释放内存映射并停止播放（Windows 下映射中的文件不能改名）
-        if (!m_mapMappedInputs.isEmpty())
-        {
-            stopCurrentPlaybackAndInvalidate();
-            releaseAllMappedInputs();
-        }
-        // P0-3：仍有停播未确认的实例时，映射不能释放，归档也无法安全替换。
-        // 先做一次非阻塞复查：后台线程可能刚好在等待期间退出了。
-        pollStopUnsafeInstances();
-        if (!m_setStopUnsafe.isEmpty())
-        {
-            QMessageBox::warning(this, tr("保存失败"),
-                tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
-                   "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
-                   "程序会每秒自动复查；也可关闭正在播放的标签页后重试。"));
-            return false;
-        }
-        if (!prepareThumbnailsForArchiveWrite(5000))
-        {
-            QMessageBox::warning(this, tr("保存失败"),
-                tr("缩略图仍在读取归档内容，暂时无法替换文件。请稍等几秒后重试。"));
-            refreshFilePathView();   // 恢复待生成的缩略图
-            return false;
+            // 后台 CRC 仍持有归档句柄时 rename 会失败：先等它结束（超时则明确提示）。
+            if (!waitForMappedCrc(15000))
+            {
+                QMessageBox::warning(this, tr("保存失败"),
+                    tr("后台仍在校验归档内容，暂时无法保存。请稍等几秒后重试。"));
+                return false;
+            }
+            // 保存会重写归档：先释放内存映射并停止播放（Windows 下映射中的文件不能改名）
+            if (!m_mapMappedInputs.isEmpty())
+            {
+                stopCurrentPlaybackAndInvalidate();
+                releaseAllMappedInputs();
+            }
+            // P0-3：仍有停播未确认的实例时，映射不能释放，归档也无法安全替换。
+            // 先做一次非阻塞复查：后台线程可能刚好在等待期间退出了。
+            pollStopUnsafeInstances();
+            if (!m_setStopUnsafe.isEmpty())
+            {
+                QMessageBox::warning(this, tr("保存失败"),
+                    tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
+                       "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
+                       "程序会每秒自动复查；也可关闭正在播放的标签页后重试。"));
+                return false;
+            }
+            if (!prepareThumbnailsForArchiveWrite(5000))
+            {
+                QMessageBox::warning(this, tr("保存失败"),
+                    tr("缩略图仍在读取归档内容，暂时无法替换文件。请稍等几秒后重试。"));
+                refreshFilePathView();   // 恢复待生成的缩略图
+                return false;
+            }
         }
         QApplication::setOverrideCursor(Qt::WaitCursor);
         bool bOk = m_fileManager->save();
@@ -3136,7 +3165,8 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
         if (!bOk)
         {
             const QString sReason = m_fileManager->lastError();
-            refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
+            if (!bNoReplace)
+                refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
             QMessageBox::critical(this, tr("保存失败"),
                 tr("保存失败，操作已取消。改动仍保留在内存中，可以重试。\n\n原因：%1")
                    .arg(sReason.isEmpty() ? tr("未知错误") : sReason));
@@ -3145,16 +3175,19 @@ bool MainWindow::confirmDiscardOrSaveIfDirty()
         // 这里也必须完成与 Ctrl+S 相同的刷新：用户可能在“加载文件”提示里选择保存，
         // 随后取消文件对话框；若列表仍持有保存前的路径/偏移快照，接下来双击、
         // 导出、属性都会报“归档内未找到文件”，大文件还会拿 nContentPositon=0 去映射。
-        afterArchiveSaved();
+        afterArchiveSaved(!bHeaderOnly);
     }
     // Discard 或 保存成功：继续
     return true;
 }
 
-void MainWindow::afterArchiveSaved()
+void MainWindow::afterArchiveSaved(bool bContentChanged)
 {
-    // 保存会重写归档并重算内容偏移/展示路径；列表、标签页快照和缩略图都必须作废。
-    invalidateThumbnailCache();
+    // 整包重写会重算内容偏移：列表、标签页快照和缩略图都必须作废。
+    // 快速保存只改了头部，条目内容与偏移都没变，缩略图缓存可以继续用
+    // （否则照片类归档每次保存后都要把上千张图重新读一遍再解码）。
+    if (bContentChanged)
+        invalidateThumbnailCache();
     refreshTabInfosFromManager();
     refreshFilePathView();
     syncActionStates();
@@ -4403,6 +4436,16 @@ void MainWindow::syncActionStates()
     const bool bCanDelete = bLoaded && !bBusy && bHasLeaf
                             && m_fileManager->getFileInfos().size() > 1;
     m_acSaveFile->setEnabled(bLoaded && m_fileManager->needsSave() && !bBusy);
+    // 整理归档：只有归档里留下空洞（快速删除/快速保存造成）时才可用
+    const qint64 nReclaimable = bLoaded ? m_fileManager->reclaimableBytes() : 0;
+    if (m_acCompact != nullptr)
+    {
+        m_acCompact->setEnabled(bLoaded && !bBusy && nReclaimable > 0);
+        m_acCompact->setToolTip(nReclaimable > 0
+            ? tr("整理归档：回收 %1 的空洞空间（会重写整个归档）")
+                  .arg(FwArc::formatSize(nReclaimable))
+            : tr("整理归档：当前归档是紧凑的，没有可回收的空间"));
+    }
     m_acAddFile->setEnabled(bLoaded && !bBusy);
     m_acDelFile->setEnabled(bCanDelete);
     m_acOutputFile->setEnabled(bLoaded && !bBusy && bHasLeaf);
@@ -4443,6 +4486,8 @@ void MainWindow::setOperationsEnabled(bool bEnabled)
     m_acDelFile->setEnabled(bEnabled && bLoaded && bHasLeaf);
     m_acOutputFile->setEnabled(bEnabled && bLoaded && bHasLeaf);
     m_acSaveFile->setEnabled(bEnabled && bLoaded && m_fileManager->needsSave() && !bBusy);
+    if (m_acCompact != nullptr)
+        m_acCompact->setEnabled(bEnabled && bLoaded && m_fileManager->reclaimableBytes() > 0);
     if (m_acVerify != nullptr) m_acVerify->setEnabled(bEnabled && bLoaded);
 }
 
@@ -4871,22 +4916,19 @@ void MainWindow::onActionOutputFileTriggered()
     }
 }
 
-void MainWindow::onActionSaveFileTriggered()
+// 替换归档文件（整包重写）前的统一准备。
+// 只重写头部的快速保存不替换文件、也不移动内容偏移，所以不需要这些等待，
+// 调用方应先用 canSaveHeaderOnly() 判断（否则会让一次 10 ms 的删除
+// 因为后台校验/缩略图/正在播放而先卡上十几秒，甚至要求停播）。
+bool MainWindow::prepareForArchiveReplacement()
 {
-    if(!m_fileManager->isArchiveLoaded())
-    {
-        QMessageBox::information(this, tr("保存文件"),
-                                 tr("没有已加载的归档文件，无法保存。"));
-        return;
-    }
-
     // 后台 CRC 仍在读归档时不能改名重写（Windows 共享冲突）：先等它结束；
     // 超时给出明确提示，避免保存只报"被占用"却查不出原因。
     if (!waitForMappedCrc(15000))
     {
         QMessageBox::warning(this, tr("保存文件"),
             tr("后台仍在校验归档内容，暂时无法保存。\n请稍等几秒后重试。"));
-        return;
+        return false;
     }
 
     // 有视频/音频正在直接读取归档（内存映射）时，保存需要先停止播放并释放映射：
@@ -4898,7 +4940,7 @@ void MainWindow::onActionSaveFileTriggered()
                "播放会中断（可重新双击打开）。是否继续保存？"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (btn != QMessageBox::Yes)
-            return;
+            return false;
         stopCurrentPlaybackAndInvalidate();
         releaseAllMappedInputs();
     }
@@ -4912,7 +4954,7 @@ void MainWindow::onActionSaveFileTriggered()
             tr("有插件的后台播放未能确认停止，其内存映射仍在使用。\n"
                "此时替换归档可能失败或产生不一致，已取消本次操作。\n"
                "程序会每秒自动复查；也可关闭正在播放的标签页后重试。"));
-        return;
+        return false;
     }
 
     // 缩略图后台任务也持有归档的只读句柄；Windows 下未关闭会让 rename 失败。
@@ -4922,12 +4964,143 @@ void MainWindow::onActionSaveFileTriggered()
         QMessageBox::warning(this, tr("保存文件"),
             tr("缩略图仍在读取归档内容，暂时无法替换文件。\n请稍等几秒后重试。"));
         refreshFilePathView();   // 恢复待生成的缩略图
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::onActionSaveFileTriggered()
+{
+    if(!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, tr("保存文件"),
+                                 tr("没有已加载的归档文件，无法保存。"));
         return;
     }
 
-    // —— 进度条：保存（重写归档）可能耗时，显示进度并支持取消 ——
-    QProgressDialog dlgProgress(tr("正在保存文件..."), tr("取消"), 0, 100, this);
-    dlgProgress.setWindowTitle(tr("保存文件"));
+    // 删除条目/改标记只需重写头部：内容偏移不变，既不用替换文件，
+    // 也不用等后台校验/缩略图，更不需要停播。
+    const bool bHeaderOnly = m_fileManager->canSaveHeaderOnly();
+    // 新增文件也只是把内容追加到末尾 + 头部在预留区原地重写：
+    // 同样不替换文件，所以也不需要用 rename 前的那套等待。
+    const bool bAppend = !bHeaderOnly && m_fileManager->canSaveByAppend();
+
+    if (!bHeaderOnly && !bAppend && !prepareForArchiveReplacement())
+        return;
+
+    bool bOk = false;
+    QString sReason;
+    if (bHeaderOnly)
+    {
+        // —— 快速保存：毫秒级，不弹进度框，只给等待光标 ——
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        setOperationsEnabled(false);
+        bOk = m_fileManager->save();
+        sReason = m_fileManager->lastError();
+        setOperationsEnabled(true);
+    }
+    else
+    {
+        // —— 进度条：追加内容或重写整个归档都可能耗时，显示进度并支持取消 ——
+        QProgressDialog dlgProgress(bAppend ? tr("正在追加保存...")
+                                            : tr("正在保存文件..."),
+                                    tr("取消"), 0, 100, this);
+        dlgProgress.setWindowTitle(tr("保存文件"));
+        dlgProgress.setWindowModality(Qt::WindowModal);
+        dlgProgress.setMinimumDuration(0);
+        dlgProgress.setAutoClose(false);
+        dlgProgress.setAutoReset(false);
+        dlgProgress.setValue(0);
+
+        bool bDummy = false;
+        QString sDummy;
+        beginProgressOperation(&dlgProgress, &bDummy, &sDummy);
+
+        dlgProgress.show();
+        QApplication::processEvents();
+        setOperationsEnabled(false);
+
+        bOk = m_fileManager->save();
+        sReason = m_fileManager->lastError();
+
+        dlgProgress.close();
+        endProgressOperation();
+        setOperationsEnabled(true);
+    }
+    syncActionStates();
+
+    if(!bOk)
+    {
+        // 进度对话框关闭时也可能发出 canceled()，不能只用 isCancelRequested 判断；
+        // 优先采用 FileManager 给出的具体原因，只有确实是"操作已取消"才提示已取消。
+        const bool bCancelled = m_fileManager->isCancelRequested()
+                                && (sReason.isEmpty() || sReason.contains(tr("取消")));
+        QString sMsg = bCancelled
+                ? tr("保存已取消。改动仍保留在内存中，可重试。")
+                : tr("保存失败。改动仍保留在内存中，可重试。\n\n原因：%1")
+                    .arg(sReason.isEmpty() ? tr("未知错误") : sReason);
+        if (bHeaderOnly)
+            QApplication::restoreOverrideCursor();
+        else if (!bAppend)
+            refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
+        QMessageBox::critical(this, tr("保存文件"), sMsg);
+        return;
+    }
+
+    if (bHeaderOnly)
+        QApplication::restoreOverrideCursor();
+
+    afterArchiveSaved(!bHeaderOnly);
+
+    // 快速保存后归档里会留下“空洞”：提示可回收空间，否则用户只会觉得文件没变小
+    if (bHeaderOnly)
+    {
+        const qint64 nWaste = m_fileManager->reclaimableBytes();
+        if (nWaste > 0)
+            statusBar()->showMessage(
+                tr("已快速保存（只更新归档头部，未重写内容）。可回收空间 %1，可用「整理归档」回收")
+                    .arg(FwArc::formatSize(nWaste)), 15000);
+        else
+            statusBar()->showMessage(tr("已快速保存（只更新归档头部，未重写内容）"), 8000);
+    }
+    else if (bAppend)
+    {
+        statusBar()->showMessage(
+            tr("已追加保存（新内容写到归档末尾，原有内容未重写）"), 8000);
+    }
+}
+
+// 整理归档：把“快速保存”留下的空洞压实（整包重写，可取消），回收磁盘空间。
+void MainWindow::onActionCompactArchiveTriggered()
+{
+    if (!m_fileManager->isArchiveLoaded())
+    {
+        QMessageBox::information(this, tr("整理归档"),
+                                 tr("没有已加载的归档文件，无法整理。"));
+        return;
+    }
+    const qint64 nWaste = m_fileManager->reclaimableBytes();
+    if (nWaste <= 0 && !m_fileManager->isDirty())
+    {
+        QMessageBox::information(this, tr("整理归档"),
+                                 tr("当前归档已经是紧凑的，没有可回收的空间。"));
+        return;
+    }
+
+    const QString sNote = nWaste > 0
+        ? tr("将重写整个归档，回收 %1 的空洞空间。\n")
+              .arg(FwArc::formatSize(nWaste))
+        : tr("将重写整个归档（同时保存未保存的改动）。\n");
+    if (QMessageBox::question(this, tr("整理归档"),
+            sNote + tr("归档越大耗时越长（与保存一次相同），期间可以取消。\n\n是否继续？"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) != QMessageBox::Yes)
+        return;
+
+    if (!prepareForArchiveReplacement())
+        return;
+
+    QProgressDialog dlgProgress(tr("正在整理归档..."), tr("取消"), 0, 100, this);
+    dlgProgress.setWindowTitle(tr("整理归档"));
     dlgProgress.setWindowModality(Qt::WindowModal);
     dlgProgress.setMinimumDuration(0);
     dlgProgress.setAutoClose(false);
@@ -4942,7 +5115,7 @@ void MainWindow::onActionSaveFileTriggered()
     QApplication::processEvents();
     setOperationsEnabled(false);
 
-    const bool bOk = m_fileManager->save();
+    const bool bOk = m_fileManager->compactArchive();
     const QString sReason = m_fileManager->lastError();
 
     dlgProgress.close();
@@ -4950,22 +5123,22 @@ void MainWindow::onActionSaveFileTriggered()
     setOperationsEnabled(true);
     syncActionStates();
 
-    if(!bOk)
+    if (!bOk)
     {
-        // 进度对话框关闭时也可能发出 canceled()，不能只用 isCancelRequested 判断；
-        // 优先采用 FileManager 给出的具体原因，只有确实是"操作已取消"才提示已取消。
         const bool bCancelled = m_fileManager->isCancelRequested()
                                 && (sReason.isEmpty() || sReason.contains(tr("取消")));
-        QString sMsg = bCancelled
-                ? tr("保存已取消。改动仍保留在内存中，可重试。")
-                : tr("保存失败。改动仍保留在内存中，可重试。\n\n原因：%1")
-                    .arg(sReason.isEmpty() ? tr("未知错误") : sReason);
-        refreshFilePathView();   // 保存前取消了缩略图任务，失败后恢复
-        QMessageBox::critical(this, tr("保存文件"), sMsg);
+        refreshFilePathView();
+        QMessageBox::critical(this, tr("整理归档"),
+            bCancelled ? tr("整理已取消。归档与改动都保持不变，可重试。")
+                       : tr("整理失败。归档与改动都保持不变，可重试。\n\n原因：%1")
+                             .arg(sReason.isEmpty() ? tr("未知错误") : sReason));
         return;
     }
 
-    afterArchiveSaved();
+    afterArchiveSaved(true);
+    statusBar()->showMessage(
+        tr("整理完成，归档现在的大小为 %1")
+            .arg(FwArc::formatSize(QFileInfo(m_fileManager->archivePath()).size())), 10000);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
@@ -5038,6 +5211,12 @@ void MainWindow::saveUiState()
     st.setValue(QStringLiteral("viewMode"), sMode);
     st.setValue(QStringLiteral("showPath"), m_bShowPath);
     st.endGroup();
+}
+
+void MainWindow::onActionCryptoKeySettings()
+{
+    DlgSettings dlg(this);
+    dlg.exec();
 }
 
 void MainWindow::on_actionAbout_triggered()

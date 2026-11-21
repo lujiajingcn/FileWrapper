@@ -4,38 +4,52 @@
 // ============================================================
 // FileWrapper 归档格式公共定义
 //
-// 只有一种格式（当前版本 4）。FileWrapper 尚未正式发布，没有任何存量归档，
-// 因此不保留旧版本（v1–v3）的读取/升级分支：版本号不等于 CURRENT_VERSION
+// 只有一种格式（当前版本 5）。FileWrapper 尚未正式发布，没有任何存量归档，
+// 因此不保留旧版本（v1–v4）的读取/升级分支：版本号不等于 CURRENT_VERSION
 // 的归档一律明确拒绝，而不是悄悄接受后再保存出语义不同的文件。
 //
-// 全局头 24 字节（小端）:
+// ------------------------------------------------------------
+// v5 布局（全部小端，另有说明除外）：
+//
+//   [0..63]                全局头 64 字节（明文）
+//   [64..123]              wrappedKey 60 字节
+//   [124..]                加密索引区（长度 IndexCipherLen，尾部含 16B GCM tag）
+//   [headerSize..]         内容区：每条目分块 AES-256-GCM 密文，顺序排列
+//
+// 全局头 64 字节：
 //   [0..3]   Magic "FWDA"
-//   [4..7]   Version  uint32  当前固定为 4
-//   [8..11]  HeaderSize uint32 全局头 + 头部元数据区 + 条目头的总大小
-//   [12..15] FileCount  uint32
-//   [16..19] HeaderChecksum uint32  CRC32
-//   [20..23] Reserved   uint32 (0)
+//   [4..7]   Version  uint32  当前固定为 5
+//   [8..11]  Flags    uint32  bit0 保留=0；bit1 压缩保留（必须 0）；
+//                             bit2 尾部填充；bit3..31 保留（未知置位即拒绝）
+//   [12..15] KeyScheme uint32 1 = Argon2id 派生 PRODUCT_KEY + AES-256-GCM
+//   [16..19] IndexCipherLen uint32
+//   [20..23] WrappedKeyLen  uint32 固定 60
+//   [24..27] ExtLen         uint32 v5.0 固定 0
+//   [28..31] Reserved       uint32 0
+//   [32..47] ArchiveUuid    16 字节随机数
+//   [48..59] IndexIv        12 字节（每次重写索引换新）
+//   [60..63] Reserved2      uint32 0
 //
-// 头部区:
-//   [24..27] RootLength u32
-//   [28..]   Root u8[RootLength] (UTF-8, 合并时所有输入的公共父目录, 仅供显示)
-//   重复 FileCount 次:
-//     PathLength u32 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
+// wrappedKey 60 字节：WkIv(12) + AES-256-GCM(PRODUCT_KEY, CMK)(32) + Tag(16)；
+//   AAD = magic(4)||version(4)||keyScheme(4)||archiveUuid(16) = 28 字节。
+//
+// 加密索引明文（AES-256-GCM(K_index, IndexIv)，AAD = 完整 64B 全局头）：
+//   RootLength u32 / Root u8[RootLength]
+//   FileCount  u32
+//   重复 FileCount 次：
+//     EntryId u64 / FileSize u64 / ContentPos u64 / ContentCrc32 u32
 //     CreatedMs u64 / ModifiedMs u64 / AccessedMs u64 / Attributes u32
-//     TagCount u32
-//     Path u8[PathLength]
-//     TagCount 个标记: TagLen u32 / Tag u8[TagLen] (UTF-8)
-//   Path 是相对 Root 的路径；跨盘/无公共根时 Root 为空、盘符作为首段存储。
-//   三个时间都是 UTC 毫秒（1970-01-01 起），0 表示「未知/未记录」；
-//   Attributes 存 FILE_ATTRIBUTE_* 的 R/H/S/A 位（见 filemetadata.h），
-//   用于导出/分割时把源文件的只读/隐藏/系统/存档属性写回磁盘。
-//   标记是条目级的自定义分类（例如「合同」「重要」）。写入前统一归一化：
-//   去首尾空白、内部连续空白折叠为一个空格、大小写不敏感去重；最多 MAX_TAGS 个，
-//   单个最多 MAX_TAG_CHARS 个字符且不超过 MAX_TAG_LEN 字节（UTF-8）。
+//     ChunkCount u32 / FileNonce u8[8] / TagCount u32
+//     PathLength u32 / Path u8[PathLength]
+//     TagCount 个标记：TagLen u32 / Tag u8[TagLen]
+//   尾部补零到索引容量（预留区，解析时必须容忍）
 //
-// 校验说明:
-//   HeaderChecksum 覆盖 全局头[0..15] + 全局头[20..23] + 整个头部区。
-//   每条的 ContentCrc32 覆盖该条目的内容区，用于检测内容篡改（P1-7）。
+// 内容分块：明文块 1 MiB；块 IV = FileNonce(8) || ChunkIndex(4, BE)；
+//   块 AAD = magic(4)||version(4)||archiveUuid(16)||EntryId(8)||ChunkIndex(4,BE)||ChunkCount(4,BE)。
+//   第 i 块密文偏移 = ContentPos + i*(1 MiB+16)（最后一块可能更短）。
+//
+// 校验说明：索引与每块内容都由 GCM tag 提供认证；ContentCrc32 仍保留，
+//   仅用于快速损坏定位（不承担安全职责）。
 // ============================================================
 
 #include <QtGlobal>
@@ -72,10 +86,28 @@ inline bool hasArchiveSuffix(const QString &sPath)
 }
 
 static const char MAGIC[4] = {'F', 'W', 'D', 'A'};
-static const quint32 CURRENT_VERSION  = 4;   // 条目级标记 + 内容 CRC + 文件系统元数据
-static const quint32 GLOBAL_HDR       = 24;
-// 条目固定字段：PathLength/FileSize/ContentPos/ContentCrc32/三个时间/属性/TagCount
-static const quint32 ENTRY_FIXED      = 56;
+static const quint32 CURRENT_VERSION  = 5;   // 加密索引 + 分块加密内容
+static const quint32 GLOBAL_HDR       = 64;
+static const quint32 WRAPPED_KEY_LEN  = 60;  // WkIv(12) + CMK 密文(32) + Tag(16)
+static const quint32 WRAPPED_IV_LEN   = 12;
+static const quint32 GCM_TAG_LEN      = 16;
+static const quint32 INDEX_IV_LEN     = 12;
+static const quint32 ARCHIVE_UUID_LEN = 16;
+static const quint32 CHUNK_SIZE       = 1024 * 1024;   // 明文块 1 MiB
+static const quint32 KEY_SCHEME_ARGON2_AESGCM = 1;
+// 条目固定字段：EntryId/FileSize/ContentPos/ContentCrc32/三个时间/属性
+//               /ChunkCount/FileNonce/TagCount
+static const quint32 ENTRY_FIXED      = 76;
+
+// 一条内容（明文 nSize 字节）分成多少块、占多少密文字节（每块 +16 tag）。
+inline quint32 chunkCountFor(quint64 nSize)
+{
+    return quint32((nSize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+}
+inline quint64 cipherLenFor(quint64 nSize, quint32 nChunkCount)
+{
+    return nSize + quint64(nChunkCount) * GCM_TAG_LEN;
+}
 static const quint32 MAX_FILES        = 1000000;
 static const quint32 MAX_PATH_LEN     = 32768;
 static const quint32 MAX_ROOT_LEN     = 32768;
@@ -84,6 +116,23 @@ static const quint32 MAX_TAGS         = 32;
 static const quint32 MAX_TAG_LEN      = 128;   // UTF-8 字节
 static const int     MAX_TAG_CHARS    = 40;    // 归一化后的字符数
 static const quint64 MAX_HDR_SIZE     = 512ULL * 1024 * 1024;
+// 头部预留：整包写入时在条目区之后多留一点空间（填零），让后续“新增条目”可以
+// 在余量内只重写头部、把新内容直接追加到文件末尾，不必整包重写。
+// 余量按头部大小取 1/4，限制在 [4 KiB, 256 KiB]：
+//   * 太小 -> 加几个文件就得整包重写；
+//   * 太大 -> 每次改头部（删除/改标记）都要多写并 fsync 一份等大的回滚日志。
+static const quint32 HDR_RESERVE_MIN  = 4 * 1024;
+static const quint32 HDR_RESERVE_MAX  = 256 * 1024;
+inline quint32 headerReserveFor(quint64 exactHeaderBytes)
+{
+    quint64 want = exactHeaderBytes / 4;
+    if (want < HDR_RESERVE_MIN) want = HDR_RESERVE_MIN;
+    if (want > HDR_RESERVE_MAX) want = HDR_RESERVE_MAX;
+    const quint64 cap = exactHeaderBytes + want;
+    if (cap > MAX_HDR_SIZE || cap > 0xFFFFFFFFULL)
+        return 0;                      // 头部已经很大：不再预留
+    return quint32(want);
+}
 static const quint64 MAX_CONTENT_LEN  = (1ULL << 62);
 // 时间戳合理上界（UTC 毫秒）：9999-12-31 23:59:59.999。
 // 超出视为未知，避免伪造的 u64 在 QDateTime 转换/显示时变成无意义的值。
@@ -102,6 +151,10 @@ struct Entry
     quint64 size          = 0;
     quint64 contentPos    = 0;
     quint32 contentCrc    = 0;
+    // v5 加密参数（解析后填充；写入端负责生成）
+    quint64    entryId    = 0;      // 归档内唯一，参与 AAD/密钥派生
+    QByteArray fileNonce;           // 8 字节，内容密钥/块 IV 派生参数
+    quint32    chunkCount = 0;      // 内容块数
     // 文件系统元数据（时间 UTC 毫秒 + DOS 属性），全 0 表示源文件没有记录。
     quint64 createdMs     = 0;
     quint64 modifiedMs    = 0;
@@ -114,10 +167,13 @@ struct Entry
 struct Meta
 {
     quint32 version    = 0;
-    quint32 headerSize = 0;
+    quint64 headerSize = 0;     // 64 + 60 + IndexCipherLen + ExtLen
     quint32 fileCount  = 0;
     quint64 fileSize   = 0;
     QString root;
+    QByteArray archiveUuid;     // 16 字节
+    // 仅内存：解密内容用的 CMK。不得写入磁盘、不得展示；解析时由密钥环解出。
+    QByteArray cmk;
     QVector<Entry> entries;
 };
 
